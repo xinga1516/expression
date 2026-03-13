@@ -1,0 +1,6 @@
+d:
+cd code\pro_model\model
+jupyter lab
+
+mamba shell init --shell cmd.exe
+mamba activate promodel

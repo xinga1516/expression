@@ -1,0 +1,9 @@
+data/
+outputs/
+*.pt
+*.pth
+*.npy
+*.log
+_pycache_/
+.ipynb_checkpoints/
+
