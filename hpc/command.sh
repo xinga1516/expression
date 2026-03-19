@@ -24,7 +24,7 @@ echo "Memory allocated: $SLURM_MEM_PER_NODE"
 echo "===== Python & PyTorch Info ====="
 echo "Python: $(which python)"
 python --version
-python -c "import torch; print('PyTorch version:', torch.__version__); print('CUDA available:', torch.cuda.is_available())"
+python -m scripts.train > outputs.out
 
 
 
