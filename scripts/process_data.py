@@ -256,9 +256,9 @@ def filter_cells(rawdata, top_total_fraction=0.10, plot_qc=True):
 
 def split_train_val(
     df,
-    train_ratio=0.6,
-    val_ratio=0.2,
-    test_ratio=0.2,
+    train_ratio=0.8,
+    val_ratio=0.1,
+    test_ratio=0.1,
     output_dir=None,
 ):
     """
@@ -345,7 +345,7 @@ def split_train_val(
     print("Train ∩ Test:", set(train_genes) & set(test_genes))
 
     base_dir = Path(__file__).resolve().parent.parent
-    outdir = Path(output_dir) if output_dir is not None else (base_dir / "data" / "processed")
+    outdir = Path(output_dir) if output_dir is not None else (base_dir / "data" / "highquality")#(base_dir / "data" / "processed")
     outdir.mkdir(parents=True, exist_ok=True)
 
     data[data["gene_id"].isin(train_genes)].drop(columns=["mid"]).to_csv(outdir / "promoter_train.csv", index=False)
@@ -426,26 +426,38 @@ def filter_genes(rawdata):
 
 def compute_tpm(rawdata):
     sc.pp.normalize_total(rawdata, target_sum=1e6) # 将每个细胞的总表达量归一化到 1,000,000（TPM）
+    sc.pp.log1p(rawdata) # 对归一化后的数据进行 log1p 转换（log(x + 1)），以减小数据范围并处理零值。
     # # using gene length to compute RPKM/FPKM
     # gene_length_kb = rawdata.var["gene_length"] / 1e3
     # rawdata.X = rawdata.X / gene_length_kb.values[np.newaxis, :]
     return rawdata
 
+def draw_high_quality_samples(rawdata, top_total_fraction=0.10):
+    ''' delete genes with zero expression across all cells, 
+    and select highly variable genes'''
+    sc.pp.highly_variable_genes(rawdata, flavor="seurat_v3", n_top_genes=2000)
+    rawdata = rawdata[:, rawdata.var['highly_variable']]
+    return rawdata
 
 # %%
 def main():
-    rawdata = build_integrated_data()
-    # %%
-    rawdata = add_gene_annotation(rawdata)
-    # %%
-    filtered_data = filter_cells(rawdata)
-    # %%
-    filtered_data = filter_genes(filtered_data)
-    # %%
-    filtered_data = compute_tpm(filtered_data)
-    # %%
     base_dir = Path(__file__).resolve().parent.parent
-    filtered_data.write_h5ad(base_dir / "data" / "processed" / "integrated_data.h5ad")
+    # rawdata = build_integrated_data()
+    # # %%
+    # rawdata = add_gene_annotation(rawdata)
+    # # %%
+    # filtered_data = filter_cells(rawdata)
+    # # %%
+    # filtered_data = filter_genes(filtered_data)
+    # # %%
+    filtered_data = sc.read_h5ad(base_dir / "data" / "processed" / "integrated_data.h5ad")
+    filtered_data = compute_tpm(filtered_data)
+    high_quality_data = draw_high_quality_samples(filtered_data)
+    print("high quality data shape: ", high_quality_data.shape)
+    high_quality_data = filter_genes(high_quality_data)
+    # %%
+    #filtered_data.write_h5ad(base_dir / "data" / "processed" / "log_integrated_data.h5ad")
+    high_quality_data.write_h5ad(base_dir / "data" / "processed" / "log_integrated_data_hvg.h5ad")
 
 if __name__ == "__main__":
     main()

@@ -7,7 +7,7 @@ from scipy import sparse
 
 
 project_root = pathlib.Path(__file__).resolve().parent.parent
-data_dir = project_root / "data" / "processed"
+data_dir = project_root / "data" / "highquality"#"processed"
 out_dir = project_root / "outputs"
 
 

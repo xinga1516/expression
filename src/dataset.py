@@ -8,7 +8,7 @@ import torch
 import pandas as pd
 import scanpy as sc
 import numpy as np
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset
 from scipy import sparse
 
 class PromoterOneHotEncoder:
@@ -43,7 +43,7 @@ class PromoterOneHotEncoder:
         return one_hot
 
 
-class MyDataset(IterableDataset):
+class MyDataset(Dataset):
     def __init__(
         self,
         promoter_file,
@@ -135,14 +135,3 @@ class MyDataset(IterableDataset):
         
         return self.in_getitem(pro_i,cell_i)
 
-    def __iter__(self):
-        # For reproducible validation, initialize RNG with fixed seed
-        if self.mode == "val":
-            rng = np.random.RandomState(self.seed)
-        else:
-            rng = np.random
-        
-        while True:
-            pro_i = rng.randint(len(self.promoters))
-            cell_i = rng.randint(len(self.cells))
-            yield self.in_getitem(pro_i,cell_i)
