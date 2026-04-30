@@ -124,7 +124,7 @@ class MyDataset(Dataset):
         expr_all = torch.from_numpy(expr_all).float()
         
         target_idx = self.promoter2expr_idx[pro_i]
-        y = expr_all[target_idx]
+        y = expr_all[target_idx].clone()
         expr_all[target_idx] = 0.0 # mask the promoter expression
         
         return promoter, expr_all, y

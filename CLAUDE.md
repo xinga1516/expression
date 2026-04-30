@@ -20,6 +20,9 @@ python scripts/train.py --exp_name my_run --data highquality --dryrun
 # Evaluate on val/test split
 python scripts/evaluate.py --split val --checkpoint outputs/my_run/checkpoints/best_model.safetensors
 
+# Plot results from a completed experiment (loss curves, metrics, scatter)
+python scripts/plot_results.py --exp_name my_run --data highquality
+
 # Plot loss curves and scatter plot after training
 python scripts/train.py --exp_name my_run --data highquality --plot-loss
 

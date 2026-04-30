@@ -25,8 +25,6 @@ import copy
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# if str(PROJECT_ROOT) not in sys.path:
-#     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dataset import MyDataset
 from src.model import MODEL_REGISTRY, build_model
@@ -39,7 +37,8 @@ def weighted_mse_loss(pred, target, nonzero_weight=2.0):
     """MSE with higher weight on non-zero targets."""
     weights = torch.ones_like(target)
     weights[target != 0] = nonzero_weight
-    return torch.mean(weights * (pred - target) ** 2)
+    sq = (pred - target) ** 2
+    return (weights * sq).sum() / weights.sum().clamp_min(1e-12)
 
 def train_model(
     model,
@@ -50,10 +49,12 @@ def train_model(
     learning_rate=1e-4,
     nonzero_loss_weight=2.0,
     seed=42,
-    patience=5,           # early stopping patience (epochs)
-    min_delta=0.0,        # minimal loss improvement to reset patience
-    resume_ckpt=None,      # 断点路径，如 outputs/<exp_name>/checkpoints/last.ckpt
-    save_every=0,          # 每隔多少个 epoch 额外保存一个 epoch_xxxx.ckpt
+    patience=5,
+    min_delta=0.0,
+    resume_ckpt=None,
+    save_every=0,
+    zero_acc_threshold=0.5,
+    ema_alpha=0.9,
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -75,10 +76,15 @@ def train_model(
     log_file = log_dir / "train_log.csv"
 
     start_epoch = 0
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
+    val_loss_ema = None
     train_losses = []
     val_losses = []
+    train_losses_zero = []
+    train_losses_nz = []
+    val_losses_zero = []
+    val_losses_nz = []
+    val_pearson_nz = []
+    val_zero_acc = []
 
     # Resume from checkpoint if provided
     if resume_ckpt is not None:
@@ -87,7 +93,7 @@ def train_model(
             start_epoch, earlystopping, train_losses, val_losses = utils.resume_from_checkpoint(
                 resume_ckpt, model, optimizer, scheduler, earlystopping, device
             )
-            print(f"[Resume] loaded: {resume_ckpt} | start_epoch={start_epoch} | best_val={best_val_loss}")
+            print(f"[Resume] loaded: {resume_ckpt} | start_epoch={start_epoch} | best_score={earlystopping.best_score}")
         else:
             print(f"[Resume] checkpoint not found, start from scratch: {resume_ckpt}")
 
@@ -101,8 +107,13 @@ def train_model(
             train_loader.sampler.set_epoch(epoch)
 
         model.train()
-        train_loss_sum = 0.0
-        train_count = 0
+        train_loss_num = 0.0
+        train_loss_den = 0.0
+        train_nz_sum = 0.0
+        train_nz_count = 0
+        train_zero_sum = 0.0
+        train_zero_count = 0
+
         for batch in train_loader:
             promoters, exprs, ys = batch
             promoters = promoters.to(device, non_blocking=True)
@@ -115,20 +126,54 @@ def train_model(
             loss.backward()
             optimizer.step()
 
-            train_loss_sum += loss.item() * ys.size(0)
-            train_count += ys.size(0)
+            with torch.no_grad():
+                sq = (out - ys) ** 2
+                zero_mask = (ys == 0)
+                nz_mask = ~zero_mask
+
+                # weighted average aggregation (matches loss function)
+                w = torch.where(ys != 0, torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
+                                torch.ones_like(ys))
+                weighted_sq_sum = (w * sq).sum().item()
+                weight_sum = w.sum().item()
+                train_loss_num += weighted_sq_sum
+                train_loss_den += weight_sum
+
+                nz_cnt = nz_mask.sum().item()
+                if nz_cnt > 0:
+                    train_nz_sum += sq[nz_mask].sum().item()
+                    train_nz_count += nz_cnt
+
+                zero_cnt = zero_mask.sum().item()
+                if zero_cnt > 0:
+                    train_zero_sum += sq[zero_mask].sum().item()
+                    train_zero_count += zero_cnt
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
 
-        avg_train_loss = train_loss_sum / max(train_count, 1)
+        avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
         train_losses.append(avg_train_loss)
+        train_losses_zero.append(train_zero_sum / max(train_zero_count, 1))
+        train_losses_nz.append(train_nz_sum / max(train_nz_count, 1))
 
         # Validation loop
+        avg_val_loss = float("nan")
+        epoch_val_pearson = float("nan")
+        epoch_val_zero_acc = float("nan")
+
         if val_loader is not None:
             model.eval()
-            val_loss_sum = 0.0
-            val_count = 0
+            val_loss_num = 0.0
+            val_loss_den = 0.0
+            val_nz_sum = 0.0
+            val_nz_count = 0
+            val_zero_sum = 0.0
+            val_zero_count = 0
+            all_nz_true = []
+            all_nz_pred = []
+            all_zero_pred = []
+
             with torch.no_grad():
                 for batch in val_loader:
                     promoters, exprs, ys = batch
@@ -137,19 +182,69 @@ def train_model(
                     ys = ys.to(device, non_blocking=True).float()
 
                     out = model(promoters, exprs).squeeze(1)
-                    loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
 
-                    val_loss_sum += loss.item() * ys.size(0)
-                    val_count += ys.size(0)
+                    sq = (out - ys) ** 2
+                    zero_mask = (ys == 0)
+                    nz_mask = ~zero_mask
 
-            avg_val_loss = val_loss_sum / max(val_count, 1)
+                    w = torch.where(ys != 0, torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
+                                    torch.ones_like(ys))
+                    val_loss_num += (w * sq).sum().item()
+                    val_loss_den += w.sum().item()
+
+                    nz_cnt = nz_mask.sum().item()
+                    if nz_cnt > 0:
+                        val_nz_sum += sq[nz_mask].sum().item()
+                        val_nz_count += nz_cnt
+                        all_nz_true.append(ys[nz_mask].cpu().numpy())
+                        all_nz_pred.append(out[nz_mask].cpu().numpy())
+
+                    zero_cnt = zero_mask.sum().item()
+                    if zero_cnt > 0:
+                        val_zero_sum += sq[zero_mask].sum().item()
+                        val_zero_count += zero_cnt
+                        all_zero_pred.append(out[zero_mask].cpu().numpy())
+
+            avg_val_loss = val_loss_num / max(val_loss_den, 1e-12)
+            val_losses_zero.append(val_zero_sum / max(val_zero_count, 1))
+            val_losses_nz.append(val_nz_sum / max(val_nz_count, 1))
+
+            # Pearson correlation on non-zero samples
+            if all_nz_true:
+                nz_true_all = np.concatenate(all_nz_true)
+                nz_pred_all = np.concatenate(all_nz_pred)
+                if len(nz_true_all) > 1 and np.std(nz_true_all) > 0 and np.std(nz_pred_all) > 0:
+                    epoch_val_pearson = float(np.corrcoef(nz_true_all, nz_pred_all)[0, 1])
+                val_pearson_nz.append(epoch_val_pearson)
+
+            # Accuracy on zero samples: |pred| < threshold
+            if all_zero_pred:
+                zero_pred_all = np.concatenate(all_zero_pred)
+                epoch_val_zero_acc = float((np.abs(zero_pred_all) < zero_acc_threshold).mean())
+                val_zero_acc.append(epoch_val_zero_acc)
         else:
-            avg_val_loss = float("nan")
+            val_losses_zero.append(float("nan"))
+            val_losses_nz.append(float("nan"))
 
         val_losses.append(avg_val_loss)
 
+        # EMA-smoothed validation loss
+        monitor_loss = avg_val_loss if not math.isnan(avg_val_loss) else avg_train_loss
+        if val_loss_ema is None:
+            val_loss_ema = monitor_loss
+        else:
+            val_loss_ema = ema_alpha * val_loss_ema + (1 - ema_alpha) * monitor_loss
+
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss={avg_train_loss} | Val Loss={avg_val_loss} | LR={current_lr:.3e}")
+        log_msg = (
+            f"Epoch {epoch+1}/{epochs}: Train={avg_train_loss:.6f} Val={avg_val_loss:.6f} "
+            f"ValEMA={val_loss_ema:.6f} LR={current_lr:.3e}"
+        )
+        if not math.isnan(epoch_val_pearson):
+            log_msg += f" | Pearson(NZ)={epoch_val_pearson:.4f}"
+        if not math.isnan(epoch_val_zero_acc):
+            log_msg += f" | ZeroAcc={epoch_val_zero_acc:.4f}"
+        print(log_msg)
 
         utils.append_epoch_log(
             log_file=log_file,
@@ -157,12 +252,18 @@ def train_model(
             train_loss=avg_train_loss,
             val_loss=avg_val_loss if not math.isnan(avg_val_loss) else np.nan,
             lr=current_lr,
+            val_loss_ema=val_loss_ema,
+            train_loss_zero=train_losses_zero[-1],
+            train_loss_nonzero=train_losses_nz[-1],
+            val_loss_zero=val_losses_zero[-1],
+            val_loss_nonzero=val_losses_nz[-1],
+            val_pearson_nonzero=epoch_val_pearson,
+            val_zero_accuracy=epoch_val_zero_acc,
         )
 
-        # Update best metric and early-stopping counter
-        monitor_loss=avg_val_loss if not math.isnan(avg_val_loss) else avg_train_loss
-        earlystopping(monitor_loss)
-        if monitor_loss == earlystopping.best_score:
+        # Update best metric and early-stopping counter (uses EMA-smoothed loss)
+        earlystopping(val_loss_ema)
+        if val_loss_ema == earlystopping.best_score:
             utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
 
         scheduler.step()
@@ -212,7 +313,7 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=32, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers (0 avoids extra memory copies)")
-    parser.add_argument("--samples-per-epoch", type=int, default=90000000, help="Fixed number of unique samples to draw per epoch")
+    parser.add_argument("--samples-per-epoch", type=int, default=8800000, help="Fixed number of unique samples to draw per epoch")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate for optimizer")
     parser.add_argument("--nonzero-loss-weight", type=float, default=10.0, help="Weight multiplier for non-zero labels in MSE loss")
@@ -220,6 +321,9 @@ def main():
     parser.add_argument("--min-delta", type=float, default=1e-100, help="Minimum loss improvement to reset patience")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility of validation sampling and training")
     parser.add_argument("--max-resume-snapshots", type=int, default=5, help="Max number of resume snapshots to keep (0 means keep all)")
+    parser.add_argument("--nonzero-ratio", type=float, default=None, help="Target ratio of non-zero samples per epoch (uses ZeroNonZeroSampler). Default: natural ratio from data")
+    parser.add_argument("--zero-acc-threshold", type=float, default=0.5, help="Threshold for zero-sample accuracy (|pred| < threshold counts as correct)")
+    parser.add_argument("--ema-alpha", type=float, default=0.9, help="EMA smoothing factor for validation loss (0=use raw, higher=smoother)")
     args = parser.parse_args()
 
     # # 允许 cuDNN 自动寻找最适合当前配置的算法（提高速度）
@@ -243,40 +347,91 @@ def main():
     )
 
     pin_memory = torch.cuda.is_available()
-    if args.data == "highquality":
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=pin_memory,
-        )
+    if args.data == "processed":
+        if args.nonzero_ratio is not None:
+            train_sampler = utils.ZeroNonZeroSampler(
+                train_dataset,
+                nonzero_ratio=args.nonzero_ratio,
+                samples_per_epoch=args.samples_per_epoch,
+                seed=args.seed,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                sampler=train_sampler,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+            val_sampler = utils.ZeroNonZeroSampler(
+                val_dataset,
+                nonzero_ratio=args.nonzero_ratio,
+                samples_per_epoch=args.samples_per_epoch,
+                seed=args.seed,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                sampler=val_sampler,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+        else:
+            train_sampler = utils.BalancedEpochSubsetSampler(
+                train_dataset,
+                samples_per_epoch=args.samples_per_epoch,
+                seed=args.seed,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                sampler=train_sampler,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+            val_sampler = utils.BalancedEpochSubsetSampler(
+                val_dataset,
+                samples_per_epoch=args.samples_per_epoch,
+                seed=args.seed,            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                sampler=val_sampler,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+    elif args.data == "highquality":
+        if args.nonzero_ratio is not None:
+            train_sampler = utils.ZeroNonZeroSampler(
+                train_dataset,
+                nonzero_ratio=args.nonzero_ratio,
+                samples_per_epoch=args.samples_per_epoch,
+                seed=args.seed,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                sampler=train_sampler,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers+3,  # more workers for val_loader to speed up evaluation
-            pin_memory=pin_memory,
-        )
-    else:
-        train_sampler = utils.BalancedEpochSubsetSampler(
-            train_dataset,
-            samples_per_epoch=args.samples_per_epoch,
-            seed=args.seed,
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            sampler=train_sampler,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=pin_memory,
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers+3,  # more workers for val_loader to speed up evaluation
             pin_memory=pin_memory,
         )
 
@@ -324,13 +479,17 @@ def main():
         patience=args.patience,
         min_delta=args.min_delta,
         resume_ckpt=resume,
-        save_every=0
+        save_every=0,
+        zero_acc_threshold=args.zero_acc_threshold,
+        ema_alpha=args.ema_alpha,
     )
  
     if args.plot_loss:
         log_file = base_dir / "outputs" / args.exp_name / "log" / "train_log.csv"
         if log_file.exists():
             utils.plot_loss_curves_from_logfile(log_file, save_path=plots_dir / "loss_curve.png")
+            utils.plot_zero_nonzero_loss_curves(log_file, save_path=plots_dir / "zero_nonzero_loss.png")
+            utils.plot_val_metrics(log_file, save_path=plots_dir / "val_metrics.png")
 
             best_model_path = base_dir / "outputs" / args.exp_name / "checkpoints" / "best_model.safetensors"
             if best_model_path.exists():
@@ -339,7 +498,8 @@ def main():
                 model.to(device)
                 print(f"Loaded best model for scatter plot: {best_model_path}")
 
-            utils.plot_pred_scatter(model, val_loader, max_steps=2000, save_path=plots_dir / "pred_vs_true_scatter.png")
+            utils.count_zero_nonzero(val_loader)
+            utils.plot_pred_scatter(model, val_loader, epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
         else:
             print(f"Log file not found for plotting: {log_file}")
 # %%       

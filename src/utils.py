@@ -22,7 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class BalancedEpochSubsetSampler(Sampler):
-    '''Yield a fixed number of unique (promoter, cell) pairs per epoch without building a full permutation.'''
+    '''Yield a fixed number of unique (promoter, cell) pairs per epoch without building a full permutation.
+    This sampler ensures that each promoter is sampled approximately equally in each epoch, 
+    while shuffling the order of promoters and cells.'''
 
     def __init__(self, dataset, samples_per_epoch: int, seed: int = 42):
         self.dataset = dataset
@@ -69,6 +71,76 @@ class BalancedEpochSubsetSampler(Sampler):
             base_idx = int(pro_i) * self.C
             for cell_i in cell_ids:
                 yield base_idx + int(cell_i)
+
+class ZeroNonZeroSampler(Sampler):
+    '''Sample (promoter, cell) pairs with a controllable ratio of zero vs non-zero expression targets.'''
+
+    def __init__(self, dataset, nonzero_ratio=0.5, samples_per_epoch=None, seed=42):
+        self.dataset = dataset
+        self.nonzero_ratio = nonzero_ratio
+        self.samples_per_epoch = int(samples_per_epoch) if samples_per_epoch is not None else int(dataset.P * dataset.C)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.P = int(dataset.P)
+        self.C = int(dataset.C)
+        self.total_len = self.P * self.C
+        if self.total_len <= 0:
+            raise ValueError("Dataset is empty.")
+        self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
+
+        print("Precomputing zero/non-zero pools for sampler...")
+        X_csc = dataset.X.tocsc()
+        cells_set = set(int(c) for c in dataset.cells)
+        nz_indices = [] # store indices of non-zero samples in the flattened (promoter, cell) space
+        zero_counts = np.empty(self.P, dtype=np.int32)
+        for pro_i in range(self.P):
+            col = int(dataset.promoter2expr_idx[pro_i])
+            col_vec = X_csc[:, col].tocoo()
+            nz_rows = {int(r) for r in col_vec.row if int(r) in cells_set}
+            base = pro_i * self.C
+            for cell_i in nz_rows:
+                nz_indices.append(base + int(cell_i))
+            zero_counts[pro_i] = self.C - len(nz_rows) - (self.C - len(cells_set))
+
+        self.nz_indices = np.array(nz_indices, dtype=np.int64)
+        nonzero_cnt = len(self.nz_indices)
+        zero_cnt = self.total_len - nonzero_cnt
+        print(f"  Non-zero: {nonzero_cnt}, Zero: {zero_cnt}, Total: {self.total_len}")
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        n_nz = int(self.samples_per_epoch * self.nonzero_ratio)
+        n_z = self.samples_per_epoch - n_nz
+
+        indices = []
+
+        if n_nz > 0 and len(self.nz_indices) > 0:
+            nz_sample = self.nz_indices[rng.integers(0, len(self.nz_indices), size=n_nz)]
+            indices.append(nz_sample)
+
+        if n_z > 0:
+            nz_set = set(self.nz_indices.tolist())
+            zero_sample = []
+            while len(zero_sample) < n_z:
+                needed = n_z - len(zero_sample)
+                cand = rng.integers(0, self.total_len, size=needed * 2)
+                for c in cand.tolist():
+                    if c not in nz_set:
+                        zero_sample.append(c)
+                        if len(zero_sample) >= n_z:
+                            break
+            indices.append(np.array(zero_sample[:n_z], dtype=np.int64))
+
+        all_idx = np.concatenate(indices)
+        rng.shuffle(all_idx)
+        yield from all_idx.tolist()
+
 
 def get_git_hash():
     try:
@@ -188,17 +260,25 @@ def backup_model_architecture(run_dir: Path, model_name: str):
     print(f"[Model] architecture backup saved: {backup_path}")
 
 
-def append_epoch_log(log_file: Path, epoch: int, train_loss: float, val_loss: float, lr: float):
+def append_epoch_log(log_file: Path, epoch: int, train_loss: float, val_loss: float, lr: float, **extra):
     '''
-    Append a row of training log for the given epoch. 
+    Append a row of training log for the given epoch.
+    Extra keyword arguments are added as additional columns.
     If the log file does not exist, create it and write the header first.
     '''
+    fieldnames = ["epoch", "train_loss", "val_loss", "lr"]
+    extra_keys = sorted(k for k in extra if extra[k] is not None)
+    all_keys = fieldnames + extra_keys
+
     write_header = not log_file.exists()
     with open(log_file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+        writer = csv.DictWriter(f, fieldnames=all_keys)
         if write_header:
-            writer.writerow(["epoch", "train_loss", "val_loss", "lr"])
-        writer.writerow([epoch, train_loss, val_loss, f"{lr:.8e}"])
+            writer.writeheader()
+        row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "lr": f"{lr:.8e}"}
+        for k in extra_keys:
+            row[k] = extra[k]
+        writer.writerow(row)
 
 
 def save_checkpoint(
@@ -313,9 +393,30 @@ def dryrun_cpu(model,train_loader,steps=50,learning_rate=1e-4,save_path: Path | 
     plt.close()
         
 
-def plot_pred_scatter(model, data_loader, max_steps=20000, save_path: Path | None = None):
+def count_zero_nonzero(data_loader):
+    '''Count zero and non-zero targets in a data loader and print summary.'''
+    zero_count = 0
+    nz_count = 0
+    all_y = []
+    for batch in data_loader:
+        _, _, ys = batch
+        zero_count += (ys == 0).sum().item()
+        nz_count += (ys != 0).sum().item()
+        all_y.append(ys.cpu().numpy())
+    y_all = np.concatenate(all_y)
+    total = zero_count + nz_count
+    frac_zero = zero_count / max(total, 1)
+    print(f"[Data] Validation samples: zero={zero_count}, non-zero={nz_count}, "
+          f"zero_frac={frac_zero:.4f}, min={y_all.min():.6f}, max={y_all.max():.6f}, "
+          f"mean={y_all.mean():.6f}")
+    return zero_count, nz_count
+
+
+def plot_pred_scatter(model, data_loader, epoch=1, save_path: Path | None = None):
     '''Plot scatter of true vs predicted values from the model on the given data loader.
     compute Pearson correlation and show it in the title. Only use up to max_steps batches for plotting.
+    highquality data with epoch = 1;
+    processed data with epoch >=2 recommanded;
     '''
     device = next(model.parameters()).device
     model.eval()
@@ -324,18 +425,16 @@ def plot_pred_scatter(model, data_loader, max_steps=20000, save_path: Path | Non
     y_pred_all = []
 
     with torch.no_grad():
-        for step, batch in enumerate(data_loader):
-            promoters, exprs, ys = batch
-            promoters = promoters.to(device, non_blocking=True)
-            exprs = exprs.to(device, non_blocking=True)
-            ys = ys.to(device, non_blocking=True).float()
+        for ep in range(epoch):
+            for batch in data_loader:
+                promoters, exprs, ys = batch
+                promoters = promoters.to(device, non_blocking=True)
+                exprs = exprs.to(device, non_blocking=True)
+                ys = ys.to(device, non_blocking=True).float()
 
-            preds = model(promoters, exprs).squeeze(1)
-            y_true_all.append(ys.detach().cpu().numpy())
-            y_pred_all.append(preds.detach().cpu().numpy())
-
-            if step + 1 >= max_steps:
-                break
+                preds = model(promoters, exprs).squeeze(1)
+                y_true_all.append(ys.detach().cpu().numpy())
+                y_pred_all.append(preds.detach().cpu().numpy())
 
     if not y_true_all:
         print("No samples collected for scatter plot.")
@@ -351,14 +450,39 @@ def plot_pred_scatter(model, data_loader, max_steps=20000, save_path: Path | Non
 
     print(f"Validation Pearson correlation: {corr:.6f}")
 
-    plt.figure(figsize=(6, 6))
-    plt.scatter(y_true, y_pred, s=6, alpha=0.35)
+    zero_mask = y_true == 0
+    nz_mask = ~zero_mask
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    # Left: all points
+    ax1.scatter(y_true, y_pred, s=3, alpha=0.15)
     min_v = float(min(np.min(y_true), np.min(y_pred)))
     max_v = float(max(np.max(y_true), np.max(y_pred)))
-    plt.plot([min_v, max_v], [min_v, max_v], "r--", linewidth=1)
-    plt.xlabel("True")
-    plt.ylabel("Predicted")
-    plt.title(f"True vs Predicted (Pearson={corr:.4f})")
+    ax1.plot([min_v, max_v], [min_v, max_v], "r--", linewidth=1)
+    ax1.set_xlabel("True")
+    ax1.set_ylabel("Predicted")
+    ax1.set_title(f"All samples (Pearson={corr:.4f})")
+
+    # Right: non-zero samples only
+    if nz_mask.any():
+        nz_true = y_true[nz_mask]
+        nz_pred = y_pred[nz_mask]
+        ax2.scatter(nz_true, nz_pred, s=8, alpha=0.5, color="steelblue")
+        nz_min = float(min(np.min(nz_true), np.min(nz_pred)))
+        nz_max = float(max(np.max(nz_true), np.max(nz_pred)))
+        ax2.plot([nz_min, nz_max], [nz_min, nz_max], "r--", linewidth=1)
+        ax2.set_xlabel("True")
+        ax2.set_ylabel("Predicted")
+        if len(nz_true) > 1 and np.std(nz_true) > 0 and np.std(nz_pred) > 0:
+            nz_corr = float(np.corrcoef(nz_true, nz_pred)[0, 1])
+        else:
+            nz_corr = float("nan")
+        ax2.set_title(f"Non-zero only (n={nz_mask.sum()}, Pearson={nz_corr:.4f})")
+    else:
+        ax2.text(0.5, 0.5, "No non-zero samples", ha="center", va="center", transform=ax2.transAxes)
+        ax2.set_title("Non-zero samples")
+
     plt.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,11 +493,15 @@ def plot_pred_scatter(model, data_loader, max_steps=20000, save_path: Path | Non
 def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None):
     df = pd.read_csv(log_file)
     df = df[1:] # skip epoch 0 which may have very different scale due to resume
-    df['train_loss'] = df['train_loss']/ max(df['train_loss'].max(), 1e-8)
-    df['val_loss'] = df['val_loss']/ max(df['train_loss'].max(), 1e-8)
+    overall_max = max(df['train_loss'].max(), df['val_loss'].max(), 1e-8)
+    df['train_loss'] = df['train_loss'] / overall_max
+    df['val_loss'] = df['val_loss'] / overall_max
     plt.figure()
     plt.plot(df["epoch"], df["train_loss"], label="Train Loss")
-    plt.plot(df["epoch"], df["val_loss"], label="Val Loss")
+    plt.plot(df["epoch"], df["val_loss"], label="Val Loss (raw)")
+    if "val_loss_ema" in df.columns:
+        df["val_loss_ema"] = df["val_loss_ema"] / overall_max
+        plt.plot(df["epoch"], df["val_loss_ema"], label="Val Loss (EMA)", linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training and Validation Loss Curve")
@@ -383,4 +511,82 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
         print(f"Loss curve saved to: {save_path}")
+    plt.close()
+
+
+def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None):
+    '''Plot separate loss curves for zero and non-zero samples from the extended log.'''
+    df = pd.read_csv(log_file)
+    df = df[1:] if len(df) > 1 else df
+    required = {"train_loss_zero", "train_loss_nonzero", "val_loss_zero", "val_loss_nonzero"}
+    if not required.issubset(df.columns):
+        print("  Skipping zero/non-zero loss plot: columns not found in log.")
+        return
+
+    nz_max = max(df["train_loss_nonzero"].max(), df["val_loss_nonzero"].max(), 1e-8)
+    z_max = max(df["train_loss_zero"].max(), df["val_loss_zero"].max(), 1e-8)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(df["epoch"], df["train_loss_nonzero"] / nz_max, label="Train NonZero")
+    ax1.plot(df["epoch"], df["val_loss_nonzero"] / nz_max, label="Val NonZero")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Normalized Loss")
+    ax1.set_title("Non-Zero Sample Loss")
+    ax1.legend()
+
+    ax2.plot(df["epoch"], df["train_loss_zero"] / z_max, label="Train Zero")
+    ax2.plot(df["epoch"], df["val_loss_zero"] / z_max, label="Val Zero")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Normalized Loss")
+    ax2.set_title("Zero Sample Loss")
+    ax2.legend()
+
+    plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Zero/non-zero loss curves saved to: {save_path}")
+    plt.close()
+
+
+def plot_val_metrics(log_file: Path, save_path: Path | None = None):
+    '''Plot validation Pearson (non-zero) and accuracy (zero) over epochs.'''
+    df = pd.read_csv(log_file)
+    df = df[1:] if len(df) > 1 else df
+
+    has_pearson = "val_pearson_nonzero" in df.columns
+    has_acc = "val_zero_accuracy" in df.columns
+
+    if not has_pearson and not has_acc:
+        print("  Skipping metrics plot: no val_pearson_nonzero or val_zero_accuracy columns.")
+        return
+
+    n_plots = (has_pearson + has_acc)
+    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 4))
+    if n_plots == 1:
+        axes = [axes]
+
+    plot_idx = 0
+    if has_pearson:
+        axes[plot_idx].plot(df["epoch"], df["val_pearson_nonzero"], "o-", markersize=4)
+        axes[plot_idx].axhline(0, color="gray", linestyle="--", linewidth=0.5)
+        axes[plot_idx].set_xlabel("Epoch")
+        axes[plot_idx].set_ylabel("Pearson r")
+        axes[plot_idx].set_title("Non-Zero Sample Pearson Correlation")
+        plot_idx += 1
+
+    if has_acc:
+        axes[plot_idx].plot(df["epoch"], df["val_zero_accuracy"], "s-", markersize=4)
+        axes[plot_idx].set_xlabel("Epoch")
+        axes[plot_idx].set_ylabel("Accuracy")
+        axes[plot_idx].set_ylim(0, 1)
+        axes[plot_idx].set_title("Zero Sample Accuracy ($|\\hat{y}| < \\epsilon$)")
+        plot_idx += 1
+
+    plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Validation metrics saved to: {save_path}")
     plt.close()

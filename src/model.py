@@ -27,6 +27,53 @@ class SimpleGeneModel(nn.Module):
         return out
 
 
+class DropoutGeneModel(nn.Module):
+    '''More complex model with multi-layer bidirectional LSTM, deeper MLP, and dropout.'''
+
+    def __init__(self, promoter_len=400, promoter_channels=5, hidden_size=64, expr_dim=None, dropout=0.3, lstm_layers=2):
+        super().__init__()
+        if expr_dim is None:
+            raise ValueError("expr_dim must be provided, e.g. from dataset feature dimension")
+
+        self.lstm = nn.LSTM(
+            input_size=promoter_channels,
+            hidden_size=hidden_size,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0,
+        )
+        lstm_out_dim = hidden_size * 2  # bidirectional
+
+        self.expr_fc = nn.Linear(expr_dim, hidden_size * 2)
+        self.expr_dropout = nn.Dropout(dropout)
+
+        self.fc1 = nn.Linear(lstm_out_dim + hidden_size * 2, hidden_size * 2)
+        self.fc1_dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_size * 2, hidden_size)
+        self.fc2_dropout = nn.Dropout(dropout)
+        self.fc_out = nn.Linear(hidden_size, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, promoter, expr):
+        # promoter: (batch, 400, 5)
+        # expr: (batch, expr_dim)
+        lstm_out, _ = self.lstm(promoter)           # (batch, 400, 2*hidden)
+        lstm_out = lstm_out.mean(dim=1)              # (batch, 2*hidden) mean pooling over time
+
+        expr_out = self.relu(self.expr_fc(expr))     # (batch, 2*hidden)
+        expr_out = self.expr_dropout(expr_out)
+
+        combined = torch.cat([lstm_out, expr_out], dim=1)  # (batch, 4*hidden)
+        x = self.relu(self.fc1(combined))
+        x = self.fc1_dropout(x)
+        x = self.relu(self.fc2(x))
+        x = self.fc2_dropout(x)
+        out = self.fc_out(x)                         # (batch, 1)
+        return out
+
+
+## Model registry utilities
 def _collect_model_registry():
     '''Collect all nn.Module subclasses defined in this module into a registry.'''
     registry = {}
