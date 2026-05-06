@@ -318,7 +318,7 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate for optimizer")
     parser.add_argument("--nonzero-loss-weight", type=float, default=10.0, help="Weight multiplier for non-zero labels in MSE loss")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience in epochs")
-    parser.add_argument("--min-delta", type=float, default=1e-100, help="Minimum loss improvement to reset patience")
+    parser.add_argument("--min-delta", type=float, default=1e-2, help="Minimum loss improvement to reset patience")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility of validation sampling and training")
     parser.add_argument("--max-resume-snapshots", type=int, default=5, help="Max number of resume snapshots to keep (0 means keep all)")
     parser.add_argument("--nonzero-ratio", type=float, default=None, help="Target ratio of non-zero samples per epoch (uses ZeroNonZeroSampler). Default: natural ratio from data")

@@ -19,11 +19,15 @@ class EarlyStopping:
         elif val_loss < self.best_score - self.min_delta:
             self.best_score = val_loss
             self.counter = 0
-        else:
+            self.early_stop = False
+        elif abs(val_loss - self.best_score) <= self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-                
+        else:
+            self.counter = 0
+            self.early_stop = False
+
     def state_dict(self):
         return {
             "counter": self.counter,
@@ -33,5 +37,5 @@ class EarlyStopping:
     def load_state_dict(self, state):
         self.counter = state["counter"]
         self.best_score = state["best_score"]
-        self.early_stop = state["early_stop"]
+        self.early_stop = False  # resume always restarts early-stopping
     
