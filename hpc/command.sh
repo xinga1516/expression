@@ -10,7 +10,7 @@
 #SBATCH --overcommit
 #SBATCH --mincpus=8
 #SBATCH --no-requeue
-#SBATCH --array=1-4
+#SBATCH -a 1-4
 
 source /home/jchamper_pkuhpc/miniconda3/etc/profile.d/conda.sh
 conda activate promodel
@@ -31,7 +31,7 @@ BATCH=128
 LR=1e-4
 
 
-if $SLURM_ARRAY_TASK_ID -eq 1; then
+if [ $SLURM_ARRAY_TASK_ID -eq 1 ]; then
     echo "=============================="
     echo "1/4  LSTMmodel (LSTM + Attention)"
     echo "=============================="
@@ -46,7 +46,7 @@ if $SLURM_ARRAY_TASK_ID -eq 1; then
         --plot-loss
 fi
 
-if $SLURM_ARRAY_TASK_ID -eq 2; then
+if [ $SLURM_ARRAY_TASK_ID -eq 2 ]; then
     echo ""
     echo "=============================="
     echo "2/4  ConvAttentionModel (CNN + Attention)"
@@ -62,7 +62,7 @@ if $SLURM_ARRAY_TASK_ID -eq 2; then
         --plot-loss
 fi
 
-if $SLURM_ARRAY_TASK_ID -eq 3; then
+if [ $SLURM_ARRAY_TASK_ID -eq 3 ]; then
     echo ""
     echo "=============================="
     echo "3/4  PromoterBaseline (promoter only)"
@@ -78,7 +78,7 @@ if $SLURM_ARRAY_TASK_ID -eq 3; then
         --plot-loss
 fi
 
-if $SLURM_ARRAY_TASK_ID -eq 3; then
+if [ $SLURM_ARRAY_TASK_ID -eq 4 ]; then
     echo ""
     echo "=============================="
     echo "4/4  ExpressionBaseline (expression only)"

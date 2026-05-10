@@ -281,6 +281,17 @@ def append_epoch_log(log_file: Path, epoch: int, train_loss: float, val_loss: fl
         writer.writerow(row)
 
 
+def append_step_log(step_log_file: Path, step_losses: list, epoch: int, start_step: int):
+    '''Append per-step train losses for an entire epoch to a CSV file in one write.'''
+    write_header = not step_log_file.exists()
+    with open(step_log_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["global_step", "epoch", "train_loss"])
+        if write_header:
+            writer.writeheader()
+        for i, loss in enumerate(step_losses):
+            writer.writerow({"global_step": start_step + i, "epoch": epoch, "train_loss": f"{loss:.8f}"})
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     epoch: int,
@@ -490,23 +501,64 @@ def plot_pred_scatter(model, data_loader, epoch=1, save_path: Path | None = None
         print(f"Scatter plot saved to: {save_path}")
     plt.close()
 
-def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None):
-    df = pd.read_csv(log_file)
-    df = df[1:] # skip epoch 0 which may have very different scale due to resume
-    overall_max = max(df['train_loss'].max(), df['val_loss'].max(), 1e-8)
-    df['train_loss'] = df['train_loss'] / overall_max
-    df['val_loss'] = df['val_loss'] / overall_max
-    plt.figure()
-    plt.plot(df["epoch"], df["train_loss"], label="Train Loss")
-    plt.plot(df["epoch"], df["val_loss"], label="Val Loss (raw)")
-    if "val_loss_ema" in df.columns:
-        df["val_loss_ema"] = df["val_loss_ema"] / overall_max
-        plt.plot(df["epoch"], df["val_loss_ema"], label="Val Loss (EMA)", linewidth=2)
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss Curve")
-    plt.legend()
-    plt.tight_layout()
+def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None, step_log_file: Path | None = None):
+    '''Plot train loss by global_step (from step_train_loss.csv) and val loss by epoch.'''
+    df_epoch = pd.read_csv(log_file)
+    df_epoch = df_epoch[1:]  # skip epoch 0 which may have very different scale due to resume
+    # using max loss for normalization to keep the curve shape visible, especially when resumed training may have different absolute loss values
+    loss_max = max(df_epoch["train_loss"].max(), df_epoch["val_loss"].max(), 1e-8)
+    df_epoch["train_loss"] /= loss_max
+    df_epoch["val_loss"] /= loss_max
+    df_epoch["val_loss_ema"] /= loss_max
+
+    if step_log_file is None:
+        step_log_file = log_file.parent / "step_train_loss.csv"
+
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+
+    # ---- train loss by global_step ----
+    if step_log_file.exists():
+        df_step = pd.read_csv(step_log_file)
+        df_step = df_step[df_step["epoch"] > 1]  # skip epoch 0 which may have different scale due to resume
+        # Map each epoch to its midpoint global_step for val loss alignment
+        step_bounds = df_step.groupby("epoch")["global_step"].agg(["min", "max"])
+        # Normalize train loss
+        train_max = df_step["train_loss"].max()
+        df_step["train_loss"] /= loss_max
+        ax1.plot(df_step["global_step"], df_step["train_loss"], alpha=0.3, linewidth=0.5, color="steelblue", label="Train Loss (step)")
+        # Smoothed train loss: moving average over 500 steps
+        if len(df_step) > 500:
+            df_step["smooth"] = df_step["train_loss"].rolling(500, min_periods=1).mean()
+            ax1.plot(df_step["global_step"], df_step["smooth"], linewidth=1.5, color="steelblue", label="Train Loss (smoothed)")
+        ax1.set_ylabel("Train Loss", color="steelblue")
+        ax1.tick_params(axis="y", labelcolor="steelblue")
+        ax1.set_xlabel("Global Step")
+    else:
+        train_max = df_epoch["train_loss"].max()
+
+    # ---- val loss by epoch ----
+    val_color = "darkorange"
+    if step_log_file.exists():
+        # Map val_loss to each epoch's last step (val is computed at epoch end)
+        endpoints = step_bounds["max"].values
+        steps_last_epoch = 0 if df_step['epoch'].iloc[-1] == df_epoch['epoch'].iloc[-1] else len(df_step) - step_bounds["max"].iloc[-1]
+        if steps_last_epoch:
+            endpoints = endpoints[:-1]  # drop last point if last epoch is incomplete
+        ax1.scatter(endpoints, df_epoch["val_loss"], color=val_color, s=30, zorder=5, label="Val Loss")
+        ax1.plot(endpoints, df_epoch["val_loss"], color=val_color, linewidth=1, alpha=0.6)
+    else:
+        ax1.plot(df_epoch["epoch"], df_epoch["val_loss"], color=val_color, marker="o", linewidth=1.5, label="Val Loss")
+        ax1.set_xlabel("Epoch")
+    if "val_loss_ema" in df_epoch.columns:
+        if step_log_file.exists():
+            ax1.plot(endpoints, df_epoch["val_loss_ema"], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
+        else:
+            ax1.plot(df_epoch["epoch"], df_epoch["val_loss_ema"], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
+    ax1.legend(loc="upper right")
+    ax1.tick_params(axis="y", labelcolor=val_color)
+
+    plt.title("Loss Curve (Train by step, Validation by epoch)")
+    fig.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=200, bbox_inches="tight")

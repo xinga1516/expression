@@ -74,6 +74,10 @@ def train_model(
     base_dir = Path(__file__).resolve().parent.parent
     _, ckpt_dir, _, log_dir = utils._prepare_output_dirs(base_dir, exp_name)
     log_file = log_dir / "train_log.csv"
+    step_log_file = log_dir / "step_train_loss.csv"
+    global_step = 0
+    if step_log_file.exists():
+        global_step = pd.read_csv(step_log_file)["global_step"].max() + 1
 
     start_epoch = 0
     val_loss_ema = None
@@ -113,6 +117,7 @@ def train_model(
         train_nz_count = 0
         train_zero_sum = 0.0
         train_zero_count = 0
+        epoch_step_losses = []
 
         for batch in train_loader:
             promoters, exprs, ys = batch
@@ -125,6 +130,7 @@ def train_model(
             loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             with torch.no_grad():
                 sq = (out - ys) ** 2
@@ -152,10 +158,16 @@ def train_model(
             if device.type == "cuda":
                 torch.cuda.synchronize()
 
+            epoch_step_losses.append(loss.item())
+
         avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
         train_losses.append(avg_train_loss)
         train_losses_zero.append(train_zero_sum / max(train_zero_count, 1))
         train_losses_nz.append(train_nz_sum / max(train_nz_count, 1))
+
+        # Flush step-level train losses
+        utils.append_step_log(step_log_file, epoch_step_losses, epoch + 1, global_step)
+        global_step += len(epoch_step_losses)
 
         # Validation loop
         avg_val_loss = float("nan")
@@ -266,8 +278,6 @@ def train_model(
         if val_loss_ema == earlystopping.best_score:
             utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
 
-        scheduler.step()
-
         utils.save_checkpoint(
             checkpoint_path=ckpt_dir / "last.ckpt",
             epoch=epoch,
@@ -309,14 +319,14 @@ def main():
     parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed"], help="Which dataset version to use (affects data paths in config)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
-    parser.add_argument("--plot-loss", action="store_true", default=False, help="Plot training loss curve after training")
-    parser.add_argument("--hidden-size", type=int, default=32, help="Hidden size for LSTM and MLP in the model")
+    parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
+    parser.add_argument("--hidden-size", type=int, default=64, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers (0 avoids extra memory copies)")
-    parser.add_argument("--samples-per-epoch", type=int, default=8800000, help="Fixed number of unique samples to draw per epoch")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
+    parser.add_argument("--samples-per-epoch", type=int, default=2560000, help="Fixed number of unique samples to draw per epoch")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate for optimizer")
-    parser.add_argument("--nonzero-loss-weight", type=float, default=10.0, help="Weight multiplier for non-zero labels in MSE loss")
+    parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
+    parser.add_argument("--nonzero-loss-weight", type=float, default=2.0, help="Weight multiplier for non-zero labels in MSE loss")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-2, help="Minimum loss improvement to reset patience")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility of validation sampling and training")
