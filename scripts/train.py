@@ -40,6 +40,34 @@ def weighted_mse_loss(pred, target, nonzero_weight=2.0):
     sq = (pred - target) ** 2
     return (weights * sq).sum() / weights.sum().clamp_min(1e-12)
 
+
+def pearson_loss(pred, target, eps=1e-8):
+    """1 - Pearson correlation coefficient as loss (batch-level)."""
+    pred = pred.view(-1)
+    target = target.view(-1)
+
+    pred_mean = pred.mean()
+    target_mean = target.mean()
+
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+
+    cov = (pred_centered * target_centered).sum()
+    pred_var = (pred_centered ** 2).sum()
+    target_var = (target_centered ** 2).sum()
+
+    denom = (pred_var * target_var).sqrt() + eps
+    r = cov / denom
+    return 1.0 - r
+
+
+def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1e-8):
+    """weighted MSE + lambda * (1 - Pearson)."""
+    mse = weighted_mse_loss(pred, target, nonzero_weight)
+    p_loss = pearson_loss(pred, target, eps)
+    return mse + pearson_lambda * p_loss
+
+
 def train_model(
     model,
     train_loader,
@@ -55,6 +83,8 @@ def train_model(
     save_every=0,
     zero_acc_threshold=0.5,
     ema_alpha=0.9,
+    loss_type="mse",
+    pearson_lambda=1.0,
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -127,7 +157,12 @@ def train_model(
 
             optimizer.zero_grad()
             out = model(promoters, exprs).squeeze(1)
-            loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
+            if loss_type == "pearson":
+                loss = pearson_loss(out, ys)
+            elif loss_type == "combined":
+                loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
+            else:
+                loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -160,7 +195,10 @@ def train_model(
 
             epoch_step_losses.append(loss.item())
 
-        avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
+        if loss_type == "pearson":
+            avg_train_loss = sum(epoch_step_losses) / max(len(epoch_step_losses), 1)
+        else:
+            avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
         train_losses.append(avg_train_loss)
         train_losses_zero.append(train_zero_sum / max(train_zero_count, 1))
         train_losses_nz.append(train_nz_sum / max(train_nz_count, 1))
@@ -172,6 +210,7 @@ def train_model(
         # Validation loop
         avg_val_loss = float("nan")
         epoch_val_pearson = float("nan")
+        epoch_val_pearson_all = float("nan")
         epoch_val_zero_acc = float("nan")
 
         if val_loader is not None:
@@ -185,6 +224,8 @@ def train_model(
             all_nz_true = []
             all_nz_pred = []
             all_zero_pred = []
+            all_val_true = []
+            all_val_pred = []
 
             with torch.no_grad():
                 for batch in val_loader:
@@ -217,7 +258,24 @@ def train_model(
                         val_zero_count += zero_cnt
                         all_zero_pred.append(out[zero_mask].cpu().numpy())
 
+                    if loss_type in ("pearson", "combined"):
+                        all_val_true.append(ys.cpu().numpy())
+                        all_val_pred.append(out.cpu().numpy())
+
             avg_val_loss = val_loss_num / max(val_loss_den, 1e-12)
+            if loss_type in ("pearson", "combined") and all_val_true:
+                val_true_all = np.concatenate(all_val_true)
+                val_pred_all = np.concatenate(all_val_pred)
+                if len(val_true_all) > 1 and np.std(val_true_all) > 0 and np.std(val_pred_all) > 0:
+                    epoch_val_pearson_all = float(np.corrcoef(val_true_all, val_pred_all)[0, 1])
+                    if loss_type == "pearson":
+                        avg_val_loss = 1.0 - epoch_val_pearson_all
+                    else:
+                        avg_val_loss = avg_val_loss + pearson_lambda * (1.0 - epoch_val_pearson_all)
+                elif loss_type == "pearson":
+                    avg_val_loss = 1.0
+            elif loss_type == "pearson":
+                avg_val_loss = 1.0
             val_losses_zero.append(val_zero_sum / max(val_zero_count, 1))
             val_losses_nz.append(val_nz_sum / max(val_nz_count, 1))
 
@@ -252,6 +310,8 @@ def train_model(
             f"Epoch {epoch+1}/{epochs}: Train={avg_train_loss:.6f} Val={avg_val_loss:.6f} "
             f"ValEMA={val_loss_ema:.6f} LR={current_lr:.3e}"
         )
+        if not math.isnan(epoch_val_pearson_all):
+            log_msg += f" | Pearson(All)={epoch_val_pearson_all:.4f}"
         if not math.isnan(epoch_val_pearson):
             log_msg += f" | Pearson(NZ)={epoch_val_pearson:.4f}"
         if not math.isnan(epoch_val_zero_acc):
@@ -270,6 +330,7 @@ def train_model(
             val_loss_zero=val_losses_zero[-1],
             val_loss_nonzero=val_losses_nz[-1],
             val_pearson_nonzero=epoch_val_pearson,
+            val_pearson_all=epoch_val_pearson_all,
             val_zero_accuracy=epoch_val_zero_acc,
         )
 
@@ -316,7 +377,7 @@ def main():
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
     parser.add_argument("--model", type=str, default="SimpleGeneModel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
-    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed"], help="Which dataset version to use (affects data paths in config)")
+    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed"], help="Which dataset version to use (affects data paths in config)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
     parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
@@ -334,6 +395,9 @@ def main():
     parser.add_argument("--nonzero-ratio", type=float, default=None, help="Target ratio of non-zero samples per epoch (uses ZeroNonZeroSampler). Default: natural ratio from data")
     parser.add_argument("--zero-acc-threshold", type=float, default=0.5, help="Threshold for zero-sample accuracy (|pred| < threshold counts as correct)")
     parser.add_argument("--ema-alpha", type=float, default=0.9, help="EMA smoothing factor for validation loss (0=use raw, higher=smoother)")
+    parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
+    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "pearson", "combined"], help="Loss function: 'mse' (weighted MSE), 'pearson' (1 - Pearson), or 'combined' (MSE + lambda*(1-Pearson))")
+    parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     args = parser.parse_args()
 
     # # 允许 cuDNN 自动寻找最适合当前配置的算法（提高速度）
@@ -348,16 +412,18 @@ def main():
     train_dataset = MyDataset(
         promoter_file=data_dir / "promoter_train.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
+        cell_ratio=args.cell_ratio,
     )
     val_dataset = MyDataset(
         promoter_file=data_dir / "promoter_val.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
         mode="val",
         seed=args.seed,  # use the same seed to ensure val sampling is consistent with evaluation
+        cell_ratio=args.cell_ratio,
     )
 
     pin_memory = torch.cuda.is_available()
-    if args.data == "processed":
+    if args.data == "processed" or args.data == "log_processed":
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,
@@ -492,6 +558,8 @@ def main():
         save_every=0,
         zero_acc_threshold=args.zero_acc_threshold,
         ema_alpha=args.ema_alpha,
+        loss_type=args.loss,
+        pearson_lambda=args.pearson_lambda,
     )
  
     if args.plot_loss:

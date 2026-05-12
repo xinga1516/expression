@@ -91,6 +91,7 @@ class ZeroNonZeroSampler(Sampler):
         print("Precomputing zero/non-zero pools for sampler...")
         X_csc = dataset.X.tocsc()
         cells_set = set(int(c) for c in dataset.cells)
+        cell_row_to_pos = {int(dataset.cells[pos]): pos for pos in range(self.C)}
         nz_indices = [] # store indices of non-zero samples in the flattened (promoter, cell) space
         zero_counts = np.empty(self.P, dtype=np.int32)
         for pro_i in range(self.P):
@@ -98,9 +99,9 @@ class ZeroNonZeroSampler(Sampler):
             col_vec = X_csc[:, col].tocoo()
             nz_rows = {int(r) for r in col_vec.row if int(r) in cells_set}
             base = pro_i * self.C
-            for cell_i in nz_rows:
-                nz_indices.append(base + int(cell_i))
-            zero_counts[pro_i] = self.C - len(nz_rows) - (self.C - len(cells_set))
+            for cell_row in nz_rows:
+                nz_indices.append(base + cell_row_to_pos[cell_row])
+            zero_counts[pro_i] = self.C - len(nz_rows)
 
         self.nz_indices = np.array(nz_indices, dtype=np.int64)
         nonzero_cnt = len(self.nz_indices)
@@ -200,6 +201,10 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "scrna_file": str(base_dir / "data" / args.data / "integrated_data.h5ad"),
         "expr_dim": int(expr_dim),
         "git_hash": get_git_hash(),
+        "ema_alpha": getattr(args, "ema_alpha", 0.9),
+        "cell_ratio": getattr(args, "cell_ratio", 1.0),
+        "loss_type": getattr(args, "loss", "mse"),
+        "pearson_lambda": getattr(args, "pearson_lambda", 1.0),
     })
 
     with open(config_path, "w", encoding="utf-8") as f:
@@ -504,7 +509,7 @@ def plot_pred_scatter(model, data_loader, epoch=1, save_path: Path | None = None
 def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None, step_log_file: Path | None = None):
     '''Plot train loss by global_step (from step_train_loss.csv) and val loss by epoch.'''
     df_epoch = pd.read_csv(log_file)
-    df_epoch = df_epoch[1:]  # skip epoch 0 which may have very different scale due to resume
+    #df_epoch = df_epoch[1:]  # skip epoch 0 which may have very different scale due to resume
     # using max loss for normalization to keep the curve shape visible, especially when resumed training may have different absolute loss values
     loss_max = max(df_epoch["train_loss"].max(), df_epoch["val_loss"].max(), 1e-8)
     df_epoch["train_loss"] /= loss_max
@@ -519,7 +524,8 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
     # ---- train loss by global_step ----
     if step_log_file.exists():
         df_step = pd.read_csv(step_log_file)
-        df_step = df_step[df_step["epoch"] > 1]  # skip epoch 0 which may have different scale due to resume
+        #df_step = df_step[df_step["epoch"] > 1]  # skip epoch 0 which may have different scale due to resume
+        loss_max = max(df_step["train_loss"].max(), loss_max, 1e-8)
         # Map each epoch to its midpoint global_step for val loss alignment
         step_bounds = df_step.groupby("epoch")["global_step"].agg(["min", "max"])
         # Normalize train loss

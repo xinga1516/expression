@@ -50,7 +50,8 @@ class MyDataset(Dataset):
         scrna_file,
         cell_ids_subset=None,
         mode="train",
-        seed=42
+        seed=42,
+        cell_ratio=1.0,
     ):
         self.promoters = pd.read_csv(promoter_file)
         self.scrna = sc.read(scrna_file, sparse=True)
@@ -87,6 +88,12 @@ class MyDataset(Dataset):
             except KeyError:
                 raise ValueError(f"gene_id {gene_id} not found in scRNA var")
         #print(self.gene2idx)
+
+        if cell_ratio < 1.0:
+            rng = np.random.default_rng(seed if mode == "train" else seed + 1000)
+            n_keep = max(1, int(len(self.cells) * cell_ratio))
+            chosen = rng.choice(len(self.cells), size=n_keep, replace=False)
+            self.cells = self.cells[chosen]
 
         self.P = len(self.promoters)
         self.C = len(self.cells)

@@ -57,11 +57,15 @@ Gene expression prediction from promoter sequences and scRNA-seq data. The model
 
 ### Training (`scripts/train.py`)
 - `weighted_mse_loss`: higher weight on non-zero expression targets
+- `pearson_loss`: 1 - Pearson correlation coefficient (batch-level, select via `--loss pearson`)
 - Cosine annealing LR scheduler, early stopping, periodic checkpointing
 - Checkpoints saved as `.ckpt` (full state) in `outputs/<exp_name>/checkpoints/`
 - Best model saved as `best_model.safetensors`
 - Resume support with snapshot backup and config diff logging
 - Two data modes: `highquality` (shuffled DataLoader) vs `processed` (uses `BalancedEpochSubsetSampler` for fixed-size epochs)
+- `--cell-ratio`: subsample fraction of cells to reduce memory usage (e.g., 0.3 for 30%)
+- `--loss`: choose loss function (`mse`, `pearson`, or `combined`)
+- `--pearson-lambda`: lambda weight for the Pearson term in combined loss (default 1.0)
 
 ### Evaluation (`scripts/evaluate.py`)
 - Computes MSE, MAE, RMSE, R2, Pearson correlation

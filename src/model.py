@@ -46,6 +46,10 @@ class LSTMmodel(nn.Module):
         lstm_out_dim = hidden_size * 2  # bidirectional
 
         self.attn = nn.Linear(lstm_out_dim, 1)  # attention over LSTM time steps
+        # add full connection layer, GELU activation function layer normalization and dropout after attention pooling
+        self.lstm_fc = nn.Linear(lstm_out_dim, hidden_size * 2)
+        self.lstm_norm = nn.LayerNorm(hidden_size * 2)
+        self.lstm_dropout = nn.Dropout(dropout)
 
         self.expr_fc = nn.Linear(expr_dim, hidden_size * 2)
         self.expr_dropout = nn.Dropout(dropout)
@@ -65,6 +69,9 @@ class LSTMmodel(nn.Module):
         attn_scores = self.attn(lstm_out)           # (batch, 400, 1)
         attn_weights = torch.softmax(attn_scores, dim=1)  # (batch, 400, 1)
         lstm_out = (attn_weights * lstm_out).sum(dim=1)   # (batch, 2*hidden)
+        lstm_out = self.lstm_norm(self.lstm_fc(lstm_out))  # (batch, 2*hidden)
+        lstm_out = self.gelu(lstm_out)
+        lstm_out = self.lstm_dropout(lstm_out)
 
         expr_out = self.relu(self.expr_fc(expr))     # (batch, 2*hidden)
         expr_out = self.expr_dropout(expr_out)
