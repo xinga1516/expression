@@ -6,14 +6,14 @@ class EarlyStopping:
     Early stopping utility to stop training when validation loss does not improve for a given number of epochs (patience).
     save checkpoint of the best model when validation loss improves and save last model.
     '''
-    def __init__(self, patience=5, min_delta=0.0):
+    def __init__(self, patience: int = 5, min_delta: float = 0.0) -> None:
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
         self.best_score = None
         self.early_stop = False
 
-    def __call__(self, val_loss):
+    def __call__(self, val_loss: float) -> None:
         if self.best_score is None:
             self.best_score = val_loss
         elif val_loss < self.best_score - self.min_delta:
@@ -28,13 +28,13 @@ class EarlyStopping:
             self.counter = 0
             self.early_stop = False
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
         return {
             "counter": self.counter,
             "best_score": self.best_score,
             "early_stop": self.early_stop,
         }
-    def load_state_dict(self, state):
+    def load_state_dict(self, state: dict) -> None:
         self.counter = state["counter"]
         self.best_score = state["best_score"]
         self.early_stop = False  # resume always restarts early-stopping

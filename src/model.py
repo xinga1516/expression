@@ -1,9 +1,13 @@
 import inspect
 import torch
 import torch.nn as nn
+from typing import Any, Optional
+
+from src.vae import SCVIEncoder
 
 class SimpleGeneModel(nn.Module):
-    def __init__(self, promoter_len=400, promoter_channels=5, hidden_size=32, expr_dim=None):
+    def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 32, expr_dim: Optional[int] = None,
+                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided, e.g. from dataset feature dimension")
@@ -11,16 +15,26 @@ class SimpleGeneModel(nn.Module):
         self.lstm = nn.LSTM(input_size=promoter_channels, hidden_size=hidden_size,
                             batch_first=True)
         # expression MLP
-        self.expr_fc = nn.Linear(expr_dim, hidden_size)
+        self.use_vae = use_vae
+        if use_vae and vae_encoder_path:
+            self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
+            if not vae_fine_tune:
+                for p in self.vae_encoder.parameters():
+                    p.requires_grad = False
+            self.expr_fc = nn.Linear(self.vae_encoder.mean_encoder.out_features, hidden_size)
+        else:
+            self.expr_fc = nn.Linear(expr_dim, hidden_size)
         # output
         self.fc_out = nn.Linear(2 * hidden_size, 1)
         self.relu = nn.ReLU()
 
-    def forward(self, promoter, expr):
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
         # promoter: (batch, 400, 5)
-        # expr: (batch, 16223)
+        # expr: (batch, expr_dim)
         lstm_out, _ = self.lstm(promoter)        # (batch, 400, hidden)
         lstm_out = lstm_out[:, -1, :]            # take last time step -> (batch, hidden)
+        if self.use_vae:
+            expr = self.vae_encoder(expr)         # (batch, n_latent)
         expr_out = self.relu(self.expr_fc(expr)) # (batch, hidden)
         combined = torch.cat([lstm_out, expr_out], dim=1)  # (batch, 2*hidden)
         out = self.fc_out(combined)              # (batch, 1)
@@ -30,7 +44,9 @@ class SimpleGeneModel(nn.Module):
 class LSTMmodel(nn.Module):
     '''More complex model with multi-layer bidirectional LSTM, deeper MLP, and dropout.'''
 
-    def __init__(self, promoter_len=400, promoter_channels=5, hidden_size=64, expr_dim=None, dropout=0.3, lstm_layers=2):
+    def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 64, expr_dim: Optional[int] = None,
+                 dropout: float = 0.3, lstm_layers: int = 2,
+                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided, e.g. from dataset feature dimension")
@@ -46,12 +62,21 @@ class LSTMmodel(nn.Module):
         lstm_out_dim = hidden_size * 2  # bidirectional
 
         self.attn = nn.Linear(lstm_out_dim, 1)  # attention over LSTM time steps
-        # add full connection layer, GELU activation function layer normalization and dropout after attention pooling
+        # add full connection layer, GELU activation function layer, normalization and dropout after attention pooling
         self.lstm_fc = nn.Linear(lstm_out_dim, hidden_size * 2)
+        self.gelu = nn.GELU()
         self.lstm_norm = nn.LayerNorm(hidden_size * 2)
         self.lstm_dropout = nn.Dropout(dropout)
 
-        self.expr_fc = nn.Linear(expr_dim, hidden_size * 2)
+        self.use_vae = use_vae
+        if use_vae and vae_encoder_path:
+            self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
+            if not vae_fine_tune:
+                for p in self.vae_encoder.parameters():
+                    p.requires_grad = False
+            self.expr_fc = nn.Linear(self.vae_encoder.mean_encoder.out_features, hidden_size * 2)
+        else:
+            self.expr_fc = nn.Linear(expr_dim, hidden_size * 2)
         self.expr_dropout = nn.Dropout(dropout)
 
         self.fc1 = nn.Linear(lstm_out_dim + hidden_size * 2, hidden_size * 2)
@@ -61,11 +86,11 @@ class LSTMmodel(nn.Module):
         self.fc_out = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
 
-    def forward(self, promoter, expr):
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
         # promoter: (batch, 400, 5)
         # expr: (batch, expr_dim)
         lstm_out, _ = self.lstm(promoter)           # (batch, 400, 2*hidden)
-        # Attention pooling: ∑α_t · h_t
+        # Attention pooling: sum(alpha_t * h_t)
         attn_scores = self.attn(lstm_out)           # (batch, 400, 1)
         attn_weights = torch.softmax(attn_scores, dim=1)  # (batch, 400, 1)
         lstm_out = (attn_weights * lstm_out).sum(dim=1)   # (batch, 2*hidden)
@@ -73,6 +98,8 @@ class LSTMmodel(nn.Module):
         lstm_out = self.gelu(lstm_out)
         lstm_out = self.lstm_dropout(lstm_out)
 
+        if self.use_vae:
+            expr = self.vae_encoder(expr)             # (batch, n_latent)
         expr_out = self.relu(self.expr_fc(expr))     # (batch, 2*hidden)
         expr_out = self.expr_dropout(expr_out)
 
@@ -86,9 +113,10 @@ class LSTMmodel(nn.Module):
 
 
 class ConvAttentionModel(nn.Module):
-    """Promoter CNN + Attention pooling + Expression MLP → fusion."""
+    """Promoter CNN + Attention pooling + Expression MLP to fusion."""
 
-    def __init__(self, promoter_len=400, promoter_channels=5, hidden_size=128, expr_dim=None, dropout=0.3):
+    def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 128, expr_dim: Optional[int] = None, dropout: float = 0.3,
+                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided")
@@ -99,8 +127,16 @@ class ConvAttentionModel(nn.Module):
         self.promoter_attn = nn.Linear(128, 1)  # attention over conv positions
         self.promoter_fc = nn.Linear(128, 128)
 
-        # Expression branch: Dense(512) → ReLU → Dense(256)
-        self.expr_fc1 = nn.Linear(expr_dim, 512)
+        # Expression branch: (VAE?) → Dense(512) → ReLU → Dense(256)
+        self.use_vae = use_vae
+        if use_vae and vae_encoder_path:
+            self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
+            if not vae_fine_tune:
+                for p in self.vae_encoder.parameters():
+                    p.requires_grad = False
+            self.expr_fc1 = nn.Linear(self.vae_encoder.mean_encoder.out_features, 512)
+        else:
+            self.expr_fc1 = nn.Linear(expr_dim, 512)
         self.expr_dropout1 = nn.Dropout(dropout)
         self.expr_fc2 = nn.Linear(512, 256)
         self.expr_dropout2 = nn.Dropout(dropout)
@@ -111,7 +147,7 @@ class ConvAttentionModel(nn.Module):
         self.fc_out = nn.Linear(128, 1)
         self.relu = nn.ReLU()
 
-    def forward(self, promoter, expr):
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
         # Promoter branch
         p = promoter.permute(0, 2, 1)              # (batch, 5, 400)
         p = self.relu(self.conv1(p))               # (batch, 64, 400)
@@ -124,6 +160,8 @@ class ConvAttentionModel(nn.Module):
         p = self.relu(self.promoter_fc(p))           # (batch, 128)
 
         # Expression branch
+        if self.use_vae:
+            expr = self.vae_encoder(expr)             # (batch, n_latent)
         e = self.relu(self.expr_fc1(expr))           # (batch, 512)
         e = self.expr_dropout1(e)
         e = self.relu(self.expr_fc2(e))              # (batch, 256)
@@ -140,7 +178,7 @@ class ConvAttentionModel(nn.Module):
 class PromoterBaseline(nn.Module):
     """Promoter-only baseline: CNN → attention pooling → output."""
 
-    def __init__(self, promoter_len=400, promoter_channels=5, hidden_size=128, expr_dim=None, dropout=0.3):
+    def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 128, expr_dim: Optional[int] = None, dropout: float = 0.3, **kwargs: Any) -> None:
         super().__init__()
         # Same CNN backbone as ConvAttentionModel promoter branch
         self.conv1 = nn.Conv1d(promoter_channels, 64, kernel_size=8, padding="same")
@@ -150,7 +188,7 @@ class PromoterBaseline(nn.Module):
         self.fc_out = nn.Linear(128, 1)
         self.relu = nn.ReLU()
 
-    def forward(self, promoter, expr):
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
         x = promoter.permute(0, 2, 1)              # (batch, 5, 400)
         x = self.relu(self.conv1(x))               # (batch, 64, 400)
         x = self.relu(self.conv2(x))               # (batch, 128, 400)
@@ -165,21 +203,32 @@ class PromoterBaseline(nn.Module):
 
 
 class ExpressionBaseline(nn.Module):
-    """Expression-only baseline: MLP → output."""
+    """Expression-only baseline: MLP to output."""
 
-    def __init__(self, promoter_len=400, promoter_channels=5, hidden_size=128, expr_dim=None, dropout=0.3):
+    def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 128, expr_dim: Optional[int] = None, dropout: float = 0.3,
+                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided")
-        # Same MLP backbone as ConvAttentionModel expression branch
-        self.fc1 = nn.Linear(expr_dim, 512)
+        # Expression branch: (VAE?) → Dense(512) → ReLU → Dense(256) → output
+        self.use_vae = use_vae
+        if use_vae and vae_encoder_path:
+            self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
+            if not vae_fine_tune:
+                for p in self.vae_encoder.parameters():
+                    p.requires_grad = False
+            self.fc1 = nn.Linear(self.vae_encoder.mean_encoder.out_features, 512)
+        else:
+            self.fc1 = nn.Linear(expr_dim, 512)
         self.dropout1 = nn.Dropout(dropout)
         self.fc2 = nn.Linear(512, 256)
         self.dropout2 = nn.Dropout(dropout)
         self.fc_out = nn.Linear(256, 1)
         self.relu = nn.ReLU()
 
-    def forward(self, promoter, expr):
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
+        if self.use_vae:
+            expr = self.vae_encoder(expr)             # (batch, n_latent)
         x = self.relu(self.fc1(expr))
         x = self.dropout1(x)
         x = self.relu(self.fc2(x))
@@ -189,7 +238,7 @@ class ExpressionBaseline(nn.Module):
 
 
 ## Model registry utilities
-def _collect_model_registry():
+def _collect_model_registry() -> dict:
     '''Collect all nn.Module subclasses defined in this module into a registry.'''
     registry = {}
     for name, obj in globals().items():
@@ -202,13 +251,13 @@ def _collect_model_registry():
 MODEL_REGISTRY = _collect_model_registry()
 
 
-def get_model_class(model_name: str):
+def get_model_class(model_name: str) -> type:
     if model_name not in MODEL_REGISTRY:
         choices = ", ".join(sorted(MODEL_REGISTRY.keys()))
         raise ValueError(f"Unknown model: {model_name}. Available models: {choices}")
     return MODEL_REGISTRY[model_name]
 
 
-def build_model(model_name: str, **kwargs):
+def build_model(model_name: str, **kwargs: Any) -> nn.Module:
     model_cls = get_model_class(model_name)
     return model_cls(**kwargs)

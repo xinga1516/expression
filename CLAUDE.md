@@ -73,6 +73,9 @@ Gene expression prediction from promoter sequences and scRNA-seq data. The model
 ### HPC (`hpc/`)
 - SLURM submission via `command.sh` (GPU partition, conda env `promodel`)
 
+### Coding Conventions
+- All function parameters and return types must have type annotations (e.g., `def foo(x: int, y: str = "") -> bool:`)
+
 ### Dependencies
 - Python 3.10, PyTorch 2.5.1, scanpy 1.11.5, anndata 0.11.4
 - Full conda env in `hpc/server_env.yml`

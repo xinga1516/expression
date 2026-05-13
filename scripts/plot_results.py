@@ -20,7 +20,7 @@ import src.utils as utils
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot training results from an existing experiment.")
     parser.add_argument("--exp_name", type=str, required=True, help="Experiment name (outputs/<exp_name>)")
     parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed"],
@@ -35,7 +35,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
 
     base_dir = PROJECT_ROOT

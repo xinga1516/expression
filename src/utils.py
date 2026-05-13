@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any, Iterator, Optional
 from datetime import datetime
 import json
 import csv
@@ -9,7 +10,7 @@ import argparse
 import sys
 import subprocess
 from torch import nn
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,7 +27,7 @@ class BalancedEpochSubsetSampler(Sampler):
     This sampler ensures that each promoter is sampled approximately equally in each epoch, 
     while shuffling the order of promoters and cells.'''
 
-    def __init__(self, dataset, samples_per_epoch: int, seed: int = 42):
+    def __init__(self, dataset: Any, samples_per_epoch: int, seed: int = 42) -> None:
         self.dataset = dataset
         self.samples_per_epoch = int(samples_per_epoch)
         self.seed = int(seed)
@@ -39,13 +40,13 @@ class BalancedEpochSubsetSampler(Sampler):
             raise ValueError("Dataset is empty.")
         self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
 
-    def set_epoch(self, epoch: int):
+    def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.samples_per_epoch
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[int]:
         rng = np.random.default_rng(self.seed + self.epoch)
 
         promoter_order = rng.permutation(self.P)
@@ -75,7 +76,7 @@ class BalancedEpochSubsetSampler(Sampler):
 class ZeroNonZeroSampler(Sampler):
     '''Sample (promoter, cell) pairs with a controllable ratio of zero vs non-zero expression targets.'''
 
-    def __init__(self, dataset, nonzero_ratio=0.5, samples_per_epoch=None, seed=42):
+    def __init__(self, dataset: Any, nonzero_ratio: float = 0.5, samples_per_epoch: Optional[int] = None, seed: int = 42) -> None:
         self.dataset = dataset
         self.nonzero_ratio = nonzero_ratio
         self.samples_per_epoch = int(samples_per_epoch) if samples_per_epoch is not None else int(dataset.P * dataset.C)
@@ -108,13 +109,13 @@ class ZeroNonZeroSampler(Sampler):
         zero_cnt = self.total_len - nonzero_cnt
         print(f"  Non-zero: {nonzero_cnt}, Zero: {zero_cnt}, Total: {self.total_len}")
 
-    def set_epoch(self, epoch: int):
+    def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.samples_per_epoch
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[int]:
         rng = np.random.default_rng(self.seed + self.epoch)
         n_nz = int(self.samples_per_epoch * self.nonzero_ratio)
         n_z = self.samples_per_epoch - n_nz
@@ -143,14 +144,14 @@ class ZeroNonZeroSampler(Sampler):
         yield from all_idx.tolist()
 
 
-def get_git_hash():
+def get_git_hash() -> str:
     try:
         # 执行 git 命令获取当前的 commit id
         return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
     except:
         return "Not a git repository"
 
-def _prepare_output_dirs(base_dir: Path, exp_name: str):
+def _prepare_output_dirs(base_dir: Path, exp_name: str) -> tuple[Path, Path, Path, Path]:
     '''Prepare experiment-specific output directories under base_dir/outputs/exp_name.'''
     run_dir = base_dir / "outputs" / exp_name
     ckpt_dir = run_dir / "checkpoints"
@@ -162,7 +163,7 @@ def _prepare_output_dirs(base_dir: Path, exp_name: str):
     return run_dir, ckpt_dir, plot_dir, log_dir
 
 
-def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path, expr_dim: int, resume_path: str):
+def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path, expr_dim: int, resume_path: str) -> tuple[dict, dict]:
     '''Save run hyperparameters/config to JSON in the experiment output folder.
     Returns previous run config (if exists) and the new config.
     '''
@@ -205,6 +206,9 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "cell_ratio": getattr(args, "cell_ratio", 1.0),
         "loss_type": getattr(args, "loss", "mse"),
         "pearson_lambda": getattr(args, "pearson_lambda", 1.0),
+        "use_vae": getattr(args, "vae_encoder", None) is not None,
+        "vae_encoder_path": getattr(args, "vae_encoder", None),
+        "vae_fine_tune": getattr(args, "vae_fine_tune", False),
     })
 
     with open(config_path, "w", encoding="utf-8") as f:
@@ -213,7 +217,7 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
     return previous_cfg, cfg
 
 
-def append_resume_config_history(log_path: Path, resume_ckpt: str, previous_cfg: dict, current_cfg: dict):
+def append_resume_config_history(log_path: Path, resume_ckpt: str, previous_cfg: dict, current_cfg: dict) -> None:
     '''Append timestamp and changed hyperparameters for resumed training runs.'''
     changed = {}
     all_keys = set(previous_cfg.keys()) | set(current_cfg.keys())
@@ -237,7 +241,7 @@ def append_resume_config_history(log_path: Path, resume_ckpt: str, previous_cfg:
     print(f"[Config] resume history appended: {log_path}")
 
 
-def save_resume_snapshot(ckpt_dir: Path, resume_ckpt: Path, max_keep: int = 5):
+def save_resume_snapshot(ckpt_dir: Path, resume_ckpt: Path, max_keep: int = 5) -> None:
     '''Save a timestamped snapshot before resumed training and keep only the latest max_keep snapshots.'''
     snapshot_dir = ckpt_dir / "resume_snapshots"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -256,7 +260,7 @@ def save_resume_snapshot(ckpt_dir: Path, resume_ckpt: Path, max_keep: int = 5):
             print(f"[Resume] pruned {len(snapshots) - max_keep} old snapshots (keep={max_keep})")
 
 
-def backup_model_architecture(run_dir: Path, model_name: str):
+def backup_model_architecture(run_dir: Path, model_name: str) -> None:
     '''Backup model architecture source code to the experiment output directory.'''
     src_model_path = PROJECT_ROOT / "src" / "model.py"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -265,7 +269,7 @@ def backup_model_architecture(run_dir: Path, model_name: str):
     print(f"[Model] architecture backup saved: {backup_path}")
 
 
-def append_epoch_log(log_file: Path, epoch: int, train_loss: float, val_loss: float, lr: float, **extra):
+def append_epoch_log(log_file: Path, epoch: int, train_loss: float, val_loss: float, lr: float, **extra: Any) -> None:
     '''
     Append a row of training log for the given epoch.
     Extra keyword arguments are added as additional columns.
@@ -286,7 +290,7 @@ def append_epoch_log(log_file: Path, epoch: int, train_loss: float, val_loss: fl
         writer.writerow(row)
 
 
-def append_step_log(step_log_file: Path, step_losses: list, epoch: int, start_step: int):
+def append_step_log(step_log_file: Path, step_losses: list[float], epoch: int, start_step: int) -> None:
     '''Append per-step train losses for an entire epoch to a CSV file in one write.'''
     write_header = not step_log_file.exists()
     with open(step_log_file, "a", newline="", encoding="utf-8") as f:
@@ -304,9 +308,9 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     earlystopping: EarlyStopping,
-    train_losses: list,
-    val_losses: list,
-):
+    train_losses: list[float],
+    val_losses: list[float],
+) -> None:
     '''Save the training state to a checkpoint file.'''
     state = {
         "epoch": epoch,
@@ -329,7 +333,7 @@ def resume_from_checkpoint(
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     earlystopping: EarlyStopping,
     device: torch.device,
-):
+) -> tuple[int, EarlyStopping, list[float], list[float]]:
     '''Load the training state from a checkpoint file and move optimizer state to device.'''
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
@@ -348,7 +352,7 @@ def resume_from_checkpoint(
     val_losses = list(ckpt.get("val_losses", []))
     return start_epoch, earlystopping, train_losses, val_losses
 
-def robust_save_model(model: nn.Module, save_path: Path):
+def robust_save_model(model: nn.Module, save_path: Path) -> None:
     temp_path = save_path.with_suffix(".tmp")
     try:
         save_file(model.state_dict(), temp_path)
@@ -360,7 +364,7 @@ def robust_save_model(model: nn.Module, save_path: Path):
             temp_path.unlink()
         raise e
     
-def dryrun_cpu(model,train_loader,steps=50,learning_rate=1e-4,save_path: Path | None = None):
+def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, learning_rate: float = 1e-4, save_path: Path | None = None) -> None:
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
     
@@ -393,8 +397,9 @@ def dryrun_cpu(model,train_loader,steps=50,learning_rate=1e-4,save_path: Path | 
     # parameters and gradients after training
     for name, p in model.named_parameters():
         diff = torch.norm(p.detach() - params_before[name]).item()
+        grad_norm = p.grad.norm().item() if p.grad is not None else 0.0
         print(f"{name:30s} param_diff = {diff:.6e}")
-        print(name, p.grad is None, p.grad.norm().item())
+        print(name, p.grad is None, grad_norm)
     # loss 曲线
     plt.figure()
     plt.plot(losses)
@@ -409,7 +414,7 @@ def dryrun_cpu(model,train_loader,steps=50,learning_rate=1e-4,save_path: Path | 
     plt.close()
         
 
-def count_zero_nonzero(data_loader):
+def count_zero_nonzero(data_loader: DataLoader) -> tuple[int, int]:
     '''Count zero and non-zero targets in a data loader and print summary.'''
     zero_count = 0
     nz_count = 0
@@ -428,7 +433,7 @@ def count_zero_nonzero(data_loader):
     return zero_count, nz_count
 
 
-def plot_pred_scatter(model, data_loader, epoch=1, save_path: Path | None = None):
+def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1, save_path: Path | None = None) -> None:
     '''Plot scatter of true vs predicted values from the model on the given data loader.
     compute Pearson correlation and show it in the title. Only use up to max_steps batches for plotting.
     highquality data with epoch = 1;
@@ -506,7 +511,7 @@ def plot_pred_scatter(model, data_loader, epoch=1, save_path: Path | None = None
         print(f"Scatter plot saved to: {save_path}")
     plt.close()
 
-def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None, step_log_file: Path | None = None):
+def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None, step_log_file: Path | None = None) -> None:
     '''Plot train loss by global_step (from step_train_loss.csv) and val loss by epoch.'''
     df_epoch = pd.read_csv(log_file)
     #df_epoch = df_epoch[1:]  # skip epoch 0 which may have very different scale due to resume
@@ -572,7 +577,7 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
     plt.close()
 
 
-def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None):
+def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None) -> None:
     '''Plot separate loss curves for zero and non-zero samples from the extended log.'''
     df = pd.read_csv(log_file)
     df = df[1:] if len(df) > 1 else df
@@ -608,7 +613,7 @@ def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None)
     plt.close()
 
 
-def plot_val_metrics(log_file: Path, save_path: Path | None = None):
+def plot_val_metrics(log_file: Path, save_path: Path | None = None) -> None:
     '''Plot validation Pearson (non-zero) and accuracy (zero) over epochs.'''
     df = pd.read_csv(log_file)
     df = df[1:] if len(df) > 1 else df

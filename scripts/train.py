@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 import shutil
 import sys
+from typing import Optional
 
 import torch
 import time
@@ -33,7 +34,7 @@ import src.utils as utils
 from safetensors.torch import save_file, load_file
 
 
-def weighted_mse_loss(pred, target, nonzero_weight=2.0):
+def weighted_mse_loss(pred: torch.Tensor, target: torch.Tensor, nonzero_weight: float = 2.0) -> torch.Tensor:
     """MSE with higher weight on non-zero targets."""
     weights = torch.ones_like(target)
     weights[target != 0] = nonzero_weight
@@ -41,7 +42,7 @@ def weighted_mse_loss(pred, target, nonzero_weight=2.0):
     return (weights * sq).sum() / weights.sum().clamp_min(1e-12)
 
 
-def pearson_loss(pred, target, eps=1e-8):
+def pearson_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """1 - Pearson correlation coefficient as loss (batch-level)."""
     pred = pred.view(-1)
     target = target.view(-1)
@@ -61,7 +62,7 @@ def pearson_loss(pred, target, eps=1e-8):
     return 1.0 - r
 
 
-def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1e-8):
+def pearson_mse_loss(pred: torch.Tensor, target: torch.Tensor, nonzero_weight: float = 2.0, pearson_lambda: float = 1.0, eps: float = 1e-8) -> torch.Tensor:
     """weighted MSE + lambda * (1 - Pearson)."""
     mse = weighted_mse_loss(pred, target, nonzero_weight)
     p_loss = pearson_loss(pred, target, eps)
@@ -69,23 +70,23 @@ def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1
 
 
 def train_model(
-    model,
-    train_loader,
-    val_loader,
-    exp_name,
-    epochs=30,
-    learning_rate=1e-4,
-    nonzero_loss_weight=2.0,
-    seed=42,
-    patience=5,
-    min_delta=0.0,
-    resume_ckpt=None,
-    save_every=0,
-    zero_acc_threshold=0.5,
-    ema_alpha=0.9,
-    loss_type="mse",
-    pearson_lambda=1.0,
-):
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: Optional[DataLoader],
+    exp_name: str,
+    epochs: int = 30,
+    learning_rate: float = 1e-4,
+    nonzero_loss_weight: float = 2.0,
+    seed: int = 42,
+    patience: int = 5,
+    min_delta: float = 0.0,
+    resume_ckpt: Optional[str] = None,
+    save_every: int = 0,
+    zero_acc_threshold: float = 0.5,
+    ema_alpha: float = 0.9,
+    loss_type: str = "mse",
+    pearson_lambda: float = 1.0,
+) -> None:
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -372,7 +373,7 @@ def train_model(
     print(f"Training done. logs: {log_file} | checkpoints: {ckpt_dir}")
         
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Train a gene expression model.")
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
@@ -398,6 +399,8 @@ def main():
     parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "pearson", "combined"], help="Loss function: 'mse' (weighted MSE), 'pearson' (1 - Pearson), or 'combined' (MSE + lambda*(1-Pearson))")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
+    parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
+    parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
     args = parser.parse_args()
 
     # # 允许 cuDNN 自动寻找最适合当前配置的算法（提高速度）
@@ -512,7 +515,16 @@ def main():
         )
 
     expr_dim = train_dataset.X.shape[1]
-    model = build_model(args.model, expr_dim=expr_dim, hidden_size=args.hidden_size)
+    if args.vae_encoder is not None and not Path(args.vae_encoder).exists():
+        raise FileNotFoundError(f"VAE encoder dir not found: {args.vae_encoder}")
+    model = build_model(
+        args.model,
+        expr_dim=expr_dim,
+        hidden_size=args.hidden_size,
+        use_vae=args.vae_encoder is not None,
+        vae_encoder_path=args.vae_encoder,
+        vae_fine_tune=args.vae_fine_tune,
+    )
 
     run_dir, ckpt_dir, plots_dir, _ = utils._prepare_output_dirs(base_dir, args.exp_name)
     has_model_backup = any(run_dir.glob("model_arch_*.py"))

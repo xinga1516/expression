@@ -1,5 +1,6 @@
 import json
 import pathlib
+from typing import Optional
 
 import numpy as np
 import scanpy as sc
@@ -11,7 +12,7 @@ data_dir = project_root / "data" / "log_processed"#"highquality"
 out_dir = data_dir#project_root / "outputs"
 
 
-def _summary_stats(arr: np.ndarray):
+def _summary_stats(arr: np.ndarray) -> dict[str, Optional[float]]:
     if arr.size == 0:
         return {
             "mean": None,
@@ -38,7 +39,7 @@ def _summary_stats(arr: np.ndarray):
     }
 
 
-def summarize_integrated_data(h5ad_path: pathlib.Path):
+def summarize_integrated_data(h5ad_path: pathlib.Path) -> dict:
     adata = sc.read_h5ad(h5ad_path)
     X = adata.X
 
@@ -84,7 +85,7 @@ def summarize_integrated_data(h5ad_path: pathlib.Path):
     return summary
 
 
-def main():
+def main() -> None:
     h5ad_path = data_dir / "integrated_data.h5ad"
     summary = summarize_integrated_data(h5ad_path)
 

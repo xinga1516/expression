@@ -11,13 +11,14 @@ import re
 import pyranges as pr
 import matplotlib.pyplot as plt
 from pathlib import Path
+from typing import Optional, Any
 
 def hdf5_matrix_to_sparse(
-    mat,
-    chunk_size=5000,
-    transpose=True,
-    dtype=np.float32,
-):
+    mat: Any,
+    chunk_size: int = 5000,
+    transpose: bool = True,
+    dtype: type = np.float32,
+) -> sparse.csr_matrix:
     """
     Convert an HDF5 dense-looking dataset (genes × cells)
     into a scipy sparse matrix safely using chunking.
@@ -78,7 +79,7 @@ def hdf5_matrix_to_sparse(
     return X
 
 
-def add_gene_annotation(rawdata, synonym_path=None, gtf_path=None):
+def add_gene_annotation(rawdata: ad.AnnData, synonym_path: Optional[str] = None, gtf_path: Optional[str] = None) -> ad.AnnData:
     """
     Add FlyBase annotation for genes in an AnnData object.
 
@@ -174,7 +175,7 @@ def add_gene_annotation(rawdata, synonym_path=None, gtf_path=None):
 
     return rawdata
 
-def build_integrated_data():
+def build_integrated_data() -> ad.AnnData:
     '''
     Build integrated single-cell RNA sequencing data.
     '''
@@ -207,7 +208,7 @@ def build_integrated_data():
     )
     return rawdata
 
-def filter_cells(rawdata, top_total_fraction=0.10, plot_qc=True):
+def filter_cells(rawdata: ad.AnnData, top_total_fraction: float = 0.10, plot_qc: bool = True) -> ad.AnnData:
     # filter cells based on quality control metrics
     # AnnData here stores raw UMI counts in X, so make sure QC uses counts explicitly.
     if 'counts' not in rawdata.layers:
@@ -255,12 +256,12 @@ def filter_cells(rawdata, top_total_fraction=0.10, plot_qc=True):
     return filtered_data
 
 def split_train_val(
-    df,
-    train_ratio=0.8,
-    val_ratio=0.1,
-    test_ratio=0.1,
-    output_dir=None,
-):
+    df: pd.DataFrame,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    output_dir: Optional[Path] = None,
+) -> tuple:
     """
     按每条染色体上的物理位置排序后，按样本个数比例切分为连续区间。
     这样 train/val/test 都是位置连续块，同时数量由比例控制。
@@ -360,7 +361,7 @@ def split_train_val(
 
     return train_genes, val_genes, test_genes
 
-def filter_genes(rawdata):
+def filter_genes(rawdata: ad.AnnData) -> ad.AnnData:
     '''
     For anndata: remove genes without promoter sequence, and output file as integrated_data.h5ad
     and split the data into train/val/test sets by gene, and output promoter csv files for each set.
@@ -424,7 +425,7 @@ def filter_genes(rawdata):
 
     return filtered_data
 
-def compute_tpm(rawdata):
+def compute_tpm(rawdata: ad.AnnData) -> ad.AnnData:
     sc.pp.normalize_total(rawdata, target_sum=1e6) # 将每个细胞的总表达量归一化到 1,000,000（TPM）
     sc.pp.log1p(rawdata) # 对归一化后的数据进行 log1p 转换（log(x + 1)），以减小数据范围并处理零值。
     # # using gene length to compute RPKM/FPKM
@@ -432,7 +433,7 @@ def compute_tpm(rawdata):
     # rawdata.X = rawdata.X / gene_length_kb.values[np.newaxis, :]
     return rawdata
 
-def draw_high_quality_samples(rawdata, top_total_fraction=0.10):
+def draw_high_quality_samples(rawdata: ad.AnnData, top_total_fraction: float = 0.10) -> ad.AnnData:
     ''' delete genes with zero expression across all cells, 
     and select highly variable genes'''
     sc.pp.highly_variable_genes(rawdata, flavor="seurat_v3", n_top_genes=2000)
@@ -440,7 +441,7 @@ def draw_high_quality_samples(rawdata, top_total_fraction=0.10):
     return rawdata
 
 # %%
-def main():
+def main() -> None:
     base_dir = Path(__file__).resolve().parent.parent
     # rawdata = build_integrated_data()
     # # %%

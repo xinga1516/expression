@@ -10,10 +10,12 @@ import scanpy as sc
 import numpy as np
 from torch.utils.data import Dataset
 from scipy import sparse
+from pathlib import Path
+from typing import Optional
 
 class PromoterOneHotEncoder:
     # One-hot encode DNA sequence (pad with N up to fixed length).
-    def __init__(self, length=400):
+    def __init__(self, length: int = 400) -> None:
         self.length = length
         self.vocab = {
             "A": 0,
@@ -24,7 +26,7 @@ class PromoterOneHotEncoder:
         }
         self.num_channels = 5
 
-    def __call__(self, seq: str):
+    def __call__(self, seq: str) -> torch.Tensor:
         """
         seq: str, length <= self.length
         return: FloatTensor (length, 5)
@@ -46,13 +48,13 @@ class PromoterOneHotEncoder:
 class MyDataset(Dataset):
     def __init__(
         self,
-        promoter_file,
-        scrna_file,
-        cell_ids_subset=None,
-        mode="train",
-        seed=42,
-        cell_ratio=1.0,
-    ):
+        promoter_file: str | Path,
+        scrna_file: str | Path,
+        cell_ids_subset: Optional[np.ndarray] = None,
+        mode: str = "train",
+        seed: int = 42,
+        cell_ratio: float = 1.0,
+    ) -> None:
         self.promoters = pd.read_csv(promoter_file)
         self.scrna = sc.read(scrna_file, sparse=True)
         # CSR: fast row access; CSC: fast column access.
@@ -100,7 +102,7 @@ class MyDataset(Dataset):
         self.mode = mode
         self.seed = seed
 
-    def _preencode_promoters(self):
+    def _preencode_promoters(self) -> torch.Tensor:
         sequences = self.promoters["sequence"].values
         n = len(sequences)
 
@@ -117,10 +119,10 @@ class MyDataset(Dataset):
 
         return promoter_tensor
     
-    def __len__(self):
+    def __len__(self) -> int:
         return self.P * self.C
 
-    def in_getitem(self, pro_i, cell_i):
+    def in_getitem(self, pro_i: int, cell_i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         promoter = self.promoter_tensor[pro_i]
         #gene_id = (self.promoters["gene_id"]).iloc[pro_i]
         cell_id = self.cells[cell_i]
@@ -136,7 +138,7 @@ class MyDataset(Dataset):
         
         return promoter, expr_all, y
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pro_i = idx // self.C
         cell_i = idx % self.C
         

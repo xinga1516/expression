@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 import argparse
 from pathlib import Path
 
@@ -12,17 +13,17 @@ from scipy import sparse
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _clean_gene_ids(values) -> pd.Series:
+def _clean_gene_ids(values: pd.Series) -> pd.Series:
     return pd.Series(values, dtype="string").str.strip()
 
 
-def load_h5ad(h5ad_file: Path):
+def load_h5ad(h5ad_file: Path) -> Any:
     if not h5ad_file.exists():
         raise FileNotFoundError(f"h5ad file not found: {h5ad_file}")
     return sc.read_h5ad(h5ad_file)
 
 
-def check_h5ad(adata, gene_col: str = "gene_id") -> dict:
+def check_h5ad(adata: Any, gene_col: str = "gene_id") -> dict:
     print(f"[h5ad] shape={adata.shape}")
 
     X = adata.X
@@ -131,7 +132,7 @@ def check_gene_id_alignment(h5ad_gene_ids: pd.Series, promoter_gene_ids: pd.Seri
     }
 
 
-def check_target_values(adata, promoter_gene_ids: pd.Series, n_cells: int = 200, seed: int = 42) -> None:
+def check_target_values(adata: Any, promoter_gene_ids: pd.Series, n_cells: int = 200, seed: int = 42) -> None:
     valid_promoter_gene_ids = promoter_gene_ids.dropna()
     valid_promoter_gene_ids = valid_promoter_gene_ids[valid_promoter_gene_ids != ""].drop_duplicates()
     gene_to_idx = {gene_id: i for i, gene_id in enumerate(_clean_gene_ids(adata.var["gene_id"]))}
