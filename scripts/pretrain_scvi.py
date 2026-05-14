@@ -15,8 +15,8 @@ Saves:
         metrics.json       -- reconstruction Pearson r, MSE
 
 Usage:
-    python scripts/pretrain_scvi.py --n-latent 10 --epochs 100
-    python scripts/pretrain_scvi.py --n-latent 20 --n-hidden 256 --n-layers 2 --epochs 200
+    python scripts/pretrain_scvi.py --n-latent 64 --epochs 200 --lr 1e-3 --lr-patience 15
+    python scripts/pretrain_scvi.py --data umi_highquality --n-latent 128 --epochs 300 --lr 1e-3 --lr-patience 10
 """
 
 import argparse
@@ -97,7 +97,7 @@ def plot_loss_curves(history: dict, save_path: Path) -> None:
     print(f"[Eval] Loss curves saved to: {save_path}")
 
 
-def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: int = 2000, n_points: int = 80000, seed: int = 42) -> dict:
+def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: int = 8000, n_points: int = 8000000, seed: int = 42) -> dict:
     """Scatter-plot true vs reconstructed expression and compute Pearson r + MSE.
 
     Subsets cells (keeping all genes to satisfy scVI), then randomly samples
@@ -111,14 +111,16 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
     cell_idx = rng.choice(total_cells, size=n_cells, replace=False)
     adata_sub = adata[cell_idx, :].copy()
 
-    # Original expression (raw counts → log1p)
+    # Normalize raw counts to library-size scale matching get_normalized_expression
     X_sub = adata_sub.X
     if hasattr(X_sub, "toarray"):
         X_sub = X_sub.toarray()
     X_sub = np.asarray(X_sub, dtype=np.float64)
+    X_sub = X_sub / np.maximum(np.sum(X_sub, axis=1, keepdims=True), 1e-9)
 
-    # Reconstructed: scVI normalized expression → log1p
-    recon = model.get_normalized_expression(adata_sub)
+    # Reconstructed: scVI normalized expression (same library-size scale)
+    recon = model.get_normalized_expression(adata_sub,library_size=1.0)
+    #recon = model.posterior_predictive_sample(adata_sub, n_samples=128)
     if hasattr(recon, "toarray"):
         recon = recon.toarray()
     elif hasattr(recon, "to_numpy"):
@@ -145,7 +147,7 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
 
     # Plot
     fig, ax = plt.subplots(figsize=(7, 7))
-    ax.scatter(t, p, s=1, alpha=0.15, color="steelblue")
+    ax.scatter(t, p, s=2, alpha=0.5, color="steelblue")
     lo, hi = float(np.min([t, p])), float(np.max([t, p]))
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, label="y = x")
     ax.set_xlabel("True log1p(expr)")
@@ -165,34 +167,43 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pretrain scVI on scRNA-seq data")
-    parser.add_argument("--data", type=str, default="processed",
-                        help="Data version (must have raw UMI counts)")
-    parser.add_argument("--n-latent", type=int, default=128,
+    parser.add_argument("--data", type=str, default="umi_highquality",
+                        choices=["umi_processed", "umi_highquality", "processed", "log_processed"],
+                        help="Data version (umi_* = raw UMI counts)")
+    parser.add_argument("--n-latent", type=int, default=64,
                         help="Latent dimension")
     parser.add_argument("--n-hidden", type=int, default=512,
                         help="Hidden units in encoder/decoder")
     parser.add_argument("--n-layers", type=int, default=2,
                         help="Number of hidden layers")
-    parser.add_argument("--dropout-rate", type=float, default=0.1,
+    parser.add_argument("--dropout-rate", type=float, default=0.0,
                         help="Dropout rate")
-    parser.add_argument("--epochs", type=int, default=50,
+    parser.add_argument("--epochs", type=int, default=300,
                         help="Max training epochs")
-    parser.add_argument("--batch-size", type=int, default=256,
+    parser.add_argument("--batch-size", type=int, default=512,
                         help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3,
+    parser.add_argument("--lr", type=float, default=5e-3,
                         help="Learning rate")
+    parser.add_argument("--lr-patience", type=int, default=25,
+                        help="Epochs of no improvement before reducing LR (0 = no reduction)")
+    parser.add_argument("--lr-factor", type=float, default=0.6,
+                        help="Factor by which to reduce LR on plateau")
+    parser.add_argument("--lr-threshold", type=float, default=3e-3,
+                        help="Relative improvement threshold for LR reduction (default 0.1%% of best ELBO)")
     parser.add_argument("--val-size", type=float, default=0.1,
                         help="Fraction of cells held out for validation")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--load-model", type=str, default=None,
+                        help="Path to saved scVI model dir (skip training, only evaluate + update encoder)")
     args = parser.parse_args()
+
+    if args.load_model and not Path(args.load_model).exists():
+        raise FileNotFoundError(f"Model dir not found: {args.load_model}")
 
     data_path = PROJECT_ROOT / "data" / args.data / "integrated_data.h5ad"
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found in {PROJECT_ROOT / 'data' / args.data}")
-
-    out_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.n_latent}"
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     eval_dir = PROJECT_ROOT / "outputs" / "pretrain_vae"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -207,28 +218,52 @@ def main() -> None:
     print("Setting up AnnData for scVI...")
     SCVI.setup_anndata(adata)
 
-    print(f"Building scVI model: n_latent={args.n_latent}, n_hidden={args.n_hidden}, "
-          f"n_layers={args.n_layers}")
-    model = SCVI(
-        adata,
-        n_latent=args.n_latent,
-        n_hidden=args.n_hidden,
-        n_layers=args.n_layers,
-        dropout_rate=args.dropout_rate,
-    )
+    if args.load_model:
+        print(f"Loading model from: {args.load_model}")
+        model = SCVI.load(args.load_model, adata=adata)
+        args.n_latent = model.module.n_latent
+        # Extract n_hidden / n_layers from encoder structure
+        enc = model.module.z_encoder
+        n_hidden_loaded = enc.encoder.fc_layers[0][0].out_features
+        n_layers_loaded = len(enc.encoder.fc_layers)
+        args.n_hidden = n_hidden_loaded
+        args.n_layers = n_layers_loaded
+        print(f"  Loaded: n_latent={args.n_latent}, n_hidden={args.n_hidden}, n_layers={args.n_layers}")
 
-    train_size = 1.0 - args.val_size
-    print(f"Training for up to {args.epochs} epochs (train={train_size:.0%}, val={args.val_size:.0%})...")
-    model.train(
-        max_epochs=args.epochs,
-        batch_size=args.batch_size,
-        accelerator="auto",
-        enable_progress_bar=True,
-        plan_kwargs={"lr": args.lr},
-        train_size=train_size,
-        validation_size=args.val_size,
-        check_val_every_n_epoch=1,
-    )
+    else:
+        print(f"Building scVI model: n_latent={args.n_latent}, n_hidden={args.n_hidden}, "
+              f"n_layers={args.n_layers}")
+        model = SCVI(
+            adata,
+            n_latent=args.n_latent,
+            n_hidden=args.n_hidden,
+            n_layers=args.n_layers,
+            dropout_rate=args.dropout_rate,
+        )
+        train_size = 1.0 - args.val_size
+        print(f"Training for up to {args.epochs} epochs (train={train_size:.0%}, val={args.val_size:.0%})...")
+        model.train(
+            max_epochs=args.epochs,
+            early_stopping=True,
+            early_stopping_monitor="elbo_validation",
+            batch_size=args.batch_size,
+            accelerator="auto",
+            enable_progress_bar=True,
+            plan_kwargs={
+                "lr": args.lr,
+                "n_epochs_kl_warmup": 1000,
+                "reduce_lr_on_plateau": args.lr_patience > 0,
+                "lr_patience": args.lr_patience,
+                "lr_factor": args.lr_factor,
+                "lr_threshold": args.lr_threshold,
+            },
+            train_size=train_size,
+            validation_size=args.val_size,
+            check_val_every_n_epoch=1,
+        )
+
+    out_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.n_latent}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Evaluation: loss curves + reconstruction ----
     print("\nEvaluating pretraining results...")
@@ -250,9 +285,14 @@ def main() -> None:
     print(f"[Eval] Metrics saved to: {metrics_path}")
 
     # ---- Save model outputs ----
-    scvi_dir = out_dir / "scvi_model"
-    print(f"\nSaving scVI model to {scvi_dir}")
-    model.save(scvi_dir, overwrite=True)
+    if not args.load_model:
+        scvi_dir = out_dir / "scvi_model"
+        print(f"\nSaving scVI model to {scvi_dir}")
+        model.save(scvi_dir, overwrite=True)
+
+    n_latent_saved = args.n_latent
+    n_hidden_saved = args.n_hidden
+    n_layers_saved = args.n_layers
 
     encoder_path = out_dir / "encoder.pt"
     print(f"Saving encoder weights to {encoder_path}")
@@ -260,9 +300,9 @@ def main() -> None:
 
     config = {
         "n_input": n_genes,
-        "n_latent": args.n_latent,
-        "n_hidden": args.n_hidden,
-        "n_layers": args.n_layers,
+        "n_latent": n_latent_saved,
+        "n_hidden": n_hidden_saved,
+        "n_layers": n_layers_saved,
         "dropout_rate": args.dropout_rate,
     }
     config_path = out_dir / "config.json"

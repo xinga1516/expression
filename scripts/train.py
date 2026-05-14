@@ -12,7 +12,6 @@ import json
 from datetime import datetime
 import shutil
 import sys
-from typing import Optional
 
 import torch
 import time
@@ -34,7 +33,7 @@ import src.utils as utils
 from safetensors.torch import save_file, load_file
 
 
-def weighted_mse_loss(pred: torch.Tensor, target: torch.Tensor, nonzero_weight: float = 2.0) -> torch.Tensor:
+def weighted_mse_loss(pred, target, nonzero_weight=2.0):
     """MSE with higher weight on non-zero targets."""
     weights = torch.ones_like(target)
     weights[target != 0] = nonzero_weight
@@ -42,7 +41,7 @@ def weighted_mse_loss(pred: torch.Tensor, target: torch.Tensor, nonzero_weight: 
     return (weights * sq).sum() / weights.sum().clamp_min(1e-12)
 
 
-def pearson_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def pearson_loss(pred, target, eps=1e-8):
     """1 - Pearson correlation coefficient as loss (batch-level)."""
     pred = pred.view(-1)
     target = target.view(-1)
@@ -62,7 +61,7 @@ def pearson_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) ->
     return 1.0 - r
 
 
-def pearson_mse_loss(pred: torch.Tensor, target: torch.Tensor, nonzero_weight: float = 2.0, pearson_lambda: float = 1.0, eps: float = 1e-8) -> torch.Tensor:
+def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1e-8):
     """weighted MSE + lambda * (1 - Pearson)."""
     mse = weighted_mse_loss(pred, target, nonzero_weight)
     p_loss = pearson_loss(pred, target, eps)
@@ -70,23 +69,23 @@ def pearson_mse_loss(pred: torch.Tensor, target: torch.Tensor, nonzero_weight: f
 
 
 def train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: Optional[DataLoader],
-    exp_name: str,
-    epochs: int = 30,
-    learning_rate: float = 1e-4,
-    nonzero_loss_weight: float = 2.0,
-    seed: int = 42,
-    patience: int = 5,
-    min_delta: float = 0.0,
-    resume_ckpt: Optional[str] = None,
-    save_every: int = 0,
-    zero_acc_threshold: float = 0.5,
-    ema_alpha: float = 0.9,
-    loss_type: str = "mse",
-    pearson_lambda: float = 1.0,
-) -> None:
+    model,
+    train_loader,
+    val_loader,
+    exp_name,
+    epochs=30,
+    learning_rate=1e-4,
+    nonzero_loss_weight=2.0,
+    seed=42,
+    patience=5,
+    min_delta=0.0,
+    resume_ckpt=None,
+    save_every=0,
+    zero_acc_threshold=0.5,
+    ema_alpha=0.9,
+    loss_type="mse",
+    pearson_lambda=1.0,
+):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -373,16 +372,16 @@ def train_model(
     print(f"Training done. logs: {log_file} | checkpoints: {ckpt_dir}")
         
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="Train a gene expression model.")
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
     parser.add_argument("--model", type=str, default="SimpleGeneModel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
-    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed"], help="Which dataset version to use (affects data paths in config)")
+    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed"], help="Which dataset version to use (affects data paths in config)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
     parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
-    parser.add_argument("--hidden-size", type=int, default=64, help="Hidden size for LSTM and MLP in the model")
+    parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
     parser.add_argument("--samples-per-epoch", type=int, default=2560000, help="Fixed number of unique samples to draw per epoch")
@@ -426,7 +425,7 @@ def main() -> None:
     )
 
     pin_memory = torch.cuda.is_available()
-    if args.data == "processed" or args.data == "log_processed":
+    if args.data in ("processed", "log_processed", "umi_processed"):
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,
@@ -482,7 +481,7 @@ def main() -> None:
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
             )
-    elif args.data == "highquality":
+    elif args.data in ("highquality", "umi_highquality"):
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,

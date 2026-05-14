@@ -60,10 +60,18 @@ class SCVIEncoder(nn.Module):
         )
 
         encoder_state = torch.load(encoder_path, map_location=device, weights_only=True)
-        # scVI saves var_encoder keys too — skip those
-        filtered_state = {k: v for k, v in encoder_state.items()
-                          if not k.startswith("var_encoder")}
-        model.load_state_dict(filtered_state, strict=False)
+        # Remap scVI key names to our SCVIEncoder key names:
+        #   scVI:  encoder.fc_layers.Layer 0.0.weight
+        #   ours:  encoder.0.0.weight
+        # Also skip var_encoder keys (only used during VAE training, not for downstream)
+        remapped = {}
+        for k, v in encoder_state.items():
+            if k.startswith("var_encoder"):
+                continue
+            if "encoder.fc_layers.Layer " in k:
+                k = k.replace("encoder.fc_layers.Layer ", "encoder.")
+            remapped[k] = v
+        model.load_state_dict(remapped, strict=False)
         model.to(device)
         model.eval()
         return model
