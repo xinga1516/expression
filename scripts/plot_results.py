@@ -20,10 +20,10 @@ import src.utils as utils
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(description="Plot training results from an existing experiment.")
     parser.add_argument("--exp_name", type=str, required=True, help="Experiment name (outputs/<exp_name>)")
-    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed"],
+    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed" ],
                         help="Which dataset version was used")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint. Default: outputs/<exp_name>/checkpoints/best_model.safetensors")
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
 
     base_dir = PROJECT_ROOT
@@ -63,6 +63,9 @@ def main() -> None:
     model_name = cfg.get("model", "SimpleGeneModel")
     hidden_size = cfg.get("hidden_size", 32)
     expr_dim = cfg.get("expr_dim", None)
+    use_vae = cfg.get("use_vae", False)
+    vae_encoder_path = cfg.get("vae_encoder_path", None)
+    vae_fine_tune = cfg.get("vae_fine_tune", False)
 
     checkpoint = args.checkpoint
     if checkpoint is None:
@@ -85,7 +88,7 @@ def main() -> None:
     if expr_dim is None:
         expr_dim = val_dataset.X.shape[1]
 
-    if args.data == "highquality":
+    if args.data in ("highquality", "umi_highquality"):
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -106,7 +109,10 @@ def main() -> None:
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(model_name, expr_dim=expr_dim, hidden_size=hidden_size)
+    model = build_model(
+        model_name, expr_dim=expr_dim, hidden_size=hidden_size,
+        use_vae=use_vae, vae_encoder_path=vae_encoder_path, vae_fine_tune=vae_fine_tune,
+    )
     model.load_state_dict(load_file(str(checkpoint), device=str(device)))
     model.to(device)
     model.eval()

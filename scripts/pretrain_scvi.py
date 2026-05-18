@@ -128,6 +128,10 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
     recon = np.asarray(recon, dtype=np.float64)
     recon = np.maximum(recon, 0)
 
+    # change to CPM scale and log1p for better visualization and metric stability
+    X_sub = X_sub * 1e6
+    recon = recon * 1e6
+
     # Randomly sample (cell, gene) pairs for scatter
     n_obs, n_vars = X_sub.shape
     total_pairs = n_obs * n_vars
@@ -170,13 +174,13 @@ def main() -> None:
     parser.add_argument("--data", type=str, default="umi_highquality",
                         choices=["umi_processed", "umi_highquality", "processed", "log_processed"],
                         help="Data version (umi_* = raw UMI counts)")
-    parser.add_argument("--n-latent", type=int, default=64,
+    parser.add_argument("--n-latent", type=int, default=128,
                         help="Latent dimension")
     parser.add_argument("--n-hidden", type=int, default=512,
                         help="Hidden units in encoder/decoder")
     parser.add_argument("--n-layers", type=int, default=2,
                         help="Number of hidden layers")
-    parser.add_argument("--dropout-rate", type=float, default=0.0,
+    parser.add_argument("--dropout-rate", type=float, default=0.05,
                         help="Dropout rate")
     parser.add_argument("--epochs", type=int, default=300,
                         help="Max training epochs")
@@ -184,7 +188,7 @@ def main() -> None:
                         help="Batch size")
     parser.add_argument("--lr", type=float, default=5e-3,
                         help="Learning rate")
-    parser.add_argument("--lr-patience", type=int, default=25,
+    parser.add_argument("--lr-patience", type=int, default=10,
                         help="Epochs of no improvement before reducing LR (0 = no reduction)")
     parser.add_argument("--lr-factor", type=float, default=0.6,
                         help="Factor by which to reduce LR on plateau")
@@ -205,7 +209,7 @@ def main() -> None:
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found in {PROJECT_ROOT / 'data' / args.data}")
 
-    eval_dir = PROJECT_ROOT / "outputs" / "pretrain_vae"
+    eval_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.data}" / "evaluation"
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading data: {data_path}")
@@ -251,7 +255,7 @@ def main() -> None:
             enable_progress_bar=True,
             plan_kwargs={
                 "lr": args.lr,
-                "n_epochs_kl_warmup": 1000,
+                "n_epochs_kl_warmup": 100,
                 "reduce_lr_on_plateau": args.lr_patience > 0,
                 "lr_patience": args.lr_patience,
                 "lr_factor": args.lr_factor,
@@ -262,7 +266,7 @@ def main() -> None:
             check_val_every_n_epoch=1,
         )
 
-    out_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.n_latent}"
+    out_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.data}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Evaluation: loss curves + reconstruction ----

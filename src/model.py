@@ -45,7 +45,7 @@ class LSTMmodel(nn.Module):
     '''More complex model with multi-layer bidirectional LSTM, deeper MLP, and dropout.'''
 
     def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 64, expr_dim: Optional[int] = None,
-                 dropout: float = 0.3, lstm_layers: int = 2,
+                 dropout: float = 0.0, lstm_layers: int = 2,
                  use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
@@ -74,17 +74,20 @@ class LSTMmodel(nn.Module):
             if not vae_fine_tune:
                 for p in self.vae_encoder.parameters():
                     p.requires_grad = False
-            self.expr_fc = nn.Linear(self.vae_encoder.mean_encoder.out_features, hidden_size * 2)
+            self.expr_fc = nn.Linear(self.vae_encoder.mean_encoder.out_features, hidden_size * 2)  
         else:
             self.expr_fc = nn.Linear(expr_dim, hidden_size * 2)
+        self.expr_norm = nn.LayerNorm(hidden_size * 2)  # add normalization layer for VAE branch  
         self.expr_dropout = nn.Dropout(dropout)
 
+        self.fc_norm = nn.LayerNorm(2 * hidden_size)  # normalization layer for combined features
         self.fc1 = nn.Linear(lstm_out_dim + hidden_size * 2, hidden_size * 2)
         self.fc1_dropout = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_size * 2, hidden_size)
         self.fc2_dropout = nn.Dropout(dropout)
         self.fc_out = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
+
 
     def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
         # promoter: (batch, 400, 5)
@@ -97,14 +100,16 @@ class LSTMmodel(nn.Module):
         lstm_out = self.lstm_norm(self.lstm_fc(lstm_out))  # (batch, 2*hidden)
         lstm_out = self.gelu(lstm_out)
         lstm_out = self.lstm_dropout(lstm_out)
-
+    
         if self.use_vae:
             expr = self.vae_encoder(expr)             # (batch, n_latent)
-        expr_out = self.relu(self.expr_fc(expr))     # (batch, 2*hidden)
+        expr_out = self.expr_norm(self.expr_fc(expr))     # (batch, 2*hidden)
+        expr_out = self.gelu(expr_out)
         expr_out = self.expr_dropout(expr_out)
 
         combined = torch.cat([lstm_out, expr_out], dim=1)  # (batch, 4*hidden)
-        x = self.relu(self.fc1(combined))
+        x = self.fc_norm(self.fc1(combined))          # (batch, 2*hidden)
+        x = self.relu(x)
         x = self.fc1_dropout(x)
         x = self.relu(self.fc2(x))
         x = self.fc2_dropout(x)

@@ -66,6 +66,7 @@ class SCVIEncoder(nn.Module):
         # Also skip var_encoder keys (only used during VAE training, not for downstream)
         remapped = {}
         for k, v in encoder_state.items():
+            # print(k, v.shape)
             if k.startswith("var_encoder"):
                 continue
             if "encoder.fc_layers.Layer " in k:

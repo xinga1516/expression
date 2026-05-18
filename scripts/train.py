@@ -32,6 +32,43 @@ from src.earlystopping import EarlyStopping
 import src.utils as utils
 from safetensors.torch import save_file, load_file
 
+class ZINBLoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, y_true, mu, theta, pi):
+        """
+        y_true: 原始 UMI Count (Batch_size, 1)
+        mu:     调整过 Library Size 后的期望值 (mu_ratio * lib_size)
+        theta:  离散度参数
+        pi:     零膨胀概率
+        """
+        # 1. 计算标准负二项分布 (NB) 的概率密度部分
+        log_theta_mu_eps = torch.log(theta + mu + self.eps)
+        
+        log_nb = (
+            torch.lgamma(y_true + theta + self.eps)
+            - torch.lgamma(y_true + 1.0)
+            - torch.lgamma(theta + self.eps)
+            + theta * (torch.log(theta + self.eps) - log_theta_mu_eps)
+            + y_true * (torch.log(mu + self.eps) - log_theta_mu_eps)
+        )
+        nb_case = torch.exp(log_nb)
+
+        # 2. 针对 y = 0 和 y > 0 分别处理
+        zero_case = pi + (1.0 - pi) * nb_case
+        non_zero_case = (1.0 - pi) * nb_case
+
+        # 3. 使用 torch.where 组合结果
+        # torch.where(condition, x, y): 满足 condition 用 x，不满足用 y
+        loss = torch.where(
+            y_true < self.eps,
+            -torch.log(zero_case + self.eps),
+            -torch.log(non_zero_case + self.eps)
+        )
+        
+        return torch.mean(loss)
 
 def weighted_mse_loss(pred, target, nonzero_weight=2.0):
     """MSE with higher weight on non-zero targets."""
@@ -376,15 +413,15 @@ def main():
     parser = argparse.ArgumentParser(description="Train a gene expression model.")
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
-    parser.add_argument("--model", type=str, default="SimpleGeneModel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
-    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed"], help="Which dataset version to use (affects data paths in config)")
+    parser.add_argument("--model", type=str, default="LSTMmodel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
+    parser.add_argument("--data", type=str, default="umi_processed", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed"], help="Which dataset version to use (affects data paths in config)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
     parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
     parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for LSTM and MLP in the model")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
-    parser.add_argument("--samples-per-epoch", type=int, default=2560000, help="Fixed number of unique samples to draw per epoch")
+    parser.add_argument("--samples-per-epoch", type=int, default=128000, help="Fixed number of unique samples to draw per epoch")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
     parser.add_argument("--nonzero-loss-weight", type=float, default=2.0, help="Weight multiplier for non-zero labels in MSE loss")
@@ -396,7 +433,7 @@ def main():
     parser.add_argument("--zero-acc-threshold", type=float, default=0.5, help="Threshold for zero-sample accuracy (|pred| < threshold counts as correct)")
     parser.add_argument("--ema-alpha", type=float, default=0.9, help="EMA smoothing factor for validation loss (0=use raw, higher=smoother)")
     parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "pearson", "combined"], help="Loss function: 'mse' (weighted MSE), 'pearson' (1 - Pearson), or 'combined' (MSE + lambda*(1-Pearson))")
+    parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined"], help="Loss function: 'mse' (weighted MSE), 'pearson' (1 - Pearson), or 'combined' (MSE + lambda*(1-Pearson))")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
@@ -411,17 +448,20 @@ def main():
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "data" / args.data
 
+    use_log1p = args.data.startswith("umi_")
     train_dataset = MyDataset(
         promoter_file=data_dir / "promoter_train.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
         cell_ratio=args.cell_ratio,
+        log1p_cpm_target=use_log1p,
     )
     val_dataset = MyDataset(
         promoter_file=data_dir / "promoter_val.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
         mode="val",
-        seed=args.seed,  # use the same seed to ensure val sampling is consistent with evaluation
+        seed=args.seed,
         cell_ratio=args.cell_ratio,
+        log1p_cpm_target=use_log1p,
     )
 
     pin_memory = torch.cuda.is_available()

@@ -90,19 +90,28 @@ class ZeroNonZeroSampler(Sampler):
         self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
 
         print("Precomputing zero/non-zero pools for sampler...")
-        X_csc = dataset.X.tocsc()
-        cells_set = set(int(c) for c in dataset.cells)
-        cell_row_to_pos = {int(dataset.cells[pos]): pos for pos in range(self.C)}
-        nz_indices = [] # store indices of non-zero samples in the flattened (promoter, cell) space
-        zero_counts = np.empty(self.P, dtype=np.int32)
+        X_csr = dataset.X.tocsr()
+        # Map expression matrix gene index → promoter index (pro_i)
+        gene_idx_to_pro = {}
         for pro_i in range(self.P):
-            col = int(dataset.promoter2expr_idx[pro_i])
-            col_vec = X_csc[:, col].tocoo()
-            nz_rows = {int(r) for r in col_vec.row if int(r) in cells_set}
-            base = pro_i * self.C
-            for cell_row in nz_rows:
-                nz_indices.append(base + cell_row_to_pos[cell_row])
-            zero_counts[pro_i] = self.C - len(nz_rows)
+            gene_idx_to_pro[int(dataset.promoter2expr_idx[pro_i])] = pro_i
+
+        nz_indices = []  # flat indices of non-zero (promoter, cell) pairs
+        nz_per_promoter = np.zeros(self.P, dtype=np.int32)
+        for cell_pos in range(self.C):
+            cell_row = int(dataset.cells[cell_pos])
+            row = X_csr[cell_row]
+            if hasattr(row, "indices"):
+                nz_gene_idx = row.indices  # sparse: column indices = non-zero gene positions
+            else:
+                nz_gene_idx = np.where(np.asarray(row).ravel() > 0)[0]
+            for gene_idx in nz_gene_idx:
+                pro_i = gene_idx_to_pro.get(int(gene_idx))
+                if pro_i is not None:
+                    nz_indices.append(pro_i * self.C + cell_pos)
+                    nz_per_promoter[pro_i] += 1
+            if cell_pos % 5000 == 0:
+                print(f"  processed cell {cell_pos}/{self.C}")
 
         self.nz_indices = np.array(nz_indices, dtype=np.int64)
         nonzero_cnt = len(self.nz_indices)

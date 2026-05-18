@@ -54,6 +54,7 @@ class MyDataset(Dataset):
         mode: str = "train",
         seed: int = 42,
         cell_ratio: float = 1.0,
+        log1p_cpm_target: bool = False,
     ) -> None:
         self.promoters = pd.read_csv(promoter_file)
         self.scrna = sc.read(scrna_file, sparse=True)
@@ -101,6 +102,7 @@ class MyDataset(Dataset):
         self.C = len(self.cells)
         self.mode = mode
         self.seed = seed
+        self.log1p_cpm_target = log1p_cpm_target
 
     def _preencode_promoters(self) -> torch.Tensor:
         sequences = self.promoters["sequence"].values
@@ -135,7 +137,12 @@ class MyDataset(Dataset):
         target_idx = self.promoter2expr_idx[pro_i]
         y = expr_all[target_idx].clone()
         expr_all[target_idx] = 0.0 # mask the promoter expression
-        
+
+        if self.log1p_cpm_target:
+            lib_size = expr_all.sum()
+            cpm = y / max(float(lib_size), 1.0) * 1e6
+            y = torch.log1p(cpm)
+
         return promoter, expr_all, y
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
