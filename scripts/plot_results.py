@@ -66,6 +66,8 @@ def main():
     use_vae = cfg.get("use_vae", False)
     vae_encoder_path = cfg.get("vae_encoder_path", None)
     vae_fine_tune = cfg.get("vae_fine_tune", False)
+    loss_type = cfg.get("loss_type", "mse")
+    output_mode = "zinb" if loss_type == "zinb" else "scalar"
 
     checkpoint = args.checkpoint
     if checkpoint is None:
@@ -98,7 +100,7 @@ def main():
         )
     else:
         # For processed data, use a smaller subset for scatter plot to reduce noise and speed up plotting.
-        subset_size = min(4*10**7, len(val_dataset))
+        subset_size = min(4*10**6, len(val_dataset))
         val_subset = torch.utils.data.Subset(val_dataset, indices=np.random.choice(len(val_dataset), subset_size, replace=False))
         val_loader = DataLoader(
             val_subset,
@@ -112,6 +114,7 @@ def main():
     model = build_model(
         model_name, expr_dim=expr_dim, hidden_size=hidden_size,
         use_vae=use_vae, vae_encoder_path=vae_encoder_path, vae_fine_tune=vae_fine_tune,
+        output_mode=output_mode,
     )
     model.load_state_dict(load_file(str(checkpoint), device=str(device)))
     model.to(device)
@@ -121,6 +124,10 @@ def main():
     utils.count_zero_nonzero(val_loader)
     utils.plot_pred_scatter(model, val_loader, epoch=args.epochs,
                             save_path=plot_dir / "pred_vs_true_scatter.png")
+    utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=6,
+                                    save_path=plot_dir / "per_promoter_scatter.png")
+    utils.plot_per_cell_scatter(model, val_dataset, n_cells=6,
+                                 save_path=plot_dir / "per_cell_scatter.png")
     print(f"All plots saved to: {plot_dir}")
 
 

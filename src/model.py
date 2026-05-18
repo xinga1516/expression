@@ -46,7 +46,8 @@ class LSTMmodel(nn.Module):
 
     def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 64, expr_dim: Optional[int] = None,
                  dropout: float = 0.0, lstm_layers: int = 2,
-                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
+                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False,
+                 output_mode: str = "scalar", **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided, e.g. from dataset feature dimension")
@@ -85,11 +86,18 @@ class LSTMmodel(nn.Module):
         self.fc1_dropout = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_size * 2, hidden_size)
         self.fc2_dropout = nn.Dropout(dropout)
-        self.fc_out = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
 
+        self.output_mode = output_mode
+        if output_mode == "zinb":
+            self.mu_head = nn.Linear(hidden_size, 1)
+            self.theta_head = nn.Linear(hidden_size, 1)
+            self.pi_head = nn.Linear(hidden_size, 1)
+        else:
+            self.fc_out = nn.Linear(hidden_size, 1)
 
-    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor):
         # promoter: (batch, 400, 5)
         # expr: (batch, expr_dim)
         lstm_out, _ = self.lstm(promoter)           # (batch, 400, 2*hidden)
@@ -100,7 +108,7 @@ class LSTMmodel(nn.Module):
         lstm_out = self.lstm_norm(self.lstm_fc(lstm_out))  # (batch, 2*hidden)
         lstm_out = self.gelu(lstm_out)
         lstm_out = self.lstm_dropout(lstm_out)
-    
+
         if self.use_vae:
             expr = self.vae_encoder(expr)             # (batch, n_latent)
         expr_out = self.expr_norm(self.expr_fc(expr))     # (batch, 2*hidden)
@@ -113,15 +121,22 @@ class LSTMmodel(nn.Module):
         x = self.fc1_dropout(x)
         x = self.relu(self.fc2(x))
         x = self.fc2_dropout(x)
-        out = self.fc_out(x)                         # (batch, 1)
-        return out
+
+        if self.output_mode == "zinb":
+            mu_ratio = torch.exp(self.mu_head(x))      # (batch, 1)
+            theta = torch.exp(self.theta_head(x))       # (batch, 1)
+            pi = torch.sigmoid(self.pi_head(x))          # (batch, 1)
+            return mu_ratio, theta, pi
+        else:
+            return self.fc_out(x)                       # (batch, 1)
 
 
 class ConvAttentionModel(nn.Module):
     """Promoter CNN + Attention pooling + Expression MLP to fusion."""
 
     def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 128, expr_dim: Optional[int] = None, dropout: float = 0.3,
-                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False, **kwargs: Any) -> None:
+                 use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False,
+                 output_mode: str = "scalar", **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided")
@@ -146,13 +161,23 @@ class ConvAttentionModel(nn.Module):
         self.expr_fc2 = nn.Linear(512, 256)
         self.expr_dropout2 = nn.Dropout(dropout)
 
-        # Fusion: concat(128 + 256) → Dense(128) → ReLU → Dense(1)
-        self.fusion_fc1 = nn.Linear(128 + 256, 128)
-        self.fusion_dropout = nn.Dropout(dropout)
-        self.fc_out = nn.Linear(128, 1)
+        # Fusion: concat(128 + 256) → Dense(128) → ReLU → (scalar or ZINB)
+        self.fc1 = nn.Linear(128 + 256, 128)
+        self.fc_norm = nn.LayerNorm(128)
+        self.fc1_dropout = nn.Dropout(dropout)
         self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, 128)
+        self.fc2_dropout = nn.Dropout(dropout)
 
-    def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
+        self.output_mode = output_mode
+        if output_mode == "zinb":
+            self.mu_head = nn.Linear(128, 1)
+            self.theta_head = nn.Linear(128, 1)
+            self.pi_head = nn.Linear(128, 1)
+        else:
+            self.fc_out = nn.Linear(128, 1)
+
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor):
         # Promoter branch
         p = promoter.permute(0, 2, 1)              # (batch, 5, 400)
         p = self.relu(self.conv1(p))               # (batch, 64, 400)
@@ -174,10 +199,19 @@ class ConvAttentionModel(nn.Module):
 
         # Fusion
         combined = torch.cat([p, e], dim=1)          # (batch, 128+256=384)
-        x = self.relu(self.fusion_fc1(combined))     # (batch, 128)
-        x = self.fusion_dropout(x)
-        out = self.fc_out(x)                         # (batch, 1)
-        return out
+        x = self.fc_norm(self.fc1(combined))          # (batch, 2*hidden)
+        x = self.relu(x)
+        x = self.fc1_dropout(x)
+        x = self.relu(self.fc2(x))
+        x = self.fc2_dropout(x)
+
+        if self.output_mode == "zinb":
+            mu_ratio = torch.exp(self.mu_head(x))      # (batch, 1)
+            theta = torch.exp(self.theta_head(x))       # (batch, 1)
+            pi = torch.sigmoid(self.pi_head(x))          # (batch, 1)
+            return mu_ratio, theta, pi
+        else:
+            return self.fc_out(x)                       # (batch, 1)
 
 
 class PromoterBaseline(nn.Module):

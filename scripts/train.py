@@ -193,19 +193,35 @@ def train_model(
             ys = ys.to(device, non_blocking=True).float()
 
             optimizer.zero_grad()
-            out = model(promoters, exprs).squeeze(1)
-            if loss_type == "pearson":
-                loss = pearson_loss(out, ys)
-            elif loss_type == "combined":
-                loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
+            if loss_type == "zinb":
+                mu_ratio, theta, pi = model(promoters, exprs)
+                mu_ratio = mu_ratio.squeeze(1)
+                theta = theta.squeeze(1)
+                pi = pi.squeeze(1)
+                lib_size = exprs.sum(dim=1) + ys  # exprs has target masked to 0
+                mu = mu_ratio * lib_size
+                zinb_loss_fn = ZINBLoss()
+                loss = zinb_loss_fn(ys, mu, theta, pi)
             else:
-                loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
+                out = model(promoters, exprs).squeeze(1)
+                if loss_type == "pearson":
+                    loss = pearson_loss(out, ys)
+                elif loss_type == "combined":
+                    loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
+                else:
+                    loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
             loss.backward()
             optimizer.step()
             scheduler.step()
 
+            # calculate weighted MSE components for each batch
             with torch.no_grad():
-                sq = (out - ys) ** 2
+                if loss_type == "zinb":
+                    y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                    y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
+                    sq = (y_pred_log - y_log) ** 2
+                else:
+                    sq = (out - ys) ** 2
                 zero_mask = (ys == 0)
                 nz_mask = ~zero_mask
 
@@ -232,7 +248,7 @@ def train_model(
 
             epoch_step_losses.append(loss.item())
 
-        if loss_type == "pearson":
+        if loss_type in ("pearson", "zinb"):
             avg_train_loss = sum(epoch_step_losses) / max(len(epoch_step_losses), 1)
         else:
             avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
@@ -271,33 +287,54 @@ def train_model(
                     exprs = exprs.to(device, non_blocking=True)
                     ys = ys.to(device, non_blocking=True).float()
 
-                    out = model(promoters, exprs).squeeze(1)
+                    if loss_type == "zinb":
+                        mu_ratio, theta, pi = model(promoters, exprs)
+                        mu_ratio = mu_ratio.squeeze(1)
+                        theta = theta.squeeze(1)
+                        pi = pi.squeeze(1)
+                        lib_size = exprs.sum(dim=1) + ys
+                        mu = mu_ratio * lib_size
+                        zinb_loss_fn = ZINBLoss()
+                        val_loss = zinb_loss_fn(ys, mu, theta, pi)
+                        val_loss_num += val_loss.item() * ys.numel()
+                        val_loss_den += ys.numel()
 
-                    sq = (out - ys) ** 2
+                        # Log-space metrics for ZINB
+                        y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                        y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
+                        all_val_true.append(y_log.cpu().numpy())
+                        all_val_pred.append(y_pred_log.cpu().numpy())
+
+                        sq = (y_pred_log - y_log) ** 2
+                    else:
+                        out = model(promoters, exprs).squeeze(1)
+                        sq = (out - ys) ** 2
+
+                        if loss_type in ("pearson", "combined"):
+                            all_val_true.append(ys.cpu().numpy())
+                            all_val_pred.append(out.cpu().numpy())
+
                     zero_mask = (ys == 0)
                     nz_mask = ~zero_mask
 
                     w = torch.where(ys != 0, torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
                                     torch.ones_like(ys))
-                    val_loss_num += (w * sq).sum().item()
-                    val_loss_den += w.sum().item()
+                    if loss_type != "zinb":
+                        val_loss_num += (w * sq).sum().item()
+                        val_loss_den += w.sum().item()
 
                     nz_cnt = nz_mask.sum().item()
                     if nz_cnt > 0:
                         val_nz_sum += sq[nz_mask].sum().item()
                         val_nz_count += nz_cnt
                         all_nz_true.append(ys[nz_mask].cpu().numpy())
-                        all_nz_pred.append(out[nz_mask].cpu().numpy())
+                        all_nz_pred.append(out.cpu().numpy() if loss_type != "zinb" else y_pred_log[nz_mask].cpu().numpy())
 
                     zero_cnt = zero_mask.sum().item()
                     if zero_cnt > 0:
                         val_zero_sum += sq[zero_mask].sum().item()
                         val_zero_count += zero_cnt
-                        all_zero_pred.append(out[zero_mask].cpu().numpy())
-
-                    if loss_type in ("pearson", "combined"):
-                        all_val_true.append(ys.cpu().numpy())
-                        all_val_pred.append(out.cpu().numpy())
+                        all_zero_pred.append(out[zero_mask].cpu().numpy() if loss_type != "zinb" else y_pred_log[zero_mask].cpu().numpy())
 
             avg_val_loss = val_loss_num / max(val_loss_den, 1e-12)
             if loss_type in ("pearson", "combined") and all_val_true:
@@ -313,6 +350,11 @@ def train_model(
                     avg_val_loss = 1.0
             elif loss_type == "pearson":
                 avg_val_loss = 1.0
+            elif loss_type == "zinb" and all_val_true:
+                val_true_all = np.concatenate(all_val_true)
+                val_pred_all = np.concatenate(all_val_pred)
+                if len(val_true_all) > 1 and np.std(val_true_all) > 0 and np.std(val_pred_all) > 0:
+                    epoch_val_pearson_all = float(np.corrcoef(val_true_all, val_pred_all)[0, 1])
             val_losses_zero.append(val_zero_sum / max(val_zero_count, 1))
             val_losses_nz.append(val_nz_sum / max(val_nz_count, 1))
 
@@ -421,7 +463,7 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
-    parser.add_argument("--samples-per-epoch", type=int, default=128000, help="Fixed number of unique samples to draw per epoch")
+    parser.add_argument("--samples-per-epoch", type=int, default=1280000, help="Fixed number of unique samples to draw per epoch")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
     parser.add_argument("--nonzero-loss-weight", type=float, default=2.0, help="Weight multiplier for non-zero labels in MSE loss")
@@ -433,7 +475,7 @@ def main():
     parser.add_argument("--zero-acc-threshold", type=float, default=0.5, help="Threshold for zero-sample accuracy (|pred| < threshold counts as correct)")
     parser.add_argument("--ema-alpha", type=float, default=0.9, help="EMA smoothing factor for validation loss (0=use raw, higher=smoother)")
     parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
-    parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined"], help="Loss function: 'mse' (weighted MSE), 'pearson' (1 - Pearson), or 'combined' (MSE + lambda*(1-Pearson))")
+    parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined", "zinb"], help="Loss function: 'mse', 'pearson', 'combined', or 'zinb' (ZINB distribution loss)")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
@@ -448,7 +490,7 @@ def main():
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "data" / args.data
 
-    use_log1p = args.data.startswith("umi_")
+    use_log1p = args.data.startswith("umi_") and args.loss != "zinb"
     train_dataset = MyDataset(
         promoter_file=data_dir / "promoter_train.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
@@ -484,7 +526,7 @@ def main():
             val_sampler = utils.ZeroNonZeroSampler(
                 val_dataset,
                 nonzero_ratio=args.nonzero_ratio,
-                samples_per_epoch=args.samples_per_epoch,
+                samples_per_epoch=2560000, #args.samples_per_epoch,
                 seed=args.seed,
             )
             val_loader = DataLoader(
@@ -556,6 +598,7 @@ def main():
     expr_dim = train_dataset.X.shape[1]
     if args.vae_encoder is not None and not Path(args.vae_encoder).exists():
         raise FileNotFoundError(f"VAE encoder dir not found: {args.vae_encoder}")
+    output_mode = "zinb" if args.loss == "zinb" else "scalar"
     model = build_model(
         args.model,
         expr_dim=expr_dim,
@@ -563,6 +606,7 @@ def main():
         use_vae=args.vae_encoder is not None,
         vae_encoder_path=args.vae_encoder,
         vae_fine_tune=args.vae_fine_tune,
+        output_mode=output_mode,
     )
 
     run_dir, ckpt_dir, plots_dir, _ = utils._prepare_output_dirs(base_dir, args.exp_name)
@@ -573,7 +617,9 @@ def main():
     if args.dryrun:
         utils.dryrun_cpu(model, train_loader, steps=50, learning_rate=1e-4, save_path=plots_dir / "dryrun.png")
         # dryrun会改参数，重新初始化模型再正式训练
-        model = build_model(args.model, expr_dim=expr_dim, hidden_size=args.hidden_size)
+        model = build_model(args.model, expr_dim=expr_dim, hidden_size=args.hidden_size,
+                            use_vae=args.vae_encoder is not None, vae_encoder_path=args.vae_encoder,
+                            vae_fine_tune=args.vae_fine_tune, output_mode=output_mode)
 
     resume = args.resume
     if resume is None:
@@ -629,6 +675,8 @@ def main():
 
             utils.count_zero_nonzero(val_loader)
             utils.plot_pred_scatter(model, val_loader, epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
+            utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=6, save_path=plots_dir / "per_promoter_scatter.png")
+            utils.plot_per_cell_scatter(model, val_dataset, n_cells=6, save_path=plots_dir / "per_cell_scatter.png")
         else:
             print(f"Log file not found for plotting: {log_file}")
 # %%       

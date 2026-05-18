@@ -427,18 +427,22 @@ def count_zero_nonzero(data_loader: DataLoader) -> tuple[int, int]:
     '''Count zero and non-zero targets in a data loader and print summary.'''
     zero_count = 0
     nz_count = 0
-    all_y = []
+    y_sum = 0.0
+    y_min = float("inf")
+    y_max = float("-inf")
     for batch in data_loader:
         _, _, ys = batch
         zero_count += (ys == 0).sum().item()
         nz_count += (ys != 0).sum().item()
-        all_y.append(ys.cpu().numpy())
-    y_all = np.concatenate(all_y)
+        y_sum += ys.sum().item()
+        y_min = min(y_min, ys.min().item())
+        y_max = max(y_max, ys.max().item())
     total = zero_count + nz_count
     frac_zero = zero_count / max(total, 1)
+    y_mean = y_sum / max(total, 1)
     print(f"[Data] Validation samples: zero={zero_count}, non-zero={nz_count}, "
-          f"zero_frac={frac_zero:.4f}, min={y_all.min():.6f}, max={y_all.max():.6f}, "
-          f"mean={y_all.mean():.6f}")
+          f"zero_frac={frac_zero:.4f}, min={y_min:.6f}, max={y_max:.6f}, "
+          f"mean={y_mean:.6f}")
     return zero_count, nz_count
 
 
@@ -451,6 +455,8 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
     device = next(model.parameters()).device
     model.eval()
 
+    is_zinb = getattr(model, "output_mode", "scalar") == "zinb"
+
     y_true_all = []
     y_pred_all = []
 
@@ -462,9 +468,18 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
                 exprs = exprs.to(device, non_blocking=True)
                 ys = ys.to(device, non_blocking=True).float()
 
-                preds = model(promoters, exprs).squeeze(1)
-                y_true_all.append(ys.detach().cpu().numpy())
-                y_pred_all.append(preds.detach().cpu().numpy())
+                if is_zinb:
+                    mu_ratio, _theta, _pi = model(promoters, exprs)
+                    mu_ratio = mu_ratio.squeeze(1)
+                    lib_size = exprs.sum(dim=1) + ys
+                    y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                    y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
+                    y_true_all.append(y_log.detach().cpu().numpy())
+                    y_pred_all.append(y_pred_log.detach().cpu().numpy())
+                else:
+                    preds = model(promoters, exprs).squeeze(1)
+                    y_true_all.append(ys.detach().cpu().numpy())
+                    y_pred_all.append(preds.detach().cpu().numpy())
 
     if not y_true_all:
         print("No samples collected for scatter plot.")
@@ -474,11 +489,18 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
     y_pred = np.concatenate(y_pred_all)
 
     if y_true.size > 1 and np.std(y_true) > 0 and np.std(y_pred) > 0:
-        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
+        pearson = float(np.corrcoef(y_true, y_pred)[0, 1])
     else:
-        corr = float("nan")
+        pearson = float("nan")
 
-    print(f"Validation Pearson correlation: {corr:.6f}")
+    # Spearman rank correlation
+    try:
+        from scipy.stats import spearmanr
+        spearman = float(spearmanr(y_true, y_pred)[0])
+    except Exception:
+        spearman = float("nan")
+
+    print(f"Validation Pearson: {pearson:.6f}, Spearman: {spearman:.6f}")
 
     zero_mask = y_true == 0
     nz_mask = ~zero_mask
@@ -487,21 +509,21 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
 
     # Left: all points
     ax1.scatter(y_true, y_pred, s=3, alpha=0.15)
-    min_v = float(min(np.min(y_true), np.min(y_pred)))
-    max_v = float(max(np.max(y_true), np.max(y_pred)))
-    ax1.plot([min_v, max_v], [min_v, max_v], "r--", linewidth=1)
+    diag_min = float(max(np.min(y_true), np.min(y_pred)))
+    diag_max = float(min(np.max(y_true), np.max(y_pred)))
+    ax1.plot([diag_min, diag_max], [diag_min, diag_max], "r--", linewidth=1)
     ax1.set_xlabel("True")
     ax1.set_ylabel("Predicted")
-    ax1.set_title(f"All samples (Pearson={corr:.4f})")
+    ax1.set_title(f"All samples (Pearson={pearson:.4f}, Spearman={spearman:.4f})")
 
     # Right: non-zero samples only
     if nz_mask.any():
         nz_true = y_true[nz_mask]
         nz_pred = y_pred[nz_mask]
         ax2.scatter(nz_true, nz_pred, s=8, alpha=0.5, color="steelblue")
-        nz_min = float(min(np.min(nz_true), np.min(nz_pred)))
-        nz_max = float(max(np.max(nz_true), np.max(nz_pred)))
-        ax2.plot([nz_min, nz_max], [nz_min, nz_max], "r--", linewidth=1)
+        nz_diag_min = float(max(np.min(nz_true), np.min(nz_pred)))
+        nz_diag_max = float(min(np.max(nz_true), np.max(nz_pred)))
+        ax2.plot([nz_diag_min, nz_diag_max], [nz_diag_min, nz_diag_max], "r--", linewidth=1)
         ax2.set_xlabel("True")
         ax2.set_ylabel("Predicted")
         if len(nz_true) > 1 and np.std(nz_true) > 0 and np.std(nz_pred) > 0:
@@ -520,15 +542,156 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
         print(f"Scatter plot saved to: {save_path}")
     plt.close()
 
+
+def plot_per_promoter_scatter(model: nn.Module, dataset: Any, n_promoters: int = 6,
+                               n_cells: int = 2000, save_path: Path | None = None) -> None:
+    '''Sample promoters and plot (true, predicted) across cells, one color per promoter.'''
+    device = next(model.parameters()).device
+    model.eval()
+    is_zinb = getattr(model, "output_mode", "scalar") == "zinb"
+
+    rng = np.random.default_rng(42)
+    pro_indices = rng.choice(dataset.P, size=min(n_promoters, dataset.P), replace=False)
+    cell_indices = rng.choice(dataset.C, size=min(n_cells, dataset.C), replace=False)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(pro_indices)))
+
+    # Pre-fetch promoter tensors
+    promoter_batch = dataset.promoter_tensor[pro_indices].to(device)  # (P, 400, 5)
+    # Pre-fetch cell expression rows as dense tensor
+    cell_rows = [int(dataset.cells[j]) for j in cell_indices]
+    X_csr = dataset.X.tocsr()
+    X_batch_raw = np.vstack([X_csr[r].toarray().ravel() for r in cell_rows])
+    X_batch = torch.from_numpy(X_batch_raw.astype(np.float32)).to(device)  # (C, n_genes)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    with torch.no_grad():
+        for i, pro_i in enumerate(pro_indices):
+            target_idx = int(dataset.promoter2expr_idx[pro_i])
+            # Mask target gene for all cells in one op
+            ys = X_batch[:, target_idx].clone()  # (C,)
+            X_masked = X_batch.clone()
+            X_masked[:, target_idx] = 0.0
+
+            # Expand promoter to batch: (C, 400, 5)
+            p_batch = promoter_batch[i].unsqueeze(0).expand(len(cell_indices), -1, -1)
+
+            if is_zinb:
+                mu_ratio, _theta, _pi = model(p_batch, X_masked)
+                mu_ratio = mu_ratio.squeeze(1)
+                lib_size = X_masked.sum(dim=1) + ys
+                y_pred_log = torch.log(mu_ratio * 10000 + 1).cpu().numpy()
+                y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
+                yt, yp = y_log, y_pred_log
+            else:
+                preds = model(p_batch, X_masked).squeeze(1).cpu().numpy()
+                yt, yp = ys.cpu().numpy(), preds
+
+            ax.scatter(yt, yp, s=15, alpha=0.5, color=colors[i])
+
+    if len(ax.collections) > 0:
+        all_t = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 0])
+                                for j in range(len(ax.collections))])
+        all_p = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 1])
+                                for j in range(len(ax.collections))])
+        diag_lo = float(max(all_t.min(), all_p.min()))
+        diag_hi = float(min(all_t.max(), all_p.max()))
+        ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "r--", linewidth=1)
+        if len(all_t) > 1 and np.std(all_t) > 0 and np.std(all_p) > 0:
+            corr = float(np.corrcoef(all_t, all_p)[0, 1])
+            ax.set_title(f"Per-promoter prediction ({len(pro_indices)} promoters, {n_cells} cells)\n"
+                         f"Pearson r={corr:.4f}")
+
+    ax.set_xlabel("True")
+    ax.set_ylabel("Predicted")
+    plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Per-promoter scatter saved to: {save_path}")
+    plt.close()
+
+
+def plot_per_cell_scatter(model: nn.Module, dataset: Any, n_cells: int = 6,
+                           n_genes: int = 500, save_path: Path | None = None) -> None:
+    '''Sample cells and plot (true, predicted) across genes, one color per cell.'''
+    device = next(model.parameters()).device
+    model.eval()
+    is_zinb = getattr(model, "output_mode", "scalar") == "zinb"
+
+    rng = np.random.default_rng(42)
+    cell_indices = rng.choice(dataset.C, size=min(n_cells, dataset.C), replace=False)
+    pro_indices = rng.choice(dataset.P, size=min(n_genes, dataset.P), replace=False)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(cell_indices)))
+
+    # Pre-fetch promoter tensors for all sampled genes
+    promoter_batch = dataset.promoter_tensor[pro_indices].to(device)  # (G, 400, 5)
+    target_indices = [int(dataset.promoter2expr_idx[p]) for p in pro_indices]
+    X_csr = dataset.X.tocsr()
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    with torch.no_grad():
+        for i, cell_i in enumerate(cell_indices):
+            cell_row = int(dataset.cells[cell_i])
+            expr_vec = torch.from_numpy(
+                X_csr[cell_row].toarray().ravel().astype(np.float32)
+            ).to(device)  # (n_genes,)
+
+            # Build batch: one row per gene, with that gene's target masked
+            expr_batch = expr_vec.unsqueeze(0).expand(len(pro_indices), -1).clone()  # (G, n_genes)
+            ys = []
+            for g, tgt in enumerate(target_indices):
+                ys.append(expr_batch[g, tgt].item())
+                expr_batch[g, tgt] = 0.0
+            ys = torch.tensor(ys, device=device)
+
+            if is_zinb:
+                mu_ratio, _theta, _pi = model(promoter_batch, expr_batch)
+                mu_ratio = mu_ratio.squeeze(1)
+                lib_size = expr_batch.sum(dim=1) + ys
+                y_pred_log = torch.log(mu_ratio * 10000 + 1).cpu().numpy()
+                y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
+                yt, yp = y_log, y_pred_log
+            else:
+                preds = model(promoter_batch, expr_batch).squeeze(1).cpu().numpy()
+                yt, yp = ys.cpu().numpy(), preds
+
+            ax.scatter(yt, yp, s=15, alpha=0.5, color=colors[i])
+
+    if len(ax.collections) > 0:
+        all_t = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 0])
+                                for j in range(len(ax.collections))])
+        all_p = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 1])
+                                for j in range(len(ax.collections))])
+        diag_lo = float(max(all_t.min(), all_p.min()))
+        diag_hi = float(min(all_t.max(), all_p.max()))
+        ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "r--", linewidth=1)
+        if len(all_t) > 1 and np.std(all_t) > 0 and np.std(all_p) > 0:
+            corr = float(np.corrcoef(all_t, all_p)[0, 1])
+            ax.set_title(f"Per-cell prediction ({len(cell_indices)} cells, {n_genes} genes)\n"
+                         f"Pearson r={corr:.4f}")
+
+    ax.set_xlabel("True")
+    ax.set_ylabel("Predicted")
+    plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Per-cell scatter saved to: {save_path}")
+    plt.close()
+
+
 def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None, step_log_file: Path | None = None) -> None:
     '''Plot train loss by global_step (from step_train_loss.csv) and val loss by epoch.'''
     df_epoch = pd.read_csv(log_file)
     #df_epoch = df_epoch[1:]  # skip epoch 0 which may have very different scale due to resume
     # using max loss for normalization to keep the curve shape visible, especially when resumed training may have different absolute loss values
-    loss_max = max(df_epoch["train_loss"].max(), df_epoch["val_loss"].max(), 1e-8)
-    df_epoch["train_loss"] /= loss_max
-    df_epoch["val_loss"] /= loss_max
-    df_epoch["val_loss_ema"] /= loss_max
+    train_loss_max = max(df_epoch["train_loss"].max(), 1e-8)
+    val_loss_max = max(df_epoch["val_loss"].max(), 1e-8)
+    df_epoch["train_loss"] /= train_loss_max
+    df_epoch["val_loss"] /= val_loss_max
+    df_epoch["val_loss_ema"] /= val_loss_max
 
     if step_log_file is None:
         step_log_file = log_file.parent / "step_train_loss.csv"
@@ -539,12 +702,12 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
     if step_log_file.exists():
         df_step = pd.read_csv(step_log_file)
         #df_step = df_step[df_step["epoch"] > 1]  # skip epoch 0 which may have different scale due to resume
-        loss_max = max(df_step["train_loss"].max(), loss_max, 1e-8)
+        train_loss_max = max(df_step["train_loss"].max(), train_loss_max, 1e-8)
         # Map each epoch to its midpoint global_step for val loss alignment
         step_bounds = df_step.groupby("epoch")["global_step"].agg(["min", "max"])
         # Normalize train loss
         train_max = df_step["train_loss"].max()
-        df_step["train_loss"] /= loss_max
+        df_step["train_loss"] /= train_loss_max
         ax1.plot(df_step["global_step"], df_step["train_loss"], alpha=0.3, linewidth=0.5, color="steelblue", label="Train Loss (step)")
         # Smoothed train loss: moving average over 500 steps
         if len(df_step) > 500:
