@@ -74,30 +74,45 @@ class BalancedEpochSubsetSampler(Sampler):
                 yield base_idx + int(cell_i)
 
 class ZeroNonZeroSampler(Sampler):
-    '''Sample (promoter, cell) pairs with a controllable ratio of zero vs non-zero expression targets.'''
+    '''Sample (promoter, cell) pairs with a controllable ratio of zero vs non-zero expression targets.
 
-    def __init__(self, dataset: Any, nonzero_ratio: float = 0.5, samples_per_epoch: Optional[int] = None, seed: int = 42) -> None:
+    Parameters
+    ----------
+    replace : bool
+        If False, non-zero indices are sampled without replacement (raises ValueError
+        when requested n_nz exceeds the available pool). Zero-side always samples
+        without replacement internally.'''
+
+    def __init__(self, dataset: Any, nonzero_ratio: float = 0.5, samples_per_epoch: Optional[int] = None, seed: int = 42, replace: bool = True, max_duplication: float = 1.0) -> None:
         self.dataset = dataset
         self.nonzero_ratio = nonzero_ratio
-        self.samples_per_epoch = int(samples_per_epoch) if samples_per_epoch is not None else int(dataset.P * dataset.C)
         self.seed = int(seed)
+        self.replace = replace
+        self.max_duplication = max_duplication
         self.epoch = 0
         self.P = int(dataset.P)
+        # 0 or None → auto-select after pool sizes are known
+        self._auto_samples = (samples_per_epoch is None or int(samples_per_epoch) == 0)
+        if not self._auto_samples:
+            self.samples_per_epoch = int(samples_per_epoch)
+        else:
+            self.samples_per_epoch = 0  # placeholder, set in _precompute_pools
+        self._precompute_pools(dataset)
+
+    def _precompute_pools(self, dataset: Any) -> None:
+        '''(Re)build nz_indices from the current dataset state.'''
         self.C = int(dataset.C)
         self.total_len = self.P * self.C
         if self.total_len <= 0:
             raise ValueError("Dataset is empty.")
-        self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
 
         print("Precomputing zero/non-zero pools for sampler...")
         X_csr = dataset.X.tocsr()
-        # Map expression matrix gene index → promoter index (pro_i)
         gene_idx_to_pro = {}
         for pro_i in range(self.P):
             gene_idx_to_pro[int(dataset.promoter2expr_idx[pro_i])] = pro_i
 
-        nz_indices = []  # flat indices of non-zero (promoter, cell) pairs
-        nz_per_promoter = np.zeros(self.P, dtype=np.int32)
+        nz_list: list[int] = []  # flat indices of non-zero (promoter, cell) pairs
         for cell_pos in range(self.C):
             cell_row = int(dataset.cells[cell_pos])
             row = X_csr[cell_row]
@@ -108,15 +123,34 @@ class ZeroNonZeroSampler(Sampler):
             for gene_idx in nz_gene_idx:
                 pro_i = gene_idx_to_pro.get(int(gene_idx))
                 if pro_i is not None:
-                    nz_indices.append(pro_i * self.C + cell_pos)
-                    nz_per_promoter[pro_i] += 1
+                    nz_list.append(pro_i * self.C + cell_pos)
             if cell_pos % 5000 == 0:
                 print(f"  processed cell {cell_pos}/{self.C}")
 
-        self.nz_indices = np.array(nz_indices, dtype=np.int64)
-        nonzero_cnt = len(self.nz_indices)
-        zero_cnt = self.total_len - nonzero_cnt
-        print(f"  Non-zero: {nonzero_cnt}, Zero: {zero_cnt}, Total: {self.total_len}")
+        self.nz_indices = np.array(nz_list, dtype=np.int64)
+        nz_pool = len(self.nz_indices)
+        zero_pool = self.total_len - nz_pool
+        print(f"  Non-zero: {nz_pool}, Zero: {zero_pool}, Total: {self.total_len}")
+
+        # Auto-select samples_per_epoch from pool sizes + nonzero_ratio
+        if self._auto_samples or not hasattr(self, "samples_per_epoch") or self.samples_per_epoch == 0:
+            max_nz = max(nz_pool, 1)
+            max_z = max(zero_pool, 1)
+            cap_nz = max_nz / self.nonzero_ratio if self.nonzero_ratio > 0 else float("inf")
+            cap_z = max_z / (1.0 - self.nonzero_ratio) if self.nonzero_ratio < 1.0 else float("inf")
+            max_unique = int(min(cap_nz, cap_z, self.total_len))
+            self.samples_per_epoch = int(max_unique * self.max_duplication)
+            print(f"[ZeroNonZeroSampler] Auto samples_per_epoch = {self.samples_per_epoch} "
+                  f"(max_unique={max_unique}, nz_pool={nz_pool}, zero_pool={zero_pool}, "
+                  f"max_duplication={self.max_duplication})")
+        else:
+            self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
+
+    def rebuild(self, dataset: Any) -> None:
+        '''Rebuild index pools after the dataset has been resampled (e.g. cell rotation).'''
+        self.dataset = dataset
+        self.P = int(dataset.P)
+        self._precompute_pools(dataset)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -132,21 +166,33 @@ class ZeroNonZeroSampler(Sampler):
         indices = []
 
         if n_nz > 0 and len(self.nz_indices) > 0:
-            nz_sample = self.nz_indices[rng.integers(0, len(self.nz_indices), size=n_nz)]
+            if n_nz > len(self.nz_indices):
+                if not self.replace:
+                    raise ValueError(
+                        f"Requested {n_nz} non-zero samples but pool only has "
+                        f"{len(self.nz_indices)}. Set replace=True or reduce "
+                        f"samples_per_epoch / nonzero_ratio."
+                    )
+                print(f"[ZeroNonZeroSampler] WARNING: n_nz({n_nz}) > "
+                      f"pool({len(self.nz_indices)}), sampling with replacement — "
+                      f"{n_nz - len(self.nz_indices)} duplicates guaranteed.")
+            nz_sample = rng.choice(self.nz_indices, size=n_nz, replace=self.replace)
             indices.append(nz_sample)
 
         if n_z > 0:
             nz_set = set(self.nz_indices.tolist())
-            zero_sample = []
+            zero_sample: list[int] = []
+            zero_seen: set[int] = set()  # internal dedup
             while len(zero_sample) < n_z:
                 needed = n_z - len(zero_sample)
                 cand = rng.integers(0, self.total_len, size=needed * 2)
                 for c in cand.tolist():
-                    if c not in nz_set:
+                    if c not in nz_set and c not in zero_seen:
                         zero_sample.append(c)
+                        zero_seen.add(c)
                         if len(zero_sample) >= n_z:
                             break
-            indices.append(np.array(zero_sample[:n_z], dtype=np.int64))
+            indices.append(np.array(zero_sample, dtype=np.int64))
 
         all_idx = np.concatenate(indices)
         rng.shuffle(all_idx)
@@ -213,6 +259,8 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "git_hash": get_git_hash(),
         "ema_alpha": getattr(args, "ema_alpha", 0.9),
         "cell_ratio": getattr(args, "cell_ratio", 1.0),
+        "val_cell_ratio": getattr(args, "val_cell_ratio", 1.0),
+        "max_duplication": getattr(args, "max_duplication", 1.0),
         "loss_type": getattr(args, "loss", "mse"),
         "pearson_lambda": getattr(args, "pearson_lambda", 1.0),
         "use_vae": getattr(args, "vae_encoder", None) is not None,
@@ -376,8 +424,9 @@ def robust_save_model(model: nn.Module, save_path: Path) -> None:
 def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, learning_rate: float = 1e-4, save_path: Path | None = None) -> None:
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
-    
-    # test if dataset and dataloader work well 
+    output_mode = getattr(model, "output_mode", "scalar")
+
+    # test if dataset and dataloader work well
     batch = next(iter(train_loader))
     promoters, exprs, ys = batch  # (batch, 400, 5), (batch, 16300), (batch,)
     print(promoters.shape, exprs.shape, ys.shape)
@@ -387,20 +436,25 @@ def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, lear
         name: p.detach().clone()
         for name, p in model.named_parameters()
     }
-    
+
     losses = []
     for step in range(steps):
         batch = next(iter(train_loader))
         promoters, exprs, ys = batch
         ys = ys.float()
-    
+
         optimizer.zero_grad()
-        out = model(promoters, exprs).squeeze(1)
+        out_raw = model(promoters, exprs)
+        if output_mode == "zinb":
+            mu_ratio, _theta, _pi = out_raw
+            out = mu_ratio.squeeze(1)
+        else:
+            out = out_raw.squeeze(1)
         loss = criterion(out, ys)
-    
+
         loss.backward()
         optimizer.step()
-    
+
         losses.append(loss.item())
     
     # parameters and gradients after training
@@ -507,20 +561,30 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
-    # Left: all points
-    ax1.scatter(y_true, y_pred, s=3, alpha=0.15)
+    # Left: all points — use hexbin for density-aware coloring
+    hb1 = ax1.hexbin(y_true, y_pred, gridsize=80, cmap="viridis", mincnt=1,
+                     bins="log", linewidths=0)
     diag_min = float(max(np.min(y_true), np.min(y_pred)))
     diag_max = float(min(np.max(y_true), np.max(y_pred)))
     ax1.plot([diag_min, diag_max], [diag_min, diag_max], "r--", linewidth=1)
     ax1.set_xlabel("True")
     ax1.set_ylabel("Predicted")
     ax1.set_title(f"All samples (Pearson={pearson:.4f}, Spearman={spearman:.4f})")
+    plt.colorbar(hb1, ax=ax1, label="log₁₀(count)")
 
-    # Right: non-zero samples only
+    # Right: non-zero samples only — density-colored scatter
     if nz_mask.any():
         nz_true = y_true[nz_mask]
         nz_pred = y_pred[nz_mask]
-        ax2.scatter(nz_true, nz_pred, s=8, alpha=0.5, color="steelblue")
+        # Compute 2D density per point
+        hist, xedges, yedges = np.histogram2d(nz_true, nz_pred, bins=80)
+        x_bin = np.clip(np.digitize(nz_true, xedges) - 1, 0, hist.shape[0] - 1)
+        y_bin = np.clip(np.digitize(nz_pred, yedges) - 1, 0, hist.shape[1] - 1)
+        density = np.log1p(hist[x_bin, y_bin])
+        # Sort so densest points render on top
+        order = np.argsort(density)
+        ax2.scatter(nz_true[order], nz_pred[order], s=8, c=density[order],
+                    cmap="plasma", alpha=0.7, edgecolors="none")
         nz_diag_min = float(max(np.min(nz_true), np.min(nz_pred)))
         nz_diag_max = float(min(np.max(nz_true), np.max(nz_pred)))
         ax2.plot([nz_diag_min, nz_diag_max], [nz_diag_min, nz_diag_max], "r--", linewidth=1)

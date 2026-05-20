@@ -92,6 +92,8 @@ class MyDataset(Dataset):
                 raise ValueError(f"gene_id {gene_id} not found in scRNA var")
         #print(self.gene2idx)
 
+        self._cell_ratio = cell_ratio
+        self._original_cells = self.cells.copy()
         if cell_ratio < 1.0:
             rng = np.random.default_rng(seed if mode == "train" else seed + 1000)
             n_keep = max(1, int(len(self.cells) * cell_ratio))
@@ -103,6 +105,17 @@ class MyDataset(Dataset):
         self.mode = mode
         self.seed = seed
         self.log1p_cpm_target = log1p_cpm_target
+
+    def resample_cells(self, seed: int) -> None:
+        '''Re-select a random subset of cells using cell_ratio with a new seed.
+        Call between epochs to expose the model to different cells over time.'''
+        if self._cell_ratio >= 1.0:
+            return
+        rng = np.random.default_rng(seed if self.mode == "train" else seed + 1000)
+        n_keep = max(1, int(len(self._original_cells) * self._cell_ratio))
+        chosen = rng.choice(len(self._original_cells), size=n_keep, replace=False)
+        self.cells = self._original_cells[chosen]
+        self.C = len(self.cells)
 
     def _preencode_promoters(self) -> torch.Tensor:
         sequences = self.promoters["sequence"].values

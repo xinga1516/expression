@@ -100,7 +100,7 @@ def main():
         )
     else:
         # For processed data, use a smaller subset for scatter plot to reduce noise and speed up plotting.
-        subset_size = min(4*10**6, len(val_dataset))
+        subset_size = min(4*10**5, len(val_dataset))
         val_subset = torch.utils.data.Subset(val_dataset, indices=np.random.choice(len(val_dataset), subset_size, replace=False))
         val_loader = DataLoader(
             val_subset,

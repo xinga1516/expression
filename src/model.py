@@ -16,6 +16,7 @@ class SimpleGeneModel(nn.Module):
                             batch_first=True)
         # expression MLP
         self.use_vae = use_vae
+        self.vae_fine_tune = vae_fine_tune
         if use_vae and vae_encoder_path:
             self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
             if not vae_fine_tune:
@@ -27,6 +28,12 @@ class SimpleGeneModel(nn.Module):
         # output
         self.fc_out = nn.Linear(2 * hidden_size, 1)
         self.relu = nn.ReLU()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.use_vae and not self.vae_fine_tune:
+            self.vae_encoder.eval()
+        return self
 
     def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor:
         # promoter: (batch, 400, 5)
@@ -70,15 +77,16 @@ class LSTMmodel(nn.Module):
         self.lstm_dropout = nn.Dropout(dropout)
 
         self.use_vae = use_vae
+        self.vae_fine_tune = vae_fine_tune
         if use_vae and vae_encoder_path:
             self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
             if not vae_fine_tune:
                 for p in self.vae_encoder.parameters():
                     p.requires_grad = False
-            self.expr_fc = nn.Linear(self.vae_encoder.mean_encoder.out_features, hidden_size * 2)  
+            self.expr_fc = nn.Linear(self.vae_encoder.mean_encoder.out_features, hidden_size * 2)
         else:
             self.expr_fc = nn.Linear(expr_dim, hidden_size * 2)
-        self.expr_norm = nn.LayerNorm(hidden_size * 2)  # add normalization layer for VAE branch  
+        self.expr_norm = nn.LayerNorm(hidden_size * 2)  # add normalization layer for VAE branch
         self.expr_dropout = nn.Dropout(dropout)
 
         self.fc_norm = nn.LayerNorm(2 * hidden_size)  # normalization layer for combined features
@@ -123,12 +131,18 @@ class LSTMmodel(nn.Module):
         x = self.fc2_dropout(x)
 
         if self.output_mode == "zinb":
-            mu_ratio = torch.exp(self.mu_head(x))      # (batch, 1)
-            theta = torch.exp(self.theta_head(x))       # (batch, 1)
-            pi = torch.sigmoid(self.pi_head(x))          # (batch, 1)
+            mu_ratio = torch.exp(torch.clamp(self.mu_head(x), max=10))     # (batch, 1)
+            theta = torch.exp(torch.clamp(self.theta_head(x), max=10))     # (batch, 1)
+            pi = torch.sigmoid(self.pi_head(x))                             # (batch, 1)
             return mu_ratio, theta, pi
         else:
             return self.fc_out(x)                       # (batch, 1)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.use_vae and not self.vae_fine_tune:
+            self.vae_encoder.eval()
+        return self
 
 
 class ConvAttentionModel(nn.Module):
@@ -149,6 +163,7 @@ class ConvAttentionModel(nn.Module):
 
         # Expression branch: (VAE?) → Dense(512) → ReLU → Dense(256)
         self.use_vae = use_vae
+        self.vae_fine_tune = vae_fine_tune
         if use_vae and vae_encoder_path:
             self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
             if not vae_fine_tune:
@@ -206,12 +221,18 @@ class ConvAttentionModel(nn.Module):
         x = self.fc2_dropout(x)
 
         if self.output_mode == "zinb":
-            mu_ratio = torch.exp(self.mu_head(x))      # (batch, 1)
-            theta = torch.exp(self.theta_head(x))       # (batch, 1)
-            pi = torch.sigmoid(self.pi_head(x))          # (batch, 1)
+            mu_ratio = torch.exp(torch.clamp(self.mu_head(x), max=10))     # (batch, 1)
+            theta = torch.exp(torch.clamp(self.theta_head(x), max=10))     # (batch, 1)
+            pi = torch.sigmoid(self.pi_head(x))                             # (batch, 1)
             return mu_ratio, theta, pi
         else:
             return self.fc_out(x)                       # (batch, 1)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.use_vae and not self.vae_fine_tune:
+            self.vae_encoder.eval()
+        return self
 
 
 class PromoterBaseline(nn.Module):

@@ -33,42 +33,44 @@ import src.utils as utils
 from safetensors.torch import save_file, load_file
 
 class ZINBLoss(nn.Module):
-    def __init__(self, eps=1e-8):
+    '''Zero-inflated negative binomial negative log-likelihood, computed entirely
+    in log-space to avoid exp() overflow and the 0*inf=NaN edge case.'''
+
+    def __init__(self, eps: float = 1e-8):
         super().__init__()
         self.eps = eps
 
-    def forward(self, y_true, mu, theta, pi):
-        """
-        y_true: 原始 UMI Count (Batch_size, 1)
-        mu:     调整过 Library Size 后的期望值 (mu_ratio * lib_size)
-        theta:  离散度参数
-        pi:     零膨胀概率
-        """
-        # 1. 计算标准负二项分布 (NB) 的概率密度部分
-        log_theta_mu_eps = torch.log(theta + mu + self.eps)
-        
+    def forward(self, y_true: torch.Tensor, mu: torch.Tensor, theta: torch.Tensor, pi: torch.Tensor) -> torch.Tensor:
+        eps = self.eps
+
+        # Clamp inputs to safe ranges before any log/lgamma
+        mu = torch.clamp(mu, min=eps)
+        theta = torch.clamp(theta, min=eps, max=1e12)
+        pi = torch.clamp(pi, min=eps, max=1.0 - eps)
+
+        # NB log-probability:  log P(y | mu, theta)
+        log_theta_plus_mu = torch.log(theta + mu)
         log_nb = (
-            torch.lgamma(y_true + theta + self.eps)
+            torch.lgamma(y_true + theta)
             - torch.lgamma(y_true + 1.0)
-            - torch.lgamma(theta + self.eps)
-            + theta * (torch.log(theta + self.eps) - log_theta_mu_eps)
-            + y_true * (torch.log(mu + self.eps) - log_theta_mu_eps)
+            - torch.lgamma(theta)
+            + theta * (torch.log(theta) - log_theta_plus_mu)
+            + y_true * (torch.log(mu) - log_theta_plus_mu)
         )
-        nb_case = torch.exp(log_nb)
 
-        # 2. 针对 y = 0 和 y > 0 分别处理
-        zero_case = pi + (1.0 - pi) * nb_case
-        non_zero_case = (1.0 - pi) * nb_case
+        # Log-space mixture to avoid ever computing exp(log_nb):
+        #   P(y) = pi * I(y=0) + (1-pi) * NB(y)
+        #   log P(y>0) = log(1-pi) + log_nb
+        #   log P(y=0) = logaddexp(log(pi), log(1-pi) + log_nb)
+        log_pi = torch.log(pi)
+        log_1m_pi = torch.log(1.0 - pi)
 
-        # 3. 使用 torch.where 组合结果
-        # torch.where(condition, x, y): 满足 condition 用 x，不满足用 y
-        loss = torch.where(
-            y_true < self.eps,
-            -torch.log(zero_case + self.eps),
-            -torch.log(non_zero_case + self.eps)
-        )
-        
-        return torch.mean(loss)
+        y_zero = y_true < eps
+        log_zero_case = torch.logaddexp(log_pi, log_1m_pi + log_nb)
+        log_non_zero_case = log_1m_pi + log_nb
+
+        log_prob = torch.where(y_zero, log_zero_case, log_non_zero_case)
+        return -log_prob.mean()
 
 def weighted_mse_loss(pred, target, nonzero_weight=2.0):
     """MSE with higher weight on non-zero targets."""
@@ -172,10 +174,19 @@ def train_model(
         print(f"[Resume] start_epoch({start_epoch}) >= epochs({epochs}), nothing to train.")
         return
 
+    zinb_loss_fn = ZINBLoss() if loss_type == "zinb" else None
+
     # Training loop
     for epoch in range(start_epoch, epochs):
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
+
+        # Rotate cell subset each epoch so the model eventually sees all cells
+        train_ds = train_loader.dataset
+        if hasattr(train_ds, "resample_cells"):
+            train_ds.resample_cells(seed + epoch)
+            if hasattr(train_loader.sampler, "rebuild"):
+                train_loader.sampler.rebuild(train_ds)
 
         model.train()
         train_loss_num = 0.0
@@ -200,7 +211,6 @@ def train_model(
                 pi = pi.squeeze(1)
                 lib_size = exprs.sum(dim=1) + ys  # exprs has target masked to 0
                 mu = mu_ratio * lib_size
-                zinb_loss_fn = ZINBLoss()
                 loss = zinb_loss_fn(ys, mu, theta, pi)
             else:
                 out = model(promoters, exprs).squeeze(1)
@@ -211,6 +221,7 @@ def train_model(
                 else:
                     loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
@@ -294,7 +305,6 @@ def train_model(
                         pi = pi.squeeze(1)
                         lib_size = exprs.sum(dim=1) + ys
                         mu = mu_ratio * lib_size
-                        zinb_loss_fn = ZINBLoss()
                         val_loss = zinb_loss_fn(ys, mu, theta, pi)
                         val_loss_num += val_loss.item() * ys.numel()
                         val_loss_den += ys.numel()
@@ -327,8 +337,8 @@ def train_model(
                     if nz_cnt > 0:
                         val_nz_sum += sq[nz_mask].sum().item()
                         val_nz_count += nz_cnt
-                        all_nz_true.append(ys[nz_mask].cpu().numpy())
-                        all_nz_pred.append(out.cpu().numpy() if loss_type != "zinb" else y_pred_log[nz_mask].cpu().numpy())
+                        all_nz_true.append(ys[nz_mask].cpu().numpy() if loss_type != "zinb" else y_log[nz_mask].cpu().numpy())
+                        all_nz_pred.append(out[nz_mask].cpu().numpy() if loss_type != "zinb" else y_pred_log[nz_mask].cpu().numpy())
 
                     zero_cnt = zero_mask.sum().item()
                     if zero_cnt > 0:
@@ -463,7 +473,9 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
-    parser.add_argument("--samples-per-epoch", type=int, default=1280000, help="Fixed number of unique samples to draw per epoch")
+    parser.add_argument("--samples-per-epoch", type=int, default=0, help="Number of samples per epoch. 0 = auto-select from pool sizes (no forced duplication).")
+    parser.add_argument("--val-samples", type=int, default=25600, help="Number of unique samples to use for validation (uses zeroNonZeroSampler)")
+    parser.add_argument("--max-duplication", type=float, default=1.0, help="Max duplication factor for auto samples_per_epoch (1.0 = no duplication, 2.0 = up to 2x)")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
     parser.add_argument("--nonzero-loss-weight", type=float, default=2.0, help="Weight multiplier for non-zero labels in MSE loss")
@@ -475,6 +487,7 @@ def main():
     parser.add_argument("--zero-acc-threshold", type=float, default=0.5, help="Threshold for zero-sample accuracy (|pred| < threshold counts as correct)")
     parser.add_argument("--ema-alpha", type=float, default=0.9, help="EMA smoothing factor for validation loss (0=use raw, higher=smoother)")
     parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
+    parser.add_argument("--val-cell-ratio", type=float, default=0.5, help="Fraction of cells for the validation dataset (0-1). Default 1.0 (no subsampling) since val uses fewer samples.")
     parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined", "zinb"], help="Loss function: 'mse', 'pearson', 'combined', or 'zinb' (ZINB distribution loss)")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
@@ -502,7 +515,7 @@ def main():
         scrna_file=data_dir / "integrated_data.h5ad",
         mode="val",
         seed=args.seed,
-        cell_ratio=args.cell_ratio,
+        cell_ratio=args.val_cell_ratio,
         log1p_cpm_target=use_log1p,
     )
 
@@ -514,6 +527,7 @@ def main():
                 nonzero_ratio=args.nonzero_ratio,
                 samples_per_epoch=args.samples_per_epoch,
                 seed=args.seed,
+                max_duplication=args.max_duplication,
             )
             train_loader = DataLoader(
                 train_dataset,
@@ -522,12 +536,14 @@ def main():
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                drop_last=True,
             )
             val_sampler = utils.ZeroNonZeroSampler(
                 val_dataset,
                 nonzero_ratio=args.nonzero_ratio,
-                samples_per_epoch=2560000, #args.samples_per_epoch,
+                samples_per_epoch=args.val_samples,
                 seed=args.seed,
+                max_duplication=args.max_duplication,
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -536,6 +552,7 @@ def main():
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                drop_last=True,
             )
         else:
             train_sampler = utils.BalancedEpochSubsetSampler(
@@ -550,10 +567,11 @@ def main():
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                drop_last=True,
             )
             val_sampler = utils.BalancedEpochSubsetSampler(
                 val_dataset,
-                samples_per_epoch=args.samples_per_epoch,
+                samples_per_epoch=args.val_samples,
                 seed=args.seed,            )
             val_loader = DataLoader(
                 val_dataset,
@@ -562,6 +580,7 @@ def main():
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                drop_last=True,
             )
     elif args.data in ("highquality", "umi_highquality"):
         if args.nonzero_ratio is not None:
@@ -578,6 +597,7 @@ def main():
                 shuffle=False,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                drop_last=True,
             )
         else:
             train_loader = DataLoader(
@@ -586,6 +606,7 @@ def main():
                 shuffle=True,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                drop_last=True,
             )
         val_loader = DataLoader(
             val_dataset,
@@ -593,6 +614,7 @@ def main():
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=pin_memory,
+            drop_last=True,
         )
 
     expr_dim = train_dataset.X.shape[1]
