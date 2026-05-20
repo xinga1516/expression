@@ -145,7 +145,7 @@ class ZeroNonZeroSampler(Sampler):
             cap_nz = max_nz / self.nonzero_ratio if self.nonzero_ratio > 0 else float("inf")
             cap_z = max_z / (1.0 - self.nonzero_ratio) if self.nonzero_ratio < 1.0 else float("inf")
             max_unique = int(min(cap_nz, cap_z, self.total_len))
-            self.samples_per_epoch = max(max_num_samples, int(max_unique * self.max_duplication))
+            self.samples_per_epoch = min(max_num_samples, int(max_unique * self.max_duplication))
             print(f"[ZeroNonZeroSampler] Auto samples_per_epoch = {self.samples_per_epoch} "
                   f"(max_unique={max_unique}, nz_pool={nz_pool}, zero_pool={zero_pool}, "
                   f"max_duplication={self.max_duplication})")
