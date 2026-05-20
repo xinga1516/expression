@@ -19,14 +19,10 @@ class EarlyStopping:
         elif val_loss < self.best_score - self.min_delta:
             self.best_score = val_loss
             self.counter = 0
-            self.early_stop = False
-        elif abs(val_loss - self.best_score) <= self.min_delta:
+        else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.counter = 0
-            self.early_stop = False
 
     def state_dict(self) -> dict:
         return {

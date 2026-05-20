@@ -180,13 +180,14 @@ def train_model(
     for epoch in range(start_epoch, epochs):
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
-
-        # Rotate cell subset each epoch so the model eventually sees all cells
-        train_ds = train_loader.dataset
-        if hasattr(train_ds, "resample_cells"):
-            train_ds.resample_cells(seed + epoch)
-            if hasattr(train_loader.sampler, "rebuild"):
-                train_loader.sampler.rebuild(train_ds)
+        
+        if epoch % 10 == 0:
+            # Rotate cell subset each epoch so the model eventually sees all cells
+            train_ds = train_loader.dataset
+            if hasattr(train_ds, "resample_cells"):
+                train_ds.resample_cells(seed + epoch)
+                if hasattr(train_loader.sampler, "rebuild"):
+                    train_loader.sampler.rebuild(train_ds)
 
         model.train()
         train_loss_num = 0.0
@@ -474,7 +475,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
     parser.add_argument("--samples-per-epoch", type=int, default=0, help="Number of samples per epoch. 0 = auto-select from pool sizes (no forced duplication).")
-    parser.add_argument("--val-samples", type=int, default=25600, help="Number of unique samples to use for validation (uses zeroNonZeroSampler)")
+    parser.add_argument("--val-samples", type=int, default=128000, help="Number of unique samples to use for validation (uses zeroNonZeroSampler)")
     parser.add_argument("--max-duplication", type=float, default=1.0, help="Max duplication factor for auto samples_per_epoch (1.0 = no duplication, 2.0 = up to 2x)")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
@@ -697,8 +698,8 @@ def main():
 
             utils.count_zero_nonzero(val_loader)
             utils.plot_pred_scatter(model, val_loader, epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
-            utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=6, save_path=plots_dir / "per_promoter_scatter.png")
-            utils.plot_per_cell_scatter(model, val_dataset, n_cells=6, save_path=plots_dir / "per_cell_scatter.png")
+            utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=3, save_path=plots_dir / "per_promoter_scatter.png")
+            utils.plot_per_cell_scatter(model, val_dataset, n_cells=3, save_path=plots_dir / "per_cell_scatter.png")
         else:
             print(f"Log file not found for plotting: {log_file}")
 # %%       

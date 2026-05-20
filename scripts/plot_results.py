@@ -124,9 +124,9 @@ def main():
     utils.count_zero_nonzero(val_loader)
     utils.plot_pred_scatter(model, val_loader, epoch=args.epochs,
                             save_path=plot_dir / "pred_vs_true_scatter.png")
-    utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=6,
+    utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=3,
                                     save_path=plot_dir / "per_promoter_scatter.png")
-    utils.plot_per_cell_scatter(model, val_dataset, n_cells=6,
+    utils.plot_per_cell_scatter(model, val_dataset, n_cells=3,
                                  save_path=plot_dir / "per_cell_scatter.png")
     print(f"All plots saved to: {plot_dir}")
 

@@ -81,7 +81,12 @@ class ZeroNonZeroSampler(Sampler):
     replace : bool
         If False, non-zero indices are sampled without replacement (raises ValueError
         when requested n_nz exceeds the available pool). Zero-side always samples
-        without replacement internally.'''
+        without replacement internally.
+    max_duplication : float    
+        Maximum allowed duplication of samples (default: 1.0). 
+        For example, with max_duplication=2.0, the sampler can yield up to 
+        2x the unique samples in the pools by allowing duplicates 
+        when the requested samples_per_epoch exceeds the pool sizes.'''
 
     def __init__(self, dataset: Any, nonzero_ratio: float = 0.5, samples_per_epoch: Optional[int] = None, seed: int = 42, replace: bool = True, max_duplication: float = 1.0) -> None:
         self.dataset = dataset
@@ -134,12 +139,13 @@ class ZeroNonZeroSampler(Sampler):
 
         # Auto-select samples_per_epoch from pool sizes + nonzero_ratio
         if self._auto_samples or not hasattr(self, "samples_per_epoch") or self.samples_per_epoch == 0:
+            max_num_samples = 128000  # sanity cap to prevent OOM or excessively long epochs
             max_nz = max(nz_pool, 1)
             max_z = max(zero_pool, 1)
             cap_nz = max_nz / self.nonzero_ratio if self.nonzero_ratio > 0 else float("inf")
             cap_z = max_z / (1.0 - self.nonzero_ratio) if self.nonzero_ratio < 1.0 else float("inf")
             max_unique = int(min(cap_nz, cap_z, self.total_len))
-            self.samples_per_epoch = int(max_unique * self.max_duplication)
+            self.samples_per_epoch = max(max_num_samples, int(max_unique * self.max_duplication))
             print(f"[ZeroNonZeroSampler] Auto samples_per_epoch = {self.samples_per_epoch} "
                   f"(max_unique={max_unique}, nz_pool={nz_pool}, zero_pool={zero_pool}, "
                   f"max_duplication={self.max_duplication})")
