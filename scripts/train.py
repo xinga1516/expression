@@ -176,7 +176,7 @@ def train_model(
 
     zinb_loss_fn = ZINBLoss() if loss_type == "zinb" else None
 
-    # Training loop
+    # Training loop — validate first (captures initial loss at epoch 0), then train
     for epoch in range(start_epoch, epochs):
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
@@ -189,90 +189,7 @@ def train_model(
                 if hasattr(train_loader.sampler, "rebuild"):
                     train_loader.sampler.rebuild(train_ds)
 
-        model.train()
-        train_loss_num = 0.0
-        train_loss_den = 0.0
-        train_nz_sum = 0.0
-        train_nz_count = 0
-        train_zero_sum = 0.0
-        train_zero_count = 0
-        epoch_step_losses = []
-
-        for batch in train_loader:
-            promoters, exprs, ys = batch
-            promoters = promoters.to(device, non_blocking=True)
-            exprs = exprs.to(device, non_blocking=True)
-            ys = ys.to(device, non_blocking=True).float()
-
-            optimizer.zero_grad()
-            if loss_type == "zinb":
-                mu_ratio, theta, pi = model(promoters, exprs)
-                mu_ratio = mu_ratio.squeeze(1)
-                theta = theta.squeeze(1)
-                pi = pi.squeeze(1)
-                lib_size = exprs.sum(dim=1) + ys  # exprs has target masked to 0
-                mu = mu_ratio * lib_size
-                loss = zinb_loss_fn(ys, mu, theta, pi)
-            else:
-                out = model(promoters, exprs).squeeze(1)
-                if loss_type == "pearson":
-                    loss = pearson_loss(out, ys)
-                elif loss_type == "combined":
-                    loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
-                else:
-                    loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-
-            # calculate weighted MSE components for each batch
-            with torch.no_grad():
-                if loss_type == "zinb":
-                    y_pred_log = torch.log(mu_ratio * 10000 + 1)
-                    y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
-                    sq = (y_pred_log - y_log) ** 2
-                else:
-                    sq = (out - ys) ** 2
-                zero_mask = (ys == 0)
-                nz_mask = ~zero_mask
-
-                # weighted average aggregation (matches loss function)
-                w = torch.where(ys != 0, torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
-                                torch.ones_like(ys))
-                weighted_sq_sum = (w * sq).sum().item()
-                weight_sum = w.sum().item()
-                train_loss_num += weighted_sq_sum
-                train_loss_den += weight_sum
-
-                nz_cnt = nz_mask.sum().item()
-                if nz_cnt > 0:
-                    train_nz_sum += sq[nz_mask].sum().item()
-                    train_nz_count += nz_cnt
-
-                zero_cnt = zero_mask.sum().item()
-                if zero_cnt > 0:
-                    train_zero_sum += sq[zero_mask].sum().item()
-                    train_zero_count += zero_cnt
-
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-
-            epoch_step_losses.append(loss.item())
-
-        if loss_type in ("pearson", "zinb"):
-            avg_train_loss = sum(epoch_step_losses) / max(len(epoch_step_losses), 1)
-        else:
-            avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
-        train_losses.append(avg_train_loss)
-        train_losses_zero.append(train_zero_sum / max(train_zero_count, 1))
-        train_losses_nz.append(train_nz_sum / max(train_nz_count, 1))
-
-        # Flush step-level train losses
-        utils.append_step_log(step_log_file, epoch_step_losses, epoch + 1, global_step)
-        global_step += len(epoch_step_losses)
-
-        # Validation loop
+        # ── Validation (runs before training so epoch 0 captures initial loss) ──
         avg_val_loss = float("nan")
         epoch_val_pearson = float("nan")
         epoch_val_pearson_all = float("nan")
@@ -388,16 +305,18 @@ def train_model(
 
         val_losses.append(avg_val_loss)
 
-        # EMA-smoothed validation loss
-        monitor_loss = avg_val_loss if not math.isnan(avg_val_loss) else avg_train_loss
+        # ── Post-validation: EMA, logging, early-stopping, checkpoint ──
+        prev_train = train_losses[-1] if train_losses else float("nan")
+        monitor_loss = avg_val_loss if not math.isnan(avg_val_loss) else prev_train
         if val_loss_ema is None:
             val_loss_ema = monitor_loss
         else:
             val_loss_ema = ema_alpha * val_loss_ema + (1 - ema_alpha) * monitor_loss
 
         current_lr = optimizer.param_groups[0]["lr"]
+        prev_train_str = f"Train={prev_train:.6f} " if train_losses else ""
         log_msg = (
-            f"Epoch {epoch+1}/{epochs}: Train={avg_train_loss:.6f} Val={avg_val_loss:.6f} "
+            f"Epoch {epoch}/{epochs}: {prev_train_str}Val={avg_val_loss:.6f} "
             f"ValEMA={val_loss_ema:.6f} LR={current_lr:.3e}"
         )
         if not math.isnan(epoch_val_pearson_all):
@@ -410,13 +329,13 @@ def train_model(
 
         utils.append_epoch_log(
             log_file=log_file,
-            epoch=epoch + 1,
-            train_loss=avg_train_loss,
+            epoch=epoch,
+            train_loss=train_losses[-1] if train_losses else float("nan"),
             val_loss=avg_val_loss if not math.isnan(avg_val_loss) else np.nan,
             lr=current_lr,
             val_loss_ema=val_loss_ema,
-            train_loss_zero=train_losses_zero[-1],
-            train_loss_nonzero=train_losses_nz[-1],
+            train_loss_zero=train_losses_zero[-1] if train_losses_zero else float("nan"),
+            train_loss_nonzero=train_losses_nz[-1] if train_losses_nz else float("nan"),
             val_loss_zero=val_losses_zero[-1],
             val_loss_nonzero=val_losses_nz[-1],
             val_pearson_nonzero=epoch_val_pearson,
@@ -440,9 +359,9 @@ def train_model(
             val_losses=val_losses,
         )
 
-        if save_every > 0 and ((epoch + 1) % save_every == 0):
+        if save_every > 0 and (epoch % save_every == 0):
             utils.save_checkpoint(
-                checkpoint_path=ckpt_dir / f"epoch_{epoch+1:04d}.ckpt",
+                checkpoint_path=ckpt_dir / f"epoch_{epoch:04d}.ckpt",
                 epoch=epoch,
                 model=model,
                 optimizer=optimizer,
@@ -454,10 +373,93 @@ def train_model(
 
         if patience > 0 and earlystopping.early_stop:
             print(
-                f"Early stopping at epoch {epoch+1}: "
+                f"Early stopping at epoch {epoch}: "
                 f"no improvement for {earlystopping.counter} epochs (patience={patience})."
             )
             break
+
+        # ── Training ──
+        model.train()
+        train_loss_num = 0.0
+        train_loss_den = 0.0
+        train_nz_sum = 0.0
+        train_nz_count = 0
+        train_zero_sum = 0.0
+        train_zero_count = 0
+        epoch_step_losses = []
+
+        for batch in train_loader:
+            promoters, exprs, ys = batch
+            promoters = promoters.to(device, non_blocking=True)
+            exprs = exprs.to(device, non_blocking=True)
+            ys = ys.to(device, non_blocking=True).float()
+
+            optimizer.zero_grad()
+            if loss_type == "zinb":
+                mu_ratio, theta, pi = model(promoters, exprs)
+                mu_ratio = mu_ratio.squeeze(1)
+                theta = theta.squeeze(1)
+                pi = pi.squeeze(1)
+                lib_size = exprs.sum(dim=1) + ys  # exprs has target masked to 0
+                mu = mu_ratio * lib_size
+                loss = zinb_loss_fn(ys, mu, theta, pi)
+            else:
+                out = model(promoters, exprs).squeeze(1)
+                if loss_type == "pearson":
+                    loss = pearson_loss(out, ys)
+                elif loss_type == "combined":
+                    loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
+                else:
+                    loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            # calculate weighted MSE components for each batch
+            with torch.no_grad():
+                if loss_type == "zinb":
+                    y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                    y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
+                    sq = (y_pred_log - y_log) ** 2
+                else:
+                    sq = (out - ys) ** 2
+                zero_mask = (ys == 0)
+                nz_mask = ~zero_mask
+
+                # weighted average aggregation (matches loss function)
+                w = torch.where(ys != 0, torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
+                                torch.ones_like(ys))
+                weighted_sq_sum = (w * sq).sum().item()
+                weight_sum = w.sum().item()
+                train_loss_num += weighted_sq_sum
+                train_loss_den += weight_sum
+
+                nz_cnt = nz_mask.sum().item()
+                if nz_cnt > 0:
+                    train_nz_sum += sq[nz_mask].sum().item()
+                    train_nz_count += nz_cnt
+
+                zero_cnt = zero_mask.sum().item()
+                if zero_cnt > 0:
+                    train_zero_sum += sq[zero_mask].sum().item()
+                    train_zero_count += zero_cnt
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+            epoch_step_losses.append(loss.item())
+
+        if loss_type in ("pearson", "zinb"):
+            avg_train_loss = sum(epoch_step_losses) / max(len(epoch_step_losses), 1)
+        else:
+            avg_train_loss = train_loss_num / max(train_loss_den, 1e-12)
+        train_losses.append(avg_train_loss)
+        train_losses_zero.append(train_zero_sum / max(train_zero_count, 1))
+        train_losses_nz.append(train_nz_sum / max(train_nz_count, 1))
+
+        utils.append_step_log(step_log_file, epoch_step_losses, epoch, global_step)
+        global_step += len(epoch_step_losses)
 
     print(f"Training done. logs: {log_file} | checkpoints: {ckpt_dir}")
         
@@ -481,7 +483,7 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
     parser.add_argument("--nonzero-loss-weight", type=float, default=2.0, help="Weight multiplier for non-zero labels in MSE loss")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience in epochs")
-    parser.add_argument("--min-delta", type=float, default=1e-2, help="Minimum loss improvement to reset patience")
+    parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum loss improvement to reset patience")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility of validation sampling and training")
     parser.add_argument("--max-resume-snapshots", type=int, default=5, help="Max number of resume snapshots to keep (0 means keep all)")
     parser.add_argument("--nonzero-ratio", type=float, default=None, help="Target ratio of non-zero samples per epoch (uses ZeroNonZeroSampler). Default: natural ratio from data")

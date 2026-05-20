@@ -52,7 +52,7 @@ class LSTMmodel(nn.Module):
     '''More complex model with multi-layer bidirectional LSTM, deeper MLP, and dropout.'''
 
     def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 64, expr_dim: Optional[int] = None,
-                 dropout: float = 0.0, lstm_layers: int = 2,
+                 dropout: float = 0.1, lstm_layers: int = 2,
                  use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False,
                  output_mode: str = "scalar", **kwargs: Any) -> None:
         super().__init__()

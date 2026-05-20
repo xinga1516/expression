@@ -791,20 +791,34 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
 
     # ---- val loss by epoch ----
     val_color = "darkorange"
+    has_initial_val = df_epoch["epoch"].iloc[0] == 0
     if step_log_file.exists():
         # Map val_loss to each epoch's last step (val is computed at epoch end)
         endpoints = step_bounds["max"].values
         steps_last_epoch = 0 if df_step['epoch'].iloc[-1] == df_epoch['epoch'].iloc[-1] else len(df_step) - step_bounds["max"].iloc[-1]
         if steps_last_epoch:
             endpoints = endpoints[:-1]  # drop last point if last epoch is incomplete
-        ax1.scatter(endpoints, df_epoch["val_loss"], color=val_color, s=30, zorder=5, label="Val Loss")
-        ax1.plot(endpoints, df_epoch["val_loss"], color=val_color, linewidth=1, alpha=0.6)
+
+        if has_initial_val:
+            # Epoch 0 val is the initial loss before any training — plot at first step
+            endpoints = np.insert(endpoints, 0, df_step["global_step"].iloc[0])
+            first_step = df_step["global_step"].iloc[0]
+            val_arr = df_epoch["val_loss"].values
+            ema_arr = df_epoch["val_loss_ema"].values if "val_loss_ema" in df_epoch.columns else None
+        else:
+            val_arr = df_epoch["val_loss"].values
+            ema_arr = df_epoch["val_loss_ema"].values if "val_loss_ema" in df_epoch.columns else None
+
+        n_pts = min(len(endpoints), len(val_arr))
+        ax1.scatter(endpoints[:n_pts], val_arr[:n_pts], color=val_color, s=30, zorder=5, label="Val Loss")
+        ax1.plot(endpoints[:n_pts], val_arr[:n_pts], color=val_color, linewidth=1, alpha=0.6)
     else:
         ax1.plot(df_epoch["epoch"], df_epoch["val_loss"], color=val_color, marker="o", linewidth=1.5, label="Val Loss")
         ax1.set_xlabel("Epoch")
     if "val_loss_ema" in df_epoch.columns:
         if step_log_file.exists():
-            ax1.plot(endpoints, df_epoch["val_loss_ema"], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
+            if ema_arr is not None and n_pts > 0:
+                ax1.plot(endpoints[:n_pts], ema_arr[:n_pts], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
         else:
             ax1.plot(df_epoch["epoch"], df_epoch["val_loss_ema"], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
     ax1.legend(loc="upper right")
@@ -822,7 +836,6 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
 def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None) -> None:
     '''Plot separate loss curves for zero and non-zero samples from the extended log.'''
     df = pd.read_csv(log_file)
-    df = df[1:] if len(df) > 1 else df
     required = {"train_loss_zero", "train_loss_nonzero", "val_loss_zero", "val_loss_nonzero"}
     if not required.issubset(df.columns):
         print("  Skipping zero/non-zero loss plot: columns not found in log.")
@@ -858,7 +871,6 @@ def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None)
 def plot_val_metrics(log_file: Path, save_path: Path | None = None) -> None:
     '''Plot validation Pearson (non-zero) and accuracy (zero) over epochs.'''
     df = pd.read_csv(log_file)
-    df = df[1:] if len(df) > 1 else df
 
     has_pearson = "val_pearson_nonzero" in df.columns
     has_acc = "val_zero_accuracy" in df.columns
