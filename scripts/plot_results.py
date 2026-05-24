@@ -114,7 +114,7 @@ def main():
     model = build_model(
         model_name, expr_dim=expr_dim, hidden_size=hidden_size,
         use_vae=use_vae, vae_encoder_path=vae_encoder_path, vae_fine_tune=vae_fine_tune,
-        output_mode=output_mode,
+        output_mode=output_mode,fusion="gate"
     )
     model.load_state_dict(load_file(str(checkpoint), device=str(device)))
     model.to(device)
@@ -122,12 +122,12 @@ def main():
     print(f"Loaded model from: {checkpoint}")
 
     utils.count_zero_nonzero(val_loader)
-    utils.plot_pred_scatter(model, val_loader, epoch=args.epochs,
-                            save_path=plot_dir / "pred_vs_true_scatter.png")
-    utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=3,
-                                    save_path=plot_dir / "per_promoter_scatter.png")
+    # utils.plot_pred_scatter(model, val_loader, epoch=args.epochs,
+    #                         save_path=plot_dir / "pred_vs_true_scatter.png")
+    # utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=3,
+    #                                 save_path=plot_dir / "per_promoter_scatter.png")
     utils.plot_per_cell_scatter(model, val_dataset, n_cells=3,
-                                 save_path=plot_dir / "per_cell_scatter.png")
+                                 save_path=plot_dir / "per_cell_scatter3.png")
     print(f"All plots saved to: {plot_dir}")
 
 

@@ -203,6 +203,10 @@ def train_model(
             val_nz_count = 0
             val_zero_sum = 0.0
             val_zero_count = 0
+            lstm_var_sum = 0.0
+            lstm_var_count = 0
+            expr_var_sum = 0.0
+            expr_var_count = 0
             all_nz_true = []
             all_nz_pred = []
             all_zero_pred = []
@@ -244,6 +248,13 @@ def train_model(
 
                     zero_mask = (ys == 0)
                     nz_mask = ~zero_mask
+
+                    if hasattr(model, 'last_lstm_out'):
+                        lstm_var_sum += model.last_lstm_out.var(dim=0).mean().item()
+                        lstm_var_count += 1
+                    if hasattr(model, 'last_expr_out'):
+                        expr_var_sum += model.last_expr_out.var(dim=0).mean().item()
+                        expr_var_count += 1
 
                     w = torch.where(ys != 0, torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
                                     torch.ones_like(ys))
@@ -305,6 +316,10 @@ def train_model(
 
         val_losses.append(avg_val_loss)
 
+        # Branch output variances — monitor whether each branch learns diverse representations
+        epoch_lstm_var = lstm_var_sum / max(lstm_var_count, 1) if lstm_var_count > 0 else float("nan")
+        epoch_expr_var = expr_var_sum / max(expr_var_count, 1) if expr_var_count > 0 else float("nan")
+
         # ── Post-validation: EMA, logging, early-stopping, checkpoint ──
         prev_train = train_losses[-1] if train_losses else float("nan")
         monitor_loss = avg_val_loss if not math.isnan(avg_val_loss) else prev_train
@@ -325,6 +340,10 @@ def train_model(
             log_msg += f" | Pearson(NZ)={epoch_val_pearson:.4f}"
         if not math.isnan(epoch_val_zero_acc):
             log_msg += f" | ZeroAcc={epoch_val_zero_acc:.4f}"
+        if not math.isnan(epoch_lstm_var):
+            log_msg += f" | LstmVar={epoch_lstm_var:.4f}"
+        if not math.isnan(epoch_expr_var):
+            log_msg += f" | ExprVar={epoch_expr_var:.4f}"
         print(log_msg)
 
         utils.append_epoch_log(
@@ -341,6 +360,8 @@ def train_model(
             val_pearson_nonzero=epoch_val_pearson,
             val_pearson_all=epoch_val_pearson_all,
             val_zero_accuracy=epoch_val_zero_acc,
+            lstm_var=epoch_lstm_var,
+            expr_var=epoch_expr_var,
         )
 
         # Update best metric and early-stopping counter (uses EMA-smoothed loss)
@@ -492,6 +513,7 @@ def main():
     parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
     parser.add_argument("--val-cell-ratio", type=float, default=0.5, help="Fraction of cells for the validation dataset (0-1). Default 1.0 (no subsampling) since val uses fewer samples.")
     parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined", "zinb"], help="Loss function: 'mse', 'pearson', 'combined', or 'zinb' (ZINB distribution loss)")
+    parser.add_argument("--fusion", type=str, default="gate", choices=["concat", "gate"], help="Fusion method for combining LSTM and expression features")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
@@ -632,6 +654,7 @@ def main():
         vae_encoder_path=args.vae_encoder,
         vae_fine_tune=args.vae_fine_tune,
         output_mode=output_mode,
+        fusion=args.fusion,
     )
 
     run_dir, ckpt_dir, plots_dir, _ = utils._prepare_output_dirs(base_dir, args.exp_name)
@@ -644,7 +667,8 @@ def main():
         # dryrun会改参数，重新初始化模型再正式训练
         model = build_model(args.model, expr_dim=expr_dim, hidden_size=args.hidden_size,
                             use_vae=args.vae_encoder is not None, vae_encoder_path=args.vae_encoder,
-                            vae_fine_tune=args.vae_fine_tune, output_mode=output_mode)
+                            vae_fine_tune=args.vae_fine_tune, output_mode=output_mode,
+                            fusion=args.fusion)
 
     resume = args.resume
     if resume is None:

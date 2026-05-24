@@ -175,37 +175,93 @@ def add_gene_annotation(rawdata: ad.AnnData, synonym_path: Optional[str] = None,
 
     return rawdata
 
-def build_integrated_data() -> ad.AnnData:
-    '''
-    Build integrated single-cell RNA sequencing data.
-    '''
-    # check the file structure
-    f = h5py.File("raw/s_fca_biohub_all_wo_blood_10x.loom", "r")
-    print(list(f.keys())) # output ['attrs', 'col_attrs', 'col_graphs', 'layers', 'matrix', 'row_attrs', 'row_graphs']
+def _safe_col_attr_to_array(handle: h5py.File, key: str) -> np.ndarray | None:
+    """Safely read a 1D column attribute from a loom file.
 
-    # reorganize data structure
-    X = f["matrix"]  # shape: genes × cells
-    # change the dense matrix to sparse matrix
-    #print(sparse.issparse(X));print(X)
+    Skips structured/compound dtypes (e.g. ClusterMarkers) and multi-
+    dimensional arrays, which are not suitable for obs columns.
+    """
+    try:
+        arr = handle["col_attrs"][key]
+        if arr.ndim != 1:
+            return None
+        # Structured (compound) dtypes have named fields — skip.
+        if arr.dtype.names is not None:
+            return None
+        return arr[:]
+    except Exception:
+        return None
+
+
+def build_integrated_data() -> ad.AnnData:
+    """Build integrated single-cell RNA sequencing data from a .loom file.
+
+    Converts the dense HDF5 matrix to a sparse CSR AnnData, preserving
+    cell-level metadata (cell type, tissue, batch, etc.) in ``.obs``.
+    """
+    base_dir = Path(__file__).resolve().parent.parent
+    loom_path = base_dir / "data" / "raw" / "s_fca_biohub_all_wo_blood_10x.loom"
+
+    f = h5py.File(str(loom_path), "r")
+    print("Top-level keys:", list(f.keys()))
+
+    X = f["matrix"]
     X_sparse = hdf5_matrix_to_sparse(X)
-    print(sparse.issparse(X))
-    print(X_sparse.data.max()) # check if the date is the UMI count: yes
-    # build eligible anndata with sparse matrix, var, and obs. 
-    # add the flybase gene id and gene length to the anndata
-    row_attrs = list(f['row_attrs'].keys())
-    col_attrs = list(f['col_attrs'].keys())
-    attrs = list(f['attrs'].keys())
-    gene_names = f['row_attrs']['Gene'][:].astype(str)
-    cell_ids = f['col_attrs']['CellID'][:].astype(str)
-    # print(row_attrs)
-    # print(col_attrs)
-    print(gene_names)
-    print(cell_ids)
+    print("Is sparse:", sparse.issparse(X_sparse))
+    print("Max UMI count:", X_sparse.data.max())
+
+    gene_names = f["row_attrs"]["Gene"][:].astype(str)
+    cell_ids = f["col_attrs"]["CellID"][:].astype(str)
+
+    # Build obs with selected cell metadata from loom col_attrs
+    obs_columns: dict[str, np.ndarray] = {}
+    col_attrs = list(f["col_attrs"].keys())
+    print(f"\ncol_attrs ({len(col_attrs)}): {sorted(col_attrs)}")
+
+    # Columns worth carrying into AnnData.obs (biologically informative).
+    keep_cols = [
+        "annotation",
+        "annotation_broad",
+        "tissue",
+        "sex",
+        "age",
+        "batch",
+        "batch_id",
+        "sample_id",
+        "dissection_lab",
+        "fly_genetics",
+        "n_counts",
+        "n_genes",
+        "percent_mito",
+        "scrublet__predicted_doublets",
+        "fca_id",
+    ]
+
+    skipped: list[str] = []
+    for key in keep_cols:
+        arr = _safe_col_attr_to_array(f, key)
+        if arr is not None:
+            # Decode bytes to str for object columns
+            if arr.dtype.kind in ("S", "O"):
+                arr = arr.astype(str)
+            obs_columns[key] = arr
+        else:
+            skipped.append(key)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} col_attrs (non-1D or structured dtype): {skipped}")
+
+    obs_df = pd.DataFrame(obs_columns, index=cell_ids)
+    print(f"\nobs columns ({len(obs_df.columns)}): {sorted(obs_df.columns)}")
+    print(f"obs shape: {obs_df.shape}")
+
     rawdata = ad.AnnData(
-        X = X_sparse,
-        obs = pd.DataFrame(index=cell_ids),
-        var = pd.DataFrame(index=gene_names)
+        X=X_sparse,
+        obs=obs_df,
+        var=pd.DataFrame(index=gene_names),
     )
+
+    f.close()
     return rawdata
 
 def filter_cells(rawdata: ad.AnnData, top_total_fraction: float = 0.10, plot_qc: bool = True) -> ad.AnnData:

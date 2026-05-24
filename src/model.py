@@ -40,21 +40,27 @@ class SimpleGeneModel(nn.Module):
         # expr: (batch, expr_dim)
         lstm_out, _ = self.lstm(promoter)        # (batch, 400, hidden)
         lstm_out = lstm_out[:, -1, :]            # take last time step -> (batch, hidden)
+        self.last_lstm_out = lstm_out             # stored for monitoring
         if self.use_vae:
             expr = self.vae_encoder(expr)         # (batch, n_latent)
         expr_out = self.relu(self.expr_fc(expr)) # (batch, hidden)
+        self.last_expr_out = expr_out             # stored for monitoring
         combined = torch.cat([lstm_out, expr_out], dim=1)  # (batch, 2*hidden)
         out = self.fc_out(combined)              # (batch, 1)
         return out
 
 
 class LSTMmodel(nn.Module):
-    '''More complex model with multi-layer bidirectional LSTM, deeper MLP, and dropout.'''
+    '''More complex model with multi-layer bidirectional LSTM, deeper MLP, and dropout.
+
+    fusion: "concat" (default) concatenates LSTM and expression branches.
+            "gate" uses a promoter-driven gate to control expression features element-wise
+            before concatenation: context_gate = sigmoid(Linear(lstm_out)), fused = expr_out * context_gate.'''
 
     def __init__(self, promoter_len: int = 400, promoter_channels: int = 5, hidden_size: int = 64, expr_dim: Optional[int] = None,
                  dropout: float = 0.1, lstm_layers: int = 2,
                  use_vae: bool = False, vae_encoder_path: Optional[str] = None, vae_fine_tune: bool = False,
-                 output_mode: str = "scalar", **kwargs: Any) -> None:
+                 output_mode: str = "scalar", fusion: str = "concat", **kwargs: Any) -> None:
         super().__init__()
         if expr_dim is None:
             raise ValueError("expr_dim must be provided, e.g. from dataset feature dimension")
@@ -89,6 +95,10 @@ class LSTMmodel(nn.Module):
         self.expr_norm = nn.LayerNorm(hidden_size * 2)  # add normalization layer for VAE branch
         self.expr_dropout = nn.Dropout(dropout)
 
+        self.fusion = fusion
+        if fusion == "gate":
+            self.seq_gate = nn.Linear(lstm_out_dim, hidden_size * 2)
+
         self.fc_norm = nn.LayerNorm(2 * hidden_size)  # normalization layer for combined features
         self.fc1 = nn.Linear(lstm_out_dim + hidden_size * 2, hidden_size * 2)
         self.fc1_dropout = nn.Dropout(dropout)
@@ -116,14 +126,21 @@ class LSTMmodel(nn.Module):
         lstm_out = self.lstm_norm(self.lstm_fc(lstm_out))  # (batch, 2*hidden)
         lstm_out = self.gelu(lstm_out)
         lstm_out = self.lstm_dropout(lstm_out)
+        self.last_lstm_out = lstm_out                     # stored for monitoring
 
         if self.use_vae:
             expr = self.vae_encoder(expr)             # (batch, n_latent)
         expr_out = self.expr_norm(self.expr_fc(expr))     # (batch, 2*hidden)
         expr_out = self.gelu(expr_out)
         expr_out = self.expr_dropout(expr_out)
+        self.last_expr_out = expr_out                     # stored for monitoring
 
-        combined = torch.cat([lstm_out, expr_out], dim=1)  # (batch, 4*hidden)
+        if self.fusion == "gate":
+            context_gate = torch.sigmoid(self.seq_gate(lstm_out))  # (batch, 2*hidden)
+            fused_expr = expr_out * context_gate                    # element-wise gate
+            combined = torch.cat([lstm_out, fused_expr], dim=1)    # (batch, 4*hidden)
+        else:
+            combined = torch.cat([lstm_out, expr_out], dim=1)       # (batch, 4*hidden)
         x = self.fc_norm(self.fc1(combined))          # (batch, 2*hidden)
         x = self.relu(x)
         x = self.fc1_dropout(x)

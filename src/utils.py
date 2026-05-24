@@ -683,20 +683,31 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, n_promoters: int =
 
 
 def plot_per_cell_scatter(model: nn.Module, dataset: Any, n_cells: int = 6,
-                           n_genes: int = 500, save_path: Path | None = None) -> None:
-    '''Sample cells and plot (true, predicted) across genes, one color per cell.'''
+                           n_genes: int = 500, annotate_top: int = 10000,
+                           save_path: Path | None = None) -> None:
+    '''Sample cells and plot (true, predicted) across genes, one color per cell.
+    annotate_top: number of top non-zero genes (by true expression) to label per cell.'''
     device = next(model.parameters()).device
     model.eval()
     is_zinb = getattr(model, "output_mode", "scalar") == "zinb"
 
     rng = np.random.default_rng(42)
-    cell_indices = rng.choice(dataset.C, size=min(n_cells, dataset.C), replace=False)
     pro_indices = rng.choice(dataset.P, size=min(n_genes, dataset.P), replace=False)
+
+    # Select cells with highest total counts
+    cell_totals = np.array([dataset.scrna.obs["total_counts"].iloc[int(dataset.cells[i])]
+                            for i in range(dataset.C)])
+    top_cell_order = np.argsort(cell_totals)[::-1]  # descending
+    cell_indices = top_cell_order[:min(n_cells, dataset.C)]
+    cell_labels = [f"cell {int(dataset.cells[i])}\n({cell_totals[i]:.0f} UMIs)" for i in cell_indices]
     colors = plt.cm.tab10(np.linspace(0, 1, len(cell_indices)))
 
-    # Pre-fetch promoter tensors for all sampled genes
+    # Pre-fetch promoter tensors and gene names for all sampled genes
     promoter_batch = dataset.promoter_tensor[pro_indices].to(device)  # (G, 400, 5)
     target_indices = [int(dataset.promoter2expr_idx[p]) for p in pro_indices]
+    id2symbol = dict(zip(dataset.scrna.var["gene_id"], dataset.scrna.var["gene_symbol"]))
+    gene_ids = dataset.promoters["gene_id"].iloc[pro_indices].values
+    gene_names = [id2symbol.get(gid, gid) for gid in gene_ids]
     X_csr = dataset.X.tocsr()
 
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -727,7 +738,18 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, n_cells: int = 6,
                 preds = model(promoter_batch, expr_batch).squeeze(1).cpu().numpy()
                 yt, yp = ys.cpu().numpy(), preds
 
-            ax.scatter(yt, yp, s=15, alpha=0.5, color=colors[i])
+            ax.scatter(yt, yp, s=15, alpha=0.5, color=colors[i], label=cell_labels[i])
+
+            # Annotate top non-zero genes with their gene IDs
+            if annotate_top > 0:
+                nz_mask = yt > 0
+                if nz_mask.any():
+                    nz_idx = np.where(nz_mask)[0]
+                    top_nz = nz_idx[np.argsort(yt[nz_mask])[::-1][:annotate_top]]
+                    for g in top_nz:
+                        ax.annotate(gene_names[g], (yt[g], yp[g]),
+                                    fontsize=4, alpha=0.6, rotation=30,
+                                    ha='left', va='bottom')
 
     if len(ax.collections) > 0:
         all_t = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 0])
@@ -744,6 +766,8 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, n_cells: int = 6,
 
     ax.set_xlabel("True")
     ax.set_ylabel("Predicted")
+    ax.legend(fontsize=6, loc="upper left", markerscale=1.5,
+              title="Cell (total UMIs)", title_fontsize=7)
     plt.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
