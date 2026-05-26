@@ -172,8 +172,8 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pretrain scVI on scRNA-seq data")
     parser.add_argument("--data", type=str, default="umi_highquality",
-                        choices=["umi_processed", "umi_highquality", "processed", "log_processed"],
-                        help="Data version (umi_* = raw UMI counts)")
+                        choices=["umi_processed", "umi_highquality", "processed", "log_processed", "emtab"],
+                        help="Data version (umi_* = raw UMI counts; emtab = E-MTAB-10519)")
     parser.add_argument("--n-latent", type=int, default=128,
                         help="Latent dimension")
     parser.add_argument("--n-hidden", type=int, default=512,
@@ -205,11 +205,15 @@ def main() -> None:
     if args.load_model and not Path(args.load_model).exists():
         raise FileNotFoundError(f"Model dir not found: {args.load_model}")
 
-    data_path = PROJECT_ROOT / "data" / args.data / "integrated_data.h5ad"
+    if args.data == "emtab":
+        data_path = PROJECT_ROOT / "data" / "emtab_processed" / "integrated_data.h5ad"
+    else:
+        data_path = PROJECT_ROOT / "data" / args.data / "integrated_data.h5ad"
     if not data_path.exists():
-        raise FileNotFoundError(f"Data file not found in {PROJECT_ROOT / 'data' / args.data}")
+        raise FileNotFoundError(f"Data file not found: {data_path}")
 
-    eval_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.data}" / "evaluation"
+    out_name = "E-MTAB10519_VAE" if args.data == "emtab" else f"scvi_{args.data}"
+    eval_dir = PROJECT_ROOT / "outputs" / out_name / "evaluation"
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading data: {data_path}")
@@ -266,7 +270,7 @@ def main() -> None:
             check_val_every_n_epoch=1,
         )
 
-    out_dir = PROJECT_ROOT / "outputs" / f"scvi_{args.data}"
+    out_dir = PROJECT_ROOT / "outputs" / out_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Evaluation: loss curves + reconstruction ----

@@ -9,13 +9,17 @@ import numpy as np
 from scipy.io import mmread
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "E-MTAB-10519-normalised-files"
+#DATA_DIR = PROJECT_ROOT / "data" / "E-MTAB-10519-normalised-files"
+DATA_DIR = PROJECT_ROOT / "data" / "E-MTAB-10519-raw"
 
 
 def inspect() -> None:
-    mtx_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx"
-    rows_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx_rows"
-    cols_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx_cols"
+    # mtx_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx"
+    # rows_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx_rows"
+    # cols_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx_cols"
+    mtx_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_counts.mtx"
+    rows_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_counts.mtx_rows"
+    cols_path = DATA_DIR / "E-MTAB-10519.aggregated_filtered_counts.mtx_cols"
 
     # ── Matrix ──
     print("Reading matrix ...")
@@ -26,7 +30,7 @@ def inspect() -> None:
     values = X.data
 
     print(f"\n{'='*60}")
-    print(f"  E-MTAB-10519 — Aggregated filtered normalised counts")
+    print(f"  E-MTAB-10519 — Aggregated filtered counts")
     print(f"{'='*60}")
     print(f"  Genes:  {n_genes:,}")
     print(f"  Cells:  {n_cells:,}")

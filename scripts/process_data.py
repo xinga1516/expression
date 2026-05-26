@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from Bio import SeqIO
 from scipy import sparse
+from scipy.io import mmread
 import re
 import pyranges as pr
 import matplotlib.pyplot as plt
@@ -313,20 +314,23 @@ def filter_cells(rawdata: ad.AnnData, top_total_fraction: float = 0.10, plot_qc:
 
 def split_train_val(
     df: pd.DataFrame,
-    train_ratio: float = 0.8,
-    val_ratio: float = 0.1,
-    test_ratio: float = 0.1,
+    train_ratio: float = 0.6,
+    val_ratio: float = 0.2,
+    test_ratio: float = 0.2,
     output_dir: Optional[Path] = None,
+    by_gene: bool = False,
 ) -> tuple:
     """
-    按每条染色体上的物理位置排序后，按样本个数比例切分为连续区间。
-    这样 train/val/test 都是位置连续块，同时数量由比例控制。
+    按每条染色体上的物理位置排序后，按比例切分为 train/val/test。
 
     input:
         promoter dataframe with columns:
         ["gene_id", "chrom", "start", "end", "strand", "sequence", "length"]
-    output:
-        写出 promoter_train.csv / promoter_val.csv / promoter_test.csv
+
+    by_gene: bool
+        If True, split at gene level (one gene's all promoters go to the same
+        split, using the gene's median genomic position).  If False (default),
+        split at individual promoter row level.
     """
     required_cols = {"gene_id", "chrom", "start", "end"}
     missing = required_cols - set(df.columns)
@@ -342,47 +346,58 @@ def split_train_val(
     data["mid"] = ((data["start"] + data["end"]) // 2).astype(int)
 
     train_genes, val_genes, test_genes = set(), set(), set()
-    block_chrom = ['2R','3R']
+    block_chrom = ['2R', '3R']
 
-    for chrom, sub in data.groupby("chrom", sort=True):
-        if chrom not in block_chrom:
-            train_genes.update(sub["gene_id"].tolist())
-            print(f"{chrom}: total={len(sub)}, span ignored -> all train")
-            continue
+    if by_gene:
+        # ── gene-level split: use median position per gene ──
+        gene_mid = data.groupby("gene_id")["mid"].median()
+        for chrom, sub in data.groupby("chrom", sort=True):
+            gene_ids_chrom = sub["gene_id"].unique()
+            if chrom not in block_chrom:
+                train_genes.update(gene_ids_chrom)
+                print(f"{chrom}: {len(gene_ids_chrom)} genes -> all train")
+                continue
 
-        sub = sub.sort_values("mid").copy()
-        n = len(sub)
-        if n == 0:
-            continue
+            chrom_genes = gene_mid.loc[gene_mid.index.isin(gene_ids_chrom)].sort_values()
+            gene_list = chrom_genes.index.tolist()
+            n = len(gene_list)
+            n_train = int(np.floor(n * train_ratio))
+            n_val = int(np.floor(n * val_ratio))
+            n_test = n - n_train - n_val
+            if n_test < 0:
+                n_test = 0
+                n_val = n - n_train
 
-        # 按“样本个数比例”切分（连续索引块）
-        n_train = int(np.floor(n * train_ratio))
-        n_val = int(np.floor(n * val_ratio))
-        n_test = n - n_train - n_val
+            train_genes.update(gene_list[:n_train])
+            val_genes.update(gene_list[n_train:n_train + n_val])
+            test_genes.update(gene_list[n_train + n_val:])
+            print(f"{chrom}: {n} genes -> train={n_train} val={n_val} test={n_test}")
 
-        # 极小染色体时保证总数一致且不报错
-        if n_test < 0:
-            n_test = 0
-            n_val = n - n_train
+    else:
+        # ── row-level split (original behaviour) ──
+        for chrom, sub in data.groupby("chrom", sort=True):
+            if chrom not in block_chrom:
+                train_genes.update(sub["gene_id"].tolist())
+                print(f"{chrom}: total={len(sub)}, span ignored -> all train")
+                continue
 
-        train_idx_end = n_train
-        val_idx_end = n_train + n_val
+            sub = sub.sort_values("mid").copy()
+            n = len(sub)
+            if n == 0:
+                continue
 
-        train_part = sub.iloc[:train_idx_end]
-        val_part = sub.iloc[train_idx_end:val_idx_end]
-        test_part = sub.iloc[val_idx_end:]
+            n_train = int(np.floor(n * train_ratio))
+            n_val = int(np.floor(n * val_ratio))
+            n_test = n - n_train - n_val
 
-        train_genes.update(train_part["gene_id"].tolist())
-        val_genes.update(val_part["gene_id"].tolist())
-        test_genes.update(test_part["gene_id"].tolist())
+            if n_test < 0:
+                n_test = 0
+                n_val = n - n_train
 
-        min_pos = int(sub["mid"].min())
-        max_pos = int(sub["mid"].max())
-        print(
-            f"{chrom}: total={n}, "
-            f"train={len(train_part)}, val={len(val_part)}, test={len(test_part)}, "
-            f"range=[{min_pos}, {max_pos}]"
-        )
+            train_genes.update(sub.iloc[:n_train]["gene_id"].tolist())
+            val_genes.update(sub.iloc[n_train:n_train + n_val]["gene_id"].tolist())
+            test_genes.update(sub.iloc[n_train + n_val:]["gene_id"].tolist())
+            print(f"{chrom}: total={n}, train={n_train}, val={n_val}, test={n_test}")
 
     # 去重并确保互斥（优先级：train > val > test）
     val_genes -= train_genes
@@ -402,7 +417,7 @@ def split_train_val(
     print("Train ∩ Test:", set(train_genes) & set(test_genes))
 
     base_dir = Path(__file__).resolve().parent.parent
-    outdir = Path(output_dir) if output_dir is not None else (base_dir / "data" / "highquality")#(base_dir / "data" / "processed")
+    outdir = Path(output_dir) if output_dir is not None else (base_dir / "data" / "highquality")
     outdir.mkdir(parents=True, exist_ok=True)
 
     data[data["gene_id"].isin(train_genes)].drop(columns=["mid"]).to_csv(outdir / "promoter_train.csv", index=False)
@@ -417,21 +432,33 @@ def split_train_val(
 
     return train_genes, val_genes, test_genes
 
-def filter_genes(rawdata: ad.AnnData) -> ad.AnnData:
+def filter_genes(
+    rawdata: ad.AnnData,
+    promoter_fa_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+) -> ad.AnnData:
     '''
-    For anndata: remove genes without promoter sequence, and output file as integrated_data.h5ad
-    and split the data into train/val/test sets by gene, and output promoter csv files for each set.
+    Remove genes without promoter sequences, and split into train/val/test.
+
+    Parameters
+    ----------
+    rawdata : AnnData
+    promoter_fa_path : Path or None
+        Path to promoters.fa.  Default: data/processed/promoters.fa
+    output_dir : Path or None
+        Directory for promoter CSV files.  Default: data/processed/
     '''
     base_dir = Path(__file__).resolve().parent.parent
-    promoters = SeqIO.parse(base_dir / "data" / "processed" / "promoters.fa", 'fasta')
+    if promoter_fa_path is None:
+        promoter_fa_path = base_dir / "data" / "processed" / "promoters.fa"
+
+    promoters = SeqIO.parse(str(promoter_fa_path), 'fasta')
     rows = []
     for record in promoters:
         m = re.match(r"(.+)::(.+):(\d+)-(\d+)\(([+-])\)", record.id)
         if not m:
             continue
-
         gene, chrom, start, end, strand = m.groups()
-
         rows.append({
             "gene_id": gene,
             "chrom": chrom,
@@ -443,14 +470,14 @@ def filter_genes(rawdata: ad.AnnData) -> ad.AnnData:
         })
     promoters = pd.DataFrame(rows)
     gene_promoters = set(promoters['gene_id'])
+    print(f"  Parsed promoters.fa: {len(promoters)} promoters, {len(gene_promoters)} genes")
 
-    # remove genes that have the same flybase gene_id
+    # Remove duplicate gene_ids in h5ad
     print(rawdata.shape)
     df = rawdata.var
-    filtered_data = rawdata[:,df.duplicated(subset="gene_id", keep=False) == False]
+    filtered_data = rawdata[:, df.duplicated(subset="gene_id", keep=False) == False]
     gene_singlecell = set((filtered_data.var)['gene_id'])
 
-    # check if genes are comprehensive in promoters.fa
     insect = gene_singlecell - gene_promoters
     insect1 = gene_promoters - gene_singlecell
     eligible_genes = gene_singlecell & gene_promoters
@@ -459,30 +486,19 @@ def filter_genes(rawdata: ad.AnnData) -> ad.AnnData:
 
     before = filtered_data.shape
     flag = [(i in eligible_genes) for i in filtered_data.var.gene_id]
-    filtered_data = filtered_data[:,flag]
+    filtered_data = filtered_data[:, flag]
     print("genes from {0} to {1}".format(before[1], filtered_data.shape[1]))
 
-    # merged_df = pd.merge(filtered_data.var,promoters,how='left',on='gene_id')
-    # print(merged_df['sequence'])
-    # filtered_data.var["seq"] = merged_df['sequence']
-    # filtered_data.var["seq"] = (
-    #     filtered_data.var["gene_id"]
-    #     .map(promoters.set_index("gene_id")["sequence"])
-    # )
-    # filtered_data.write_h5ad("processed/integrated_data.h5ad")
-
-    filtered_promoters = promoters[
-        promoters["gene_id"].isin(eligible_genes)
-    ]
+    filtered_promoters = promoters[promoters["gene_id"].isin(eligible_genes)]
     print(f"promoters number: {len(filtered_promoters)}")
-    df = filtered_promoters
-    df["start"] = df["start"].astype(int)
-    split_train_val(df)
+    promoter_df = filtered_promoters
+    promoter_df["start"] = promoter_df["start"].astype(int)
+    split_train_val(promoter_df, by_gene=True, output_dir=output_dir)
 
     return filtered_data
 
-def compute_tpm(rawdata: ad.AnnData) -> ad.AnnData:
-    sc.pp.normalize_total(rawdata, target_sum=1e6) # 将每个细胞的总表达量归一化到 1,000,000（TPM）
+def compute_cpm(rawdata: ad.AnnData) -> ad.AnnData:
+    sc.pp.normalize_total(rawdata, target_sum=1e6) # 将每个细胞的总表达量归一化到 1,000,000（CPM）
     sc.pp.log1p(rawdata) # 对归一化后的数据进行 log1p 转换（log(x + 1)），以减小数据范围并处理零值。
     # # using gene length to compute RPKM/FPKM
     # gene_length_kb = rawdata.var["gene_length"] / 1e3
@@ -496,8 +512,233 @@ def draw_high_quality_samples(rawdata: ad.AnnData, top_total_fraction: float = 0
     rawdata = rawdata[:, rawdata.var['highly_variable']]
     return rawdata
 
-# %%
-def main() -> None:
+def _get_mito_gene_ids(gtf_path: Path) -> set[str]:
+    """从 GTF 中提取 mitochondrion_genome 上的 gene_id 集合"""
+    gtf = pr.read_gtf(str(gtf_path))
+    df = gtf.df
+    if "Feature" in df.columns:
+        df = df[df["Feature"] == "gene"]
+    return set(df[df["Chromosome"] == "mitochondrion_genome"]["gene_id"])
+
+
+def build_from_mtx(
+    mtx_dir: Path,
+    out_dir: Path,
+    top_total_fraction: float = 0.10,
+    seed: int = 42,
+) -> ad.AnnData:
+    """从 E-MTAB-10519 raw MTX 构建 AnnData h5ad，含 QC 绘图和细胞过滤。
+
+    Parameters
+    ----------
+    mtx_dir : Path
+        MTX 文件所在目录 (e.g. data/E-MTAB-10519-raw/)
+    out_dir : Path
+        输出目录 (e.g. data/emtab_processed/)
+    promoter_dir : Path or None
+        promoter CSV 所在目录，None 则跳过复制
+    top_total_fraction : float
+        top 细胞比例 (default 10%%)
+    seed : int
+        随机种子
+    """
+    import shutil
+
+    mtx_path = mtx_dir / "E-MTAB-10519.aggregated_filtered_counts.mtx"
+    rows_path = mtx_dir / "E-MTAB-10519.aggregated_filtered_counts.mtx_rows"
+    cols_path = mtx_dir / "E-MTAB-10519.aggregated_filtered_counts.mtx_cols"
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir = out_dir / "qc_plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. Read MTX → cell × gene CSR ──
+    print("Reading MTX (may take a few minutes) ...")
+    X = mmread(str(mtx_path))        # COO: gene × cell
+    n_genes, n_cells = X.shape
+    print(f"  Loaded COO: {n_genes} genes × {n_cells} cells  |  {X.nnz:,} non-zeros")
+    X = X.T.tocsr()                  # CSR: cell × gene
+    import gc; gc.collect()
+    print(f"  Transposed to CSR: {X.shape}")
+
+    # ── 2. Gene IDs ──
+    with open(rows_path) as f:
+        gene_ids = [line.strip().split('\t')[0] for line in f]
+    print(f"  Gene IDs: {len(gene_ids)} (sample: {gene_ids[:3]})")
+
+    # ── 3. Cell IDs ──
+    with open(cols_path) as f:
+        cell_ids = [line.strip() for line in f]
+    sample_ids = [c.split('-')[0] for c in cell_ids]
+
+    # ── 4. Gene symbol mapping ──
+    base_dir = Path(__file__).resolve().parent.parent
+    gene_symbols: list[str] = []
+    fca_csv = base_dir / "data" / "FCA_expression_logCPM.csv"
+    if fca_csv.exists():
+        fca = pd.read_csv(fca_csv, usecols=["flybase_id", "gene_symbol"])
+        id2sym = dict(zip(fca["flybase_id"], fca["gene_symbol"]))
+        gene_symbols = [id2sym.get(g, "") for g in gene_ids]
+        print(f"  Gene symbols mapped: {sum(1 for s in gene_symbols if s)} / {len(gene_ids)}")
+    else:
+        gene_symbols = [""] * len(gene_ids)
+        print("  FCA CSV not found — gene_symbol left blank")
+
+    # ── 5. Mitochondrial gene annotation ──
+    gtf_path = base_dir / "data" / "raw" / "dmel-all-r6.54.gtf"
+    mito_genes = _get_mito_gene_ids(gtf_path) if gtf_path.exists() else set()
+    mt_flags = [g in mito_genes for g in gene_ids]
+    print(f"  Mitochondrial genes: {sum(mt_flags)} / {len(gene_ids)}")
+
+    # ── 6. Build AnnData ──
+    var_df = pd.DataFrame({
+        "gene_id": gene_ids,
+        "gene_symbol": gene_symbols,
+        "mt": mt_flags,
+    }, index=gene_ids)
+    obs_df = pd.DataFrame({
+        "sample_id": sample_ids,
+    }, index=cell_ids)
+
+    adata = ad.AnnData(X=X, obs=obs_df, var=var_df)
+    adata.layers["counts"] = adata.X.copy()
+
+    # ── 7. QC metrics ──
+    print("Computing QC metrics ...")
+    sc.pp.calculate_qc_metrics(
+        adata,
+        qc_vars=["mt"],
+        layer="counts",
+        percent_top=None,
+        log1p=False,
+        inplace=True,
+    )
+
+    # ── 8. QC plots ──
+    print("Generating QC plots ...")
+    n_keep = max(1, int(np.ceil(adata.n_obs * top_total_fraction)))
+    selected = adata.obs["total_counts"].nlargest(n_keep).index
+    cutoff = adata.obs.loc[selected, "total_counts"].min()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # (a) Total counts histogram
+    axes[0].hist(adata.obs["total_counts"], bins=80, color="steelblue", alpha=0.85)
+    axes[0].axvline(cutoff, color="red", linestyle="--", linewidth=1.5,
+                    label=f"top {int(top_total_fraction * 100)}% cutoff")
+    axes[0].set_xlabel("Total UMI counts per cell")
+    axes[0].set_ylabel("Number of cells")
+    axes[0].set_title("Total counts distribution")
+    axes[0].legend()
+
+    # (b) Total counts vs detected genes (density-colored)
+    x = adata.obs["total_counts"].values
+    y = adata.obs["n_genes_by_counts"].values
+    # Downsample for density computation if too many points
+    n_plot = min(len(x), 200000)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(x), size=n_plot, replace=False)
+    x_sub, y_sub = x[idx], y[idx]
+    from matplotlib.colors import Normalize
+    from scipy.stats import gaussian_kde
+    xy = np.vstack([x_sub, y_sub])
+    z = gaussian_kde(xy)(xy)
+    axes[1].scatter(x_sub, y_sub, c=z, s=2, alpha=0.5, cmap="viridis",
+                    norm=Normalize(vmin=0, vmax=np.percentile(z, 95)))
+    axes[1].set_xlabel("Total UMI counts")
+    axes[1].set_ylabel("Detected genes")
+    axes[1].set_title("Total counts vs detected genes")
+
+    # (c) Total counts vs mitochondrial fraction
+    x2 = adata.obs["total_counts"].values
+    y2 = adata.obs["pct_counts_mt"].values
+    axes[2].scatter(x2[idx], y2[idx], s=2, alpha=0.3, color="darkred")
+    axes[2].set_xlabel("Total UMI counts")
+    axes[2].set_ylabel("Mitochondrial fraction (%)")
+    axes[2].set_title("Total counts vs mito fraction")
+
+    plt.tight_layout()
+    qc_path = plot_dir / "qc_summary.png"
+    fig.savefig(qc_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  QC plots saved to: {qc_path}")
+
+    # ── 9. Gene check: random 10 genes with gene_id + gene_symbol ──
+    gene_check_path = out_dir / "gene_check.csv"
+    rng = np.random.default_rng(seed)
+    check_idx = rng.choice(n_genes, size=min(10, n_genes), replace=False)
+    check_rows = []
+    for gi in check_idx:
+        gene_expr = adata.X[:, gi].toarray().ravel() if hasattr(adata.X, "toarray") else adata.X[:, gi]
+        top_cell_idx = int(np.argmax(gene_expr))
+        check_rows.append({
+            "gene_id": gene_ids[gi],
+            "gene_symbol": gene_symbols[gi],
+            "mt": mt_flags[gi],
+            "mean_expr": float(np.mean(gene_expr)),
+            "max_expr": float(np.max(gene_expr)),
+            "top_cell": cell_ids[top_cell_idx],
+        })
+    pd.DataFrame(check_rows).to_csv(gene_check_path, index=False)
+    print(f"  Gene check saved to: {gene_check_path}")
+
+    # ── 10. Filter top cells ──
+    adata_hq = adata[selected].copy()
+    print(f"  Full: {adata.shape}  →  HQ (top {int(top_total_fraction*100)}%): {adata_hq.shape}")
+
+    # ── 11. Filter genes by promoter presence + split into train/val/test ──
+    # Reuses filter_genes (parses promoters.fa, intersects gene_ids, splits by
+    # genomic position at gene level with by_gene=True).
+    adata = filter_genes(adata, output_dir=out_dir)
+    # Re-filter top cells on the gene-filtered h5ad
+    n_keep = max(1, int(np.ceil(adata.n_obs * top_total_fraction)))
+    adata_hq = adata[adata.obs["total_counts"].nlargest(n_keep).index].copy()
+    print(f"  HQ on filtered genes: {adata_hq.shape}")
+
+    # ── 12. Save ──
+    full_path = out_dir / "integrated_data.h5ad"
+    hq_path = out_dir / "integrated_data_hq.h5ad"
+    adata.write_h5ad(full_path)
+    adata_hq.write_h5ad(hq_path)
+    print(f"\nSaved:")
+    print(f"  Full: {full_path}  ({adata.shape})")
+    print(f"  HQ:   {hq_path}  ({adata_hq.shape})")
+
+    return adata
+
+
+
+def build_h5ad_from_mtx(mtx_dir: Path) -> ad.AnnData:
+    """从 E-MTAB-10519 raw MTX 构建 AnnData h5ad，含 QC 绘图和细胞过滤。
+
+    Parameters
+    ----------
+    mtx_dir : Path
+        MTX 文件所在目录 (e.g. data/E-MTAB-10519-raw/)
+    out_path : Path
+        输出 h5ad 文件路径 (e.g. data/emtab_processed/integrated_data.h5ad)
+    """
+    base_dir = Path(__file__).resolve().parent.parent
+    if mtx_dir.exists():
+        print("\n" + "=" * 60)
+        print("  Processing E-MTAB-10519 raw MTX ...")
+        print("=" * 60)
+        build_from_mtx(
+            mtx_dir=mtx_dir,
+            out_dir=base_dir / "data" / "emtab_processed",
+        )
+    return
+
+def build_h5ad_from_loom(loom_dir: Path) -> ad.AnnData:
+    """从 Loom 文件构建 AnnData h5ad，含 QC 绘图,细胞过滤,基因过滤和高变基因选择。
+
+    Parameters
+    ----------
+    loom_dir : Path
+        Loom 文件所在目录 (e.g. data/raw/)
+    out_path : Path
+        输出 h5ad 文件路径 (e.g. data/emtab_processed/integrated_data.h5ad)
+    """
     base_dir = Path(__file__).resolve().parent.parent
     # rawdata = build_integrated_data()
     # # %%
@@ -508,13 +749,23 @@ def main() -> None:
     # filtered_data = filter_genes(filtered_data)
     # # %%
     filtered_data = sc.read_h5ad(base_dir / "data" / "processed" / "integrated_data.h5ad")
-    filtered_data = compute_tpm(filtered_data)
+    filtered_data = compute_cpm(filtered_data)
     high_quality_data = draw_high_quality_samples(filtered_data)
     print("high quality data shape: ", high_quality_data.shape)
     high_quality_data = filter_genes(high_quality_data)
     # %%
     #filtered_data.write_h5ad(base_dir / "data" / "processed" / "log_integrated_data.h5ad")
     high_quality_data.write_h5ad(base_dir / "data" / "processed" / "log_integrated_data_hvg.h5ad")
+    return
+
+# %%
+def main() -> None:
+    base_dir = Path(__file__).resolve().parent.parent
+    build_h5ad_from_loom(loom_dir = base_dir / "data" / "raw")
+
+    # E-MTAB-10519 raw MTX processing
+    mtx_dir = base_dir / "data" / "E-MTAB-10519-raw"
+    build_h5ad_from_mtx(mtx_dir=mtx_dir)
 
 if __name__ == "__main__":
     main()

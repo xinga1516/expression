@@ -265,16 +265,19 @@ def plot_loom_gene_variance_vs_median(
     loom_path: pathlib.Path,
     save_path: pathlib.Path | None = None,
     n_label: int = 100,
+    normalize: bool = True,
     chunk_size: int = 10000,
 ) -> None:
     """Scatter plot of per-gene variance vs mean from raw loom UMI counts.
 
-    Reads the dense (genes × cells) matrix in chunks in a single pass
-    (Welford algorithm) to stay memory-friendly.  Each point is one gene;
-    x-axis is variance across cells, y-axis is mean expression (both on
-    log-log axes).
-
-    Annotates variance extremes and Drosophila housekeeping genes.
+    Parameters
+    ----------
+    normalize : bool
+        If True (default), apply CPM normalization + log1p before computing
+        variance / mean, which stabilizes the mean-variance relationship and
+        reveals biological variability.  If False, use raw UMI counts.
+    chunk_size : int
+        Number of cells to read per chunk (memory/speed trade-off).
     """
     import h5py
 
@@ -284,21 +287,48 @@ def plot_loom_gene_variance_vs_median(
     n_genes, n_cells = X.shape
     print(f"Loom matrix: {n_genes} genes × {n_cells} cells")
 
-    # One-pass mean + variance via Welford algorithm:
-    # accumulates sum_x and sum_x2 per gene across chunks of cells.
-    sum_x = np.zeros(n_genes, dtype=np.float64)
-    sum_x2 = np.zeros(n_genes, dtype=np.float64)
+    if normalize:
+        # ── Pass 1: per-cell library sizes ──
+        print("Pass 1: computing per-cell library sizes ...")
+        lib_sizes = np.zeros(n_cells, dtype=np.float64)
+        for start in range(0, n_cells, chunk_size):
+            end = min(start + chunk_size, n_cells)
+            block = X[:, start:end].astype(np.float64)
+            lib_sizes[start:end] = block.sum(axis=0)
+            if (start // chunk_size) % 20 == 0:
+                print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
+        # Replace zeros with 1 to avoid division by zero
+        lib_sizes = np.maximum(lib_sizes, 1.0)
 
-    print(f"Scanning cells in chunks of {chunk_size} ...")
-    n_chunks = 0
-    for start in range(0, n_cells, chunk_size):
-        end = min(start + chunk_size, n_cells)
-        block = X[:, start:end].astype(np.float64)  # (genes, chunk)
-        sum_x += block.sum(axis=1)
-        sum_x2 += (block * block).sum(axis=1)
-        n_chunks += 1
-        if n_chunks % 20 == 0:
-            print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
+        # ── Pass 2: CPM + log1p then accumulate per-gene stats ──
+        print("Pass 2: CPM + log1p, accumulating per-gene sum / sum² ...")
+        sum_x = np.zeros(n_genes, dtype=np.float64)
+        sum_x2 = np.zeros(n_genes, dtype=np.float64)
+        for start in range(0, n_cells, chunk_size):
+            end = min(start + chunk_size, n_cells)
+            block = X[:, start:end].astype(np.float64)          # (genes, chunk)
+            block = block / lib_sizes[np.newaxis, start:end] * 1e6  # CPM
+            block = np.log1p(block)                              # log1p
+            sum_x += block.sum(axis=1)
+            sum_x2 += (block * block).sum(axis=1)
+            if (start // chunk_size) % 20 == 0:
+                print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
+
+        norm_label = "log1p(CPM)"
+    else:
+        # ── Single pass: accumulate raw UMI stats ──
+        print(f"Scanning cells in chunks of {chunk_size} (raw UMI counts) ...")
+        sum_x = np.zeros(n_genes, dtype=np.float64)
+        sum_x2 = np.zeros(n_genes, dtype=np.float64)
+        for start in range(0, n_cells, chunk_size):
+            end = min(start + chunk_size, n_cells)
+            block = X[:, start:end].astype(np.float64)
+            sum_x += block.sum(axis=1)
+            sum_x2 += (block * block).sum(axis=1)
+            if (start // chunk_size) % 20 == 0:
+                print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
+
+        norm_label = "raw UMI counts"
 
     f.close()
 
@@ -311,8 +341,11 @@ def plot_loom_gene_variance_vs_median(
     # --- plot ---
     n_label = min(n_label, n_genes // 2)
     order = np.argsort(variances)
-    low_idx = order[:n_label]
+    low_idx = order[:1]
     high_idx = order[-n_label:]
+    order_median = np.argsort(means)
+    low_idx_median = order_median[:1]
+    high_idx_median = order_median[-n_label:]
 
     fig, ax = plt.subplots(figsize=(14, 9))
     ax.scatter(variances, means, s=1, alpha=0.25, color="steelblue", rasterized=True)
@@ -327,7 +360,7 @@ def plot_loom_gene_variance_vs_median(
         "14-3-3epsilon",
     ]
     hk_mask = np.isin(gene_names_arr, hk_genes) | np.array(
-        ["8SrRNA" in g for g in gene_names_arr], dtype=bool
+        ["18SrRNA" in g for g in gene_names_arr], dtype=bool
     )
     if hk_mask.any():
         hk_idx = np.where(hk_mask)[0]
@@ -340,17 +373,17 @@ def plot_loom_gene_variance_vs_median(
                         ha="left", va="bottom")
 
     # Annotate variance extremes
-    for idx in np.concatenate([low_idx, high_idx]):
+    for idx in np.concatenate([low_idx, high_idx, low_idx_median, high_idx_median]):
         ax.annotate(str(gene_names_arr[idx]), (variances[idx], means[idx]),
                     fontsize=4.5, alpha=0.7, rotation=25,
                     ha="left", va="bottom",
                     arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3, linewidth=0.3))
 
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Variance across cells (raw UMI counts)")
-    ax.set_ylabel("Mean expression across cells (raw UMI counts)")
-    ax.set_title(f"Loom raw UMI — gene variability ({n_genes} genes × {n_cells} cells)\n"
+    # ax.set_xscale("log")
+    # ax.set_yscale("log")
+    ax.set_xlabel(f"Variance across cells ({norm_label})")
+    ax.set_ylabel(f"Mean expression across cells ({norm_label})")
+    ax.set_title(f"Loom gene variability ({norm_label}) — {n_genes} genes × {n_cells} cells\n"
                  f"Red: Drosophila housekeeping genes  |  "
                  f"Annotated: {n_label} lowest + {n_label} highest variance genes")
     ax.legend(fontsize=9, loc="upper left")
@@ -386,9 +419,9 @@ def plot_emtab_gene_variance_vs_median(
     print(f"  {n_genes} genes x {n_cells} cells  |  {X.nnz:,} non-zeros  |  "
           f"{X.nnz/(n_genes*n_cells)*100:.1f}% dense")
 
-    # ── log2(CPM + 1) transform ──
-    print("log2(CPM + 1) transform ...")
-    X.data = np.log2(X.data + 1.0)
+    # # ── log2(CPM + 1) transform ──
+    # print("log2(CPM + 1) transform ...")
+    # X.data = np.log2(X.data + 1.0)
 
     # ── Per-gene mean & variance (sparse CSR, one pass) ──
     print("Computing per-gene stats ...")
@@ -480,32 +513,37 @@ def plot_emtab_gene_variance_vs_median(
 def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # # Gene variance vs median plot from raw loom UMI counts
+    # # Gene variance vs mean plot from raw loom (normalized: log1p CPM)
     # loom_path = project_root / "data" / "raw" / "s_fca_biohub_all_wo_blood_10x.loom"
     # if loom_path.exists():
     #     plot_loom_gene_variance_vs_median(
     #         loom_path,
-    #         save_path=out_dir / "loom_gene_variance_vs_median.png",
+    #         save_path=out_dir / "loom_gene_variance_vs_mean_log1p_cpm.png",
+    #         normalize=True,
+    #     )
+    #     plot_loom_gene_variance_vs_median(
+    #         loom_path,
+    #         save_path=out_dir / "loom_gene_variance_vs_mean_raw_umi.png",
+    #         normalize=False,
     #     )
 
     # h5ad_path = data_dir / "integrated_data.h5ad"
     # summary = summarize_integrated_data(h5ad_path)
-
     # print("=== 训练前数据分布摘要（integrated_data.h5ad）===")
     # print(json.dumps(summary, indent=2, ensure_ascii=False))
-
     # out_path = out_dir / "data_sanity_summary.json"
     # with open(out_path, "w", encoding="utf-8") as f:
     #     json.dump(summary, f, indent=2, ensure_ascii=False)
     # print(f"\n摘要已保存到: {out_path}")
 
-    # Gene variance vs median plot (scRNA-seq h5ad)
-    data_h5ad = data_dir / "integrated_data.h5ad"
-    if data_h5ad.exists():
-        plot_gene_variance_vs_median(
-            data_h5ad,
-            save_path=out_dir / "gene_variance_vs_mean.png",
-        )
+    # # Gene variance vs median plot (scRNA-seq h5ad)
+    # data_h5ad = data_dir / "integrated_data.h5ad"
+    # if data_h5ad.exists():
+    #     plot_gene_variance_vs_median(
+    #         data_h5ad,
+    #         save_path=out_dir / "gene_variance_vs_mean.png",
+    #     )
+
 
     # # FCA gene variance vs median plot (logCPM CSV from Fly Cell Atlas)
     # fca_csv = project_root / "data" / "FCA_expression_logCPM.csv"
