@@ -22,8 +22,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Plot training results from an existing experiment.")
-    parser.add_argument("--exp_name", type=str, required=True, help="Experiment name (outputs/<exp_name>)")
-    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed" ],
+    parser.add_argument("--exp_name", type=str, required=True, help="Experiment name (<exp_name>)")
+    parser.add_argument("--data", type=str, default="highquality", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed", "umi_E-MTAB-10519-raw", "umi_E-MTAB-10519-hqcells"],
                         help="Which dataset version was used")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint. Default: outputs/<exp_name>/checkpoints/best_model.safetensors")
@@ -78,8 +78,12 @@ def main():
         print(f"Checkpoint not found: {checkpoint}, skipping scatter plot.")
         return
 
-    # Build val dataset and loader
-    data_dir = base_dir / "data" / args.data
+    # Derive data directory from config (source of truth), fall back to CLI arg
+    scrna_file = cfg.get("scrna_file", "")
+    if scrna_file:
+        data_dir = Path(scrna_file).parent
+    else:
+        data_dir = base_dir / "data" / args.data
     val_dataset = MyDataset(
         promoter_file=data_dir / "promoter_val.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
@@ -121,13 +125,14 @@ def main():
     model.eval()
     print(f"Loaded model from: {checkpoint}")
 
-    utils.count_zero_nonzero(val_loader)
-    # utils.plot_pred_scatter(model, val_loader, epoch=args.epochs,
+    #utils.count_zero_nonzero(val_loader)
+    is_umi = data_dir.name.startswith("umi_") and loss_type != "zinb"
+    # utils.plot_pred_scatter(model, val_loader, is_umi=is_umi, epoch=args.epochs,
     #                         save_path=plot_dir / "pred_vs_true_scatter.png")
-    # utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=3,
-    #                                 save_path=plot_dir / "per_promoter_scatter.png")
-    utils.plot_per_cell_scatter(model, val_dataset, n_cells=3,
-                                 save_path=plot_dir / "per_cell_scatter3.png")
+    utils.plot_per_promoter_scatter(model, val_dataset, is_umi=is_umi, n_promoters=3,
+                                    save_path=plot_dir / "per_promoter_scatter.png")
+    utils.plot_per_cell_scatter(model, val_dataset, is_umi=is_umi, n_cells=3,
+                                 save_path=plot_dir / "per_cell_scatter.png")
     print(f"All plots saved to: {plot_dir}")
 
 

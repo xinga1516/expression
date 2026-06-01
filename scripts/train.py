@@ -132,11 +132,30 @@ def train_model(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, epochs),
-        eta_min=learning_rate * 0.01,
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=1e-2)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=max(1, epochs),
+    #     eta_min=learning_rate * 0.01,
+    # )
+    # 1. 定义前 5 个 Epoch 的 Warmup 调度器 (从 0.001 * 0.1 线性增长到 0.001)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, 
+        start_factor=0.1, 
+        end_factor=1.0, 
+        total_iters=5 # warm up 5 epochs
+    )
+    # 2. 定义后面余弦退火的调度器 (退火步数 = 总步数 - 预热步数)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=(epochs - 5), 
+        eta_min=1e-6
+    )
+    # 3. 使用 SequentialLR 将两者串联，milestones 传入切换的节点步数
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[5]
     )
     earlystopping = EarlyStopping(patience=patience, min_delta=min_delta)
 
@@ -232,7 +251,7 @@ def train_model(
                         val_loss_den += ys.numel()
 
                         # Log-space metrics for ZINB
-                        y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                        y_pred_log = torch.log(mu_ratio * 1e6 + 1)
                         y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
                         all_val_true.append(y_log.cpu().numpy())
                         all_val_pred.append(y_pred_log.cpu().numpy())
@@ -409,6 +428,8 @@ def train_model(
         train_zero_count = 0
         epoch_step_losses = []
 
+        scheduler.step()
+
         for batch in train_loader:
             promoters, exprs, ys = batch
             promoters = promoters.to(device, non_blocking=True)
@@ -435,12 +456,11 @@ def train_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            scheduler.step()
 
             # calculate weighted MSE components for each batch
             with torch.no_grad():
                 if loss_type == "zinb":
-                    y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                    y_pred_log = torch.log(mu_ratio * 1e6 + 1)
                     y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
                     sq = (y_pred_log - y_log) ** 2
                 else:
@@ -490,7 +510,7 @@ def main():
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
     parser.add_argument("--model", type=str, default="LSTMmodel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
-    parser.add_argument("--data", type=str, default="umi_processed", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed"], help="Which dataset version to use (affects data paths in config)")
+    parser.add_argument("--data", type=str, default="umi_processed", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells"], help="Which dataset version to use (affects data paths in config)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
     parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
@@ -545,7 +565,7 @@ def main():
     )
 
     pin_memory = torch.cuda.is_available()
-    if args.data in ("processed", "log_processed", "umi_processed"):
+    if args.data in ("processed", "log_processed", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells"):
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,
@@ -723,9 +743,9 @@ def main():
                 print(f"Loaded best model for scatter plot: {best_model_path}")
 
             utils.count_zero_nonzero(val_loader)
-            utils.plot_pred_scatter(model, val_loader, epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
-            utils.plot_per_promoter_scatter(model, val_dataset, n_promoters=3, save_path=plots_dir / "per_promoter_scatter.png")
-            utils.plot_per_cell_scatter(model, val_dataset, n_cells=3, save_path=plots_dir / "per_cell_scatter.png")
+            utils.plot_pred_scatter(model, val_loader, is_umi=use_log1p, epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
+            utils.plot_per_promoter_scatter(model, val_dataset, is_umi=use_log1p, n_promoters=3, save_path=plots_dir / "per_promoter_scatter.png")
+            utils.plot_per_cell_scatter(model, val_dataset, is_umi=use_log1p, n_cells=3, save_path=plots_dir / "per_cell_scatter.png")
         else:
             print(f"Log file not found for plotting: {log_file}")
 # %%       

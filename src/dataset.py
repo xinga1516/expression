@@ -56,6 +56,8 @@ class MyDataset(Dataset):
         cell_ratio: float = 1.0,
         log1p_cpm_target: bool = False,
     ) -> None:
+        self.promoter_file = Path(promoter_file)
+        self.scrna_file = Path(scrna_file)
         self.promoters = pd.read_csv(promoter_file)
         self.scrna = sc.read(scrna_file, sparse=True)
         # CSR: fast row access; CSC: fast column access.

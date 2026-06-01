@@ -554,7 +554,8 @@ def build_from_mtx(
 
     # ── 1. Read MTX → cell × gene CSR ──
     print("Reading MTX (may take a few minutes) ...")
-    X = mmread(str(mtx_path))        # COO: gene × cell
+    X = mmread(str(mtx_path))                # COO: gene × cell (float from MatrixMarket)
+    X.data = np.round(X.data).astype(np.int64)  # enforce integer UMI counts
     n_genes, n_cells = X.shape
     print(f"  Loaded COO: {n_genes} genes × {n_cells} cells  |  {X.nnz:,} non-zeros")
     X = X.T.tocsr()                  # CSR: cell × gene
@@ -574,7 +575,7 @@ def build_from_mtx(
     # ── 4. Gene symbol mapping ──
     base_dir = Path(__file__).resolve().parent.parent
     gene_symbols: list[str] = []
-    fca_csv = base_dir / "data" / "FCA_expression_logCPM.csv"
+    fca_csv = base_dir / "data" / "FCA" / "FCA_expression_logCPM.csv"
     if fca_csv.exists():
         fca = pd.read_csv(fca_csv, usecols=["flybase_id", "gene_symbol"])
         id2sym = dict(zip(fca["flybase_id"], fca["gene_symbol"]))
@@ -598,106 +599,67 @@ def build_from_mtx(
     }, index=gene_ids)
     obs_df = pd.DataFrame({
         "sample_id": sample_ids,
+        "total_counts": np.asarray(X.sum(axis=1)).ravel().astype(np.int64),
     }, index=cell_ids)
 
     adata = ad.AnnData(X=X, obs=obs_df, var=var_df)
     adata.layers["counts"] = adata.X.copy()
 
-    # ── 7. QC metrics ──
-    print("Computing QC metrics ...")
-    sc.pp.calculate_qc_metrics(
-        adata,
-        qc_vars=["mt"],
-        layer="counts",
-        percent_top=None,
-        log1p=False,
-        inplace=True,
-    )
+    # ── 7. QC plots on full data ──
+    print("Generating QC plots on full data ...")
+    qc_fig_path = plot_dir / "qc_summary.png"
+    adata = filter_cells(adata, top_total_fraction=1.0, plot_qc=True)
+    # filter_cells with top_total_fraction=1.0 keeps all cells, only adds QC metrics + plots
+    if plt.get_fignums():
+        plt.gcf().savefig(str(qc_fig_path), dpi=150, bbox_inches="tight")
+        print(f"  QC plots saved to: {qc_fig_path}")
+    plt.close("all")
 
-    # ── 8. QC plots ──
-    print("Generating QC plots ...")
+    # ── 8. Promoter match + gene-level split ──
+    # Let filter_genes write CSVs, then apply the gene mask to our adata directly
+    # (filter_genes's return may drop obs/layers due to AnnData copy semantics)
+    sc.pp.filter_genes(adata, min_counts=10)
+    _adata_filtered = filter_genes(adata, output_dir=out_dir)
+    keep_genes = set(_adata_filtered.var["gene_id"])
+    keep_mask = [g in keep_genes for g in adata.var["gene_id"]]
+    adata = adata[:, keep_mask].copy()
+    del _adata_filtered
+    adata.layers["counts"] = adata.X.copy()  # ensure counts layer matches filtered X
+    print(f"  After promoter match: {adata.shape}")
+
+    # ── 9. Top cells count filter ──
     n_keep = max(1, int(np.ceil(adata.n_obs * top_total_fraction)))
-    selected = adata.obs["total_counts"].nlargest(n_keep).index
-    cutoff = adata.obs.loc[selected, "total_counts"].min()
+    cell_totals = np.asarray(adata.X.sum(axis=1)).ravel()
+    top_cells = np.argsort(cell_totals)[::-1][:n_keep]
+    adata_hq = adata[top_cells].copy()
+    print(f"  HQ: {adata_hq.shape}  (top {int(top_total_fraction*100)}% cells + min_counts=3)")
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # (a) Total counts histogram
-    axes[0].hist(adata.obs["total_counts"], bins=80, color="steelblue", alpha=0.85)
-    axes[0].axvline(cutoff, color="red", linestyle="--", linewidth=1.5,
-                    label=f"top {int(top_total_fraction * 100)}% cutoff")
-    axes[0].set_xlabel("Total UMI counts per cell")
-    axes[0].set_ylabel("Number of cells")
-    axes[0].set_title("Total counts distribution")
-    axes[0].legend()
-
-    # (b) Total counts vs detected genes (density-colored)
-    x = adata.obs["total_counts"].values
-    y = adata.obs["n_genes_by_counts"].values
-    # Downsample for density computation if too many points
-    n_plot = min(len(x), 200000)
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(x), size=n_plot, replace=False)
-    x_sub, y_sub = x[idx], y[idx]
-    from matplotlib.colors import Normalize
-    from scipy.stats import gaussian_kde
-    xy = np.vstack([x_sub, y_sub])
-    z = gaussian_kde(xy)(xy)
-    axes[1].scatter(x_sub, y_sub, c=z, s=2, alpha=0.5, cmap="viridis",
-                    norm=Normalize(vmin=0, vmax=np.percentile(z, 95)))
-    axes[1].set_xlabel("Total UMI counts")
-    axes[1].set_ylabel("Detected genes")
-    axes[1].set_title("Total counts vs detected genes")
-
-    # (c) Total counts vs mitochondrial fraction
-    x2 = adata.obs["total_counts"].values
-    y2 = adata.obs["pct_counts_mt"].values
-    axes[2].scatter(x2[idx], y2[idx], s=2, alpha=0.3, color="darkred")
-    axes[2].set_xlabel("Total UMI counts")
-    axes[2].set_ylabel("Mitochondrial fraction (%)")
-    axes[2].set_title("Total counts vs mito fraction")
-
-    plt.tight_layout()
-    qc_path = plot_dir / "qc_summary.png"
-    fig.savefig(qc_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  QC plots saved to: {qc_path}")
-
-    # ── 9. Gene check: random 10 genes with gene_id + gene_symbol ──
+    # ── 10. Gene check ──
     gene_check_path = out_dir / "gene_check.csv"
     rng = np.random.default_rng(seed)
-    check_idx = rng.choice(n_genes, size=min(10, n_genes), replace=False)
+    hq_n = adata_hq.n_vars
+    check_idx = rng.choice(hq_n, size=min(10, hq_n), replace=False)
     check_rows = []
     for gi in check_idx:
-        gene_expr = adata.X[:, gi].toarray().ravel() if hasattr(adata.X, "toarray") else adata.X[:, gi]
+        col = adata_hq.X[:, gi]
+        gene_expr = col.toarray().ravel() if hasattr(col, "toarray") else col
         top_cell_idx = int(np.argmax(gene_expr))
         check_rows.append({
-            "gene_id": gene_ids[gi],
-            "gene_symbol": gene_symbols[gi],
-            "mt": mt_flags[gi],
+            "gene_id": adata_hq.var["gene_id"].iloc[gi],
+            "gene_symbol": adata_hq.var["gene_symbol"].iloc[gi],
+            "mt": adata_hq.var["mt"].iloc[gi],
             "mean_expr": float(np.mean(gene_expr)),
             "max_expr": float(np.max(gene_expr)),
-            "top_cell": cell_ids[top_cell_idx],
+            "top_cell": adata_hq.obs_names[top_cell_idx],
         })
     pd.DataFrame(check_rows).to_csv(gene_check_path, index=False)
     print(f"  Gene check saved to: {gene_check_path}")
 
-    # ── 10. Filter top cells ──
-    adata_hq = adata[selected].copy()
-    print(f"  Full: {adata.shape}  →  HQ (top {int(top_total_fraction*100)}%): {adata_hq.shape}")
-
-    # ── 11. Filter genes by promoter presence + split into train/val/test ──
-    # Reuses filter_genes (parses promoters.fa, intersects gene_ids, splits by
-    # genomic position at gene level with by_gene=True).
-    adata = filter_genes(adata, output_dir=out_dir)
-    # Re-filter top cells on the gene-filtered h5ad
-    n_keep = max(1, int(np.ceil(adata.n_obs * top_total_fraction)))
-    adata_hq = adata[adata.obs["total_counts"].nlargest(n_keep).index].copy()
-    print(f"  HQ on filtered genes: {adata_hq.shape}")
-
-    # ── 12. Save ──
-    full_path = out_dir / "integrated_data.h5ad"
-    hq_path = out_dir / "integrated_data_hq.h5ad"
+    # ── 11. Save ──
+    out_dir.mkdir(parents=True, exist_ok=True)
+    full_path = out_dir / "integrated_data_full.h5ad"
+    hq_path = out_dir / "integrated_data.h5ad"
     adata.write_h5ad(full_path)
     adata_hq.write_h5ad(hq_path)
     print(f"\nSaved:")

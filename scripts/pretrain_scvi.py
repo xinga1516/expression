@@ -149,15 +149,17 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
     mse = float(np.mean((t - p) ** 2))
     mae = float(np.mean(np.abs(t - p)))
 
-    # Plot
+    # Plot with hexbin density
     fig, ax = plt.subplots(figsize=(7, 7))
-    ax.scatter(t, p, s=2, alpha=0.5, color="steelblue")
+    hb = ax.hexbin(t, p, gridsize=80, cmap="viridis", mincnt=1,
+                   bins="log", linewidths=0)
     lo, hi = float(np.min([t, p])), float(np.max([t, p]))
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, label="y = x")
     ax.set_xlabel("True log1p(expr)")
     ax.set_ylabel("Reconstructed log1p(expr)")
     ax.set_title(f"scVI Reconstruction  (Pearson r={pearson:.4f}  MSE={mse:.4f}  MAE={mae:.4f})")
     ax.legend()
+    plt.colorbar(hb, ax=ax, label="log10(count)")
 
     fig.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,7 +182,7 @@ def main() -> None:
                         help="Hidden units in encoder/decoder")
     parser.add_argument("--n-layers", type=int, default=2,
                         help="Number of hidden layers")
-    parser.add_argument("--dropout-rate", type=float, default=0.05,
+    parser.add_argument("--dropout-rate", type=float, default=0.1,
                         help="Dropout rate")
     parser.add_argument("--epochs", type=int, default=300,
                         help="Max training epochs")
@@ -206,7 +208,7 @@ def main() -> None:
         raise FileNotFoundError(f"Model dir not found: {args.load_model}")
 
     if args.data == "emtab":
-        data_path = PROJECT_ROOT / "data" / "emtab_processed" / "integrated_data.h5ad"
+        data_path = PROJECT_ROOT / "data" / "E-MTAB-10519-hqcells" / "integrated_data.h5ad"
     else:
         data_path = PROJECT_ROOT / "data" / args.data / "integrated_data.h5ad"
     if not data_path.exists():
@@ -221,13 +223,37 @@ def main() -> None:
     n_cells, n_genes = adata.shape
     print(f"  Cells: {n_cells}, Genes: {n_genes}")
 
+    # Ensure integer raw UMI counts for scVI ZINB model
+    if "counts" in adata.layers:
+        raw = adata.layers["counts"].copy()
+    else:
+        raw = adata.X.copy()
+    if hasattr(raw, "data"):
+        raw.data = np.round(raw.data).astype(np.int64)
+    else:
+        raw = np.round(raw).astype(np.int64)
+    adata.layers["raw_counts"] = raw
+    adata.X = raw
+    print(f"  Raw counts: min={raw.data.min()}, max={raw.data.max()}, "
+          f"dtype={raw.data.dtype}  |  {adata.shape}")
+
     from scvi.model import SCVI
 
     print("Setting up AnnData for scVI...")
-    SCVI.setup_anndata(adata)
+    SCVI.setup_anndata(adata, layer="raw_counts")
 
     if args.load_model:
         print(f"Loading model from: {args.load_model}")
+        # Subset adata to match the model's gene set (from saved var_names)
+        model_dir = Path(args.load_model)
+        var_names_path = model_dir / "var_names.csv"
+        if var_names_path.exists():
+            import csv
+            with open(var_names_path) as f:
+                model_genes = [row[0] for row in csv.reader(f)]
+            common = [g for g in adata.var_names if g in model_genes]
+            print(f"  Matching genes: {len(common)} / model={len(model_genes)} / adata={adata.n_vars}")
+            adata = adata[:, common].copy()
         model = SCVI.load(args.load_model, adata=adata)
         args.n_latent = model.module.n_latent
         # Extract n_hidden / n_layers from encoder structure
@@ -247,6 +273,7 @@ def main() -> None:
             n_hidden=args.n_hidden,
             n_layers=args.n_layers,
             dropout_rate=args.dropout_rate,
+            #gene_likelihood="nb",
         )
         train_size = 1.0 - args.val_size
         print(f"Training for up to {args.epochs} epochs (train={train_size:.0%}, val={args.val_size:.0%})...")
@@ -264,6 +291,7 @@ def main() -> None:
                 "lr_patience": args.lr_patience,
                 "lr_factor": args.lr_factor,
                 "lr_threshold": args.lr_threshold,
+                #"gradient_clip_val": 1.0,
             },
             train_size=train_size,
             validation_size=args.val_size,
@@ -273,26 +301,7 @@ def main() -> None:
     out_dir = PROJECT_ROOT / "outputs" / out_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Evaluation: loss curves + reconstruction ----
-    print("\nEvaluating pretraining results...")
-
-    history = model.history
-    if history:
-        plot_loss_curves(history, eval_dir / "loss_curve.png")
-
-    metrics = evaluate_reconstruction(
-        model, adata,
-        save_path=eval_dir / "recon_scatter.png",
-        seed=args.seed,
-    )
-
-    metrics_path = eval_dir / "metrics.json"
-    with open(metrics_path, "w") as f:
-        json.dump({k: v if not isinstance(v, float) or not np.isnan(v) else None
-                   for k, v in metrics.items()}, f, indent=2)
-    print(f"[Eval] Metrics saved to: {metrics_path}")
-
-    # ---- Save model outputs ----
+    # ---- Save model FIRST (before potentially-slow evaluation) ----
     if not args.load_model:
         scvi_dir = out_dir / "scvi_model"
         print(f"\nSaving scVI model to {scvi_dir}")
@@ -323,6 +332,25 @@ def main() -> None:
     latent_z = model.get_latent_representation()
     np.save(latent_path, latent_z)
     print(f"  latent_z shape: {latent_z.shape}")
+
+    # ---- Evaluation: loss curves + reconstruction (AFTER save) ----
+    print("\nEvaluating pretraining results...")
+
+    history = model.history
+    if history:
+        plot_loss_curves(history, eval_dir / "loss_curve.png")
+
+    metrics = evaluate_reconstruction(
+        model, adata,
+        save_path=eval_dir / "recon_scatter.png",
+        seed=args.seed,
+    )
+
+    metrics_path = eval_dir / "metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump({k: v if not isinstance(v, float) or not np.isnan(v) else None
+                   for k, v in metrics.items()}, f, indent=2)
+    print(f"[Eval] Metrics saved to: {metrics_path}")
 
     print(f"\nDone.")
     print(f"  Model:   {out_dir}/")

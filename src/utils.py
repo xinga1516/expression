@@ -506,7 +506,7 @@ def count_zero_nonzero(data_loader: DataLoader) -> tuple[int, int]:
     return zero_count, nz_count
 
 
-def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1, save_path: Path | None = None) -> None:
+def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, is_umi: bool = False, epoch: int = 1, save_path: Path | None = None) -> None:
     '''Plot scatter of true vs predicted values from the model on the given data loader.
     compute Pearson correlation and show it in the title. Only use up to max_steps batches for plotting.
     highquality data with epoch = 1;
@@ -532,7 +532,7 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
                     mu_ratio, _theta, _pi = model(promoters, exprs)
                     mu_ratio = mu_ratio.squeeze(1)
                     lib_size = exprs.sum(dim=1) + ys
-                    y_pred_log = torch.log(mu_ratio * 10000 + 1)
+                    y_pred_log = torch.log(mu_ratio * 1e6 + 1)
                     y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
                     y_true_all.append(y_log.detach().cpu().numpy())
                     y_pred_all.append(y_pred_log.detach().cpu().numpy())
@@ -613,9 +613,11 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, epoch: int = 1,
     plt.close()
 
 
-def plot_per_promoter_scatter(model: nn.Module, dataset: Any, n_promoters: int = 6,
-                               n_cells: int = 2000, save_path: Path | None = None) -> None:
-    '''Sample promoters and plot (true, predicted) across cells, one color per promoter.'''
+def plot_per_promoter_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_promoters: int = 6,
+                               n_cells: int = 1000, batch_size: int = 128, annotate_top: int = 100,
+                               save_path: Path | None = None) -> None:
+    '''Sample promoters and plot (true, predicted) across cells, one color per promoter.
+    Model forward pass is batched to avoid OOM on large cell sets.'''
     device = next(model.parameters()).device
     model.eval()
     is_zinb = getattr(model, "output_mode", "scalar") == "zinb"
@@ -626,51 +628,81 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, n_promoters: int =
     colors = plt.cm.tab10(np.linspace(0, 1, len(pro_indices)))
 
     # Pre-fetch promoter tensors
-    promoter_batch = dataset.promoter_tensor[pro_indices].to(device)  # (P, 400, 5)
-    # Pre-fetch cell expression rows as dense tensor
-    cell_rows = [int(dataset.cells[j]) for j in cell_indices]
+    promoter_tensors = dataset.promoter_tensor[pro_indices].to(device)  # (P, 400, 5)
     X_csr = dataset.X.tocsr()
-    X_batch_raw = np.vstack([X_csr[r].toarray().ravel() for r in cell_rows])
-    X_batch = torch.from_numpy(X_batch_raw.astype(np.float32)).to(device)  # (C, n_genes)
+    id2symbol = dict(zip(dataset.scrna.var["gene_id"], dataset.scrna.var["gene_symbol"]))
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    # Collect all points for annotation
+    all_yt: list[np.ndarray] = []
+    all_yp: list[np.ndarray] = []
+    all_labels: list[str] = []
+    all_colors: list[np.ndarray] = []  # one color per point
 
     with torch.no_grad():
-        for i, pro_i in enumerate(pro_indices):
+        for pi, pro_i in enumerate(pro_indices):
             target_idx = int(dataset.promoter2expr_idx[pro_i])
-            # Mask target gene for all cells in one op
-            ys = X_batch[:, target_idx].clone()  # (C,)
-            X_masked = X_batch.clone()
-            X_masked[:, target_idx] = 0.0
+            gene_id = dataset.promoters["gene_id"].iloc[pro_i]
+            gene_label = id2symbol.get(gene_id, gene_id)
+            p_single = promoter_tensors[pi]  # (400, 5)
 
-            # Expand promoter to batch: (C, 400, 5)
-            p_batch = promoter_batch[i].unsqueeze(0).expand(len(cell_indices), -1, -1)
+            for start in range(0, len(cell_indices), batch_size):
+                end = min(start + batch_size, len(cell_indices))
+                batch_cells = cell_indices[start:end]
+                cell_rows = [int(dataset.cells[j]) for j in batch_cells]
 
-            if is_zinb:
-                mu_ratio, _theta, _pi = model(p_batch, X_masked)
-                mu_ratio = mu_ratio.squeeze(1)
-                lib_size = X_masked.sum(dim=1) + ys
-                y_pred_log = torch.log(mu_ratio * 10000 + 1).cpu().numpy()
-                y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
-                yt, yp = y_log, y_pred_log
-            else:
-                preds = model(p_batch, X_masked).squeeze(1).cpu().numpy()
-                yt, yp = ys.cpu().numpy(), preds
+                X_batch = torch.from_numpy(
+                    np.vstack([X_csr[r].toarray().ravel() for r in cell_rows]).astype(np.float32)
+                ).to(device)  # (B, n_genes)
 
-            ax.scatter(yt, yp, s=15, alpha=0.5, color=colors[i])
+                ys = X_batch[:, target_idx].clone()
+                X_masked = X_batch.clone()
+                X_masked[:, target_idx] = 0.0
 
-    if len(ax.collections) > 0:
-        all_t = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 0])
-                                for j in range(len(ax.collections))])
-        all_p = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 1])
-                                for j in range(len(ax.collections))])
-        diag_lo = float(max(all_t.min(), all_p.min()))
-        diag_hi = float(min(all_t.max(), all_p.max()))
+                p_batch = p_single.unsqueeze(0).expand(len(batch_cells), -1, -1)  # (B, 400, 5)
+
+                if is_zinb:
+                    mu_ratio, _theta, _pi = model(p_batch, X_masked)
+                    mu_ratio = mu_ratio.squeeze(1)
+                    lib_size = X_masked.sum(dim=1) + ys
+                    yp = torch.log(mu_ratio * 1e6 + 1).cpu().numpy()
+                    yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
+                else:
+                    preds = model(p_batch, X_masked).squeeze(1).cpu().numpy()
+                    if is_umi:
+                        lib_size = X_masked.sum(dim=1) + ys
+                        yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
+                        yp = preds
+                    else:
+                        yt = ys.cpu().numpy()
+                        yp = preds
+
+                all_yt.append(yt)
+                all_yp.append(yp)
+                all_labels.extend([gene_label] * len(batch_cells))
+                all_colors.append(np.tile(colors[pi], (len(batch_cells), 1)))
+
+    yt_all = np.concatenate(all_yt)
+    yp_all = np.concatenate(all_yp)
+    color_all = np.concatenate(all_colors)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(yt_all, yp_all, s=15, alpha=0.5, c=color_all)
+
+    # Annotate top-100 by predicted and top-100 by true
+    top_pred = np.argsort(yp_all)[-annotate_top:]
+    top_true = np.argsort(yt_all)[-annotate_top:]
+    highlight = np.union1d(top_pred, top_true)
+    for idx in highlight:
+        ax.annotate(all_labels[idx], (yt_all[idx], yp_all[idx]),
+                    fontsize=3, alpha=0.5, rotation=30, ha='left', va='bottom')
+
+    if len(yt_all) > 1 and np.std(yt_all) > 0 and np.std(yp_all) > 0:
+        diag_lo = float(max(yt_all.min(), yp_all.min()))
+        diag_hi = float(min(yt_all.max(), yp_all.max()))
         ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "r--", linewidth=1)
-        if len(all_t) > 1 and np.std(all_t) > 0 and np.std(all_p) > 0:
-            corr = float(np.corrcoef(all_t, all_p)[0, 1])
-            ax.set_title(f"Per-promoter prediction ({len(pro_indices)} promoters, {n_cells} cells)\n"
-                         f"Pearson r={corr:.4f}")
+        corr = float(np.corrcoef(yt_all, yp_all)[0, 1])
+        ax.set_title(f"Per-promoter prediction ({len(pro_indices)} promoters, {n_cells} cells)\n"
+                     f"Pearson r={corr:.4f}")
 
     ax.set_xlabel("True")
     ax.set_ylabel("Predicted")
@@ -682,92 +714,146 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, n_promoters: int =
     plt.close()
 
 
-def plot_per_cell_scatter(model: nn.Module, dataset: Any, n_cells: int = 6,
-                           n_genes: int = 500, annotate_top: int = 10000,
+def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells: int = 1,
+                           n_genes: int = 0, batch_size: int = 128, annotate_top: int = 100,
                            save_path: Path | None = None) -> None:
-    '''Sample cells and plot (true, predicted) across genes, one color per cell.
-    annotate_top: number of top non-zero genes (by true expression) to label per cell.'''
+    '''Plot (true, predicted) across genes for selected cells, one color per cell.
+    n_genes=0 means use all promoters. Model forward pass is batched to avoid OOM.'''
     device = next(model.parameters()).device
     model.eval()
     is_zinb = getattr(model, "output_mode", "scalar") == "zinb"
 
     rng = np.random.default_rng(42)
-    pro_indices = rng.choice(dataset.P, size=min(n_genes, dataset.P), replace=False)
+    n_genes = int(n_genes)
+    if n_genes <= 0 or n_genes >= dataset.P:
+        pro_indices = np.arange(dataset.P, dtype=np.int64)
+    else:
+        pro_indices = rng.choice(dataset.P, size=n_genes, replace=False)
+    n_genes_actual = len(pro_indices)
 
     # Select cells with highest total counts
     cell_totals = np.array([dataset.scrna.obs["total_counts"].iloc[int(dataset.cells[i])]
                             for i in range(dataset.C)])
     top_cell_order = np.argsort(cell_totals)[::-1]  # descending
     cell_indices = top_cell_order[:min(n_cells, dataset.C)]
-    cell_labels = [f"cell {int(dataset.cells[i])}\n({cell_totals[i]:.0f} UMIs)" for i in cell_indices]
+
+    # Build legend labels with sample_id and tissue
+    id2symbol = dict(zip(dataset.scrna.var["gene_id"], dataset.scrna.var["gene_symbol"]))
+    cell_sample_ids = [dataset.scrna.obs["sample_id"].iloc[int(dataset.cells[i])] for i in cell_indices]
+
+    # Load tissue mapping if available
+    tissue_map: dict[str, str] = {}
+    tissue_map_file = dataset.scrna_file.parent / "sample_tissue.json"
+    if tissue_map_file.exists():
+        with open(tissue_map_file, "r") as f:
+            tissue_map = json.load(f)
+
+    cell_labels = []
+    for i, sid in zip(cell_indices, cell_sample_ids):
+        tissue = tissue_map.get(sid, "")
+        tissue_str = f" ({tissue})" if tissue else ""
+        cell_labels.append(f"{sid}{tissue_str}\n({cell_totals[i]:.0f} UMIs)")
     colors = plt.cm.tab10(np.linspace(0, 1, len(cell_indices)))
 
-    # Pre-fetch promoter tensors and gene names for all sampled genes
-    promoter_batch = dataset.promoter_tensor[pro_indices].to(device)  # (G, 400, 5)
+    # Pre-fetch promoter tensors and gene names
+    promoter_all = dataset.promoter_tensor[pro_indices].to(device)  # (G, 400, 5)
     target_indices = [int(dataset.promoter2expr_idx[p]) for p in pro_indices]
-    id2symbol = dict(zip(dataset.scrna.var["gene_id"], dataset.scrna.var["gene_symbol"]))
     gene_ids = dataset.promoters["gene_id"].iloc[pro_indices].values
     gene_names = [id2symbol.get(gid, gid) for gid in gene_ids]
     X_csr = dataset.X.tocsr()
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    # Collect all points
+    all_yt: list[np.ndarray] = []
+    all_yp: list[np.ndarray] = []
+    all_labels: list[str] = []
 
     with torch.no_grad():
-        for i, cell_i in enumerate(cell_indices):
+        for ci, cell_i in enumerate(cell_indices):
             cell_row = int(dataset.cells[cell_i])
             expr_vec = torch.from_numpy(
                 X_csr[cell_row].toarray().ravel().astype(np.float32)
             ).to(device)  # (n_genes,)
 
-            # Build batch: one row per gene, with that gene's target masked
-            expr_batch = expr_vec.unsqueeze(0).expand(len(pro_indices), -1).clone()  # (G, n_genes)
-            ys = []
-            for g, tgt in enumerate(target_indices):
-                ys.append(expr_batch[g, tgt].item())
-                expr_batch[g, tgt] = 0.0
-            ys = torch.tensor(ys, device=device)
+            for g_start in range(0, n_genes_actual, batch_size):
+                g_end = min(g_start + batch_size, n_genes_actual)
+                batch_pro = pro_indices[g_start:g_end]
+                batch_targets = target_indices[g_start:g_end]
+                batch_genes = gene_names[g_start:g_end]
+                batch_promoters = promoter_all[g_start:g_end]  # (B, 400, 5)
 
-            if is_zinb:
-                mu_ratio, _theta, _pi = model(promoter_batch, expr_batch)
-                mu_ratio = mu_ratio.squeeze(1)
-                lib_size = expr_batch.sum(dim=1) + ys
-                y_pred_log = torch.log(mu_ratio * 10000 + 1).cpu().numpy()
-                y_log = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
-                yt, yp = y_log, y_pred_log
-            else:
-                preds = model(promoter_batch, expr_batch).squeeze(1).cpu().numpy()
-                yt, yp = ys.cpu().numpy(), preds
+                expr_batch = expr_vec.unsqueeze(0).expand(len(batch_pro), -1).clone()  # (B, n_genes)
+                ys_list = []
+                for g, tgt in enumerate(batch_targets):
+                    ys_list.append(expr_batch[g, tgt].item())
+                    expr_batch[g, tgt] = 0.0
+                ys = torch.tensor(ys_list, device=device)
 
-            ax.scatter(yt, yp, s=15, alpha=0.5, color=colors[i], label=cell_labels[i])
+                if is_zinb:
+                    mu_ratio, _theta, _pi = model(batch_promoters, expr_batch)
+                    mu_ratio = mu_ratio.squeeze(1)
+                    lib_size = expr_batch.sum(dim=1) + ys
+                    yp = torch.log(mu_ratio * 1e6 + 1).cpu().numpy()
+                    yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
+                else:
+                    preds = model(batch_promoters, expr_batch).squeeze(1).cpu().numpy()
+                    if is_umi:
+                        lib_size = expr_batch.sum(dim=1) + ys
+                        yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
+                        yp = preds
+                    else:
+                        yt = ys.cpu().numpy()
+                        yp = preds
 
-            # Annotate top non-zero genes with their gene IDs
-            if annotate_top > 0:
-                nz_mask = yt > 0
-                if nz_mask.any():
-                    nz_idx = np.where(nz_mask)[0]
-                    top_nz = nz_idx[np.argsort(yt[nz_mask])[::-1][:annotate_top]]
-                    for g in top_nz:
-                        ax.annotate(gene_names[g], (yt[g], yp[g]),
-                                    fontsize=4, alpha=0.6, rotation=30,
-                                    ha='left', va='bottom')
+                all_yt.append(yt)
+                all_yp.append(yp)
+                all_labels.extend(batch_genes)
 
-    if len(ax.collections) > 0:
-        all_t = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 0])
-                                for j in range(len(ax.collections))])
-        all_p = np.concatenate([np.array(ax.collections[j].get_offsets()[:, 1])
-                                for j in range(len(ax.collections))])
-        diag_lo = float(max(all_t.min(), all_p.min()))
-        diag_hi = float(min(all_t.max(), all_p.max()))
+    yt_all = np.concatenate(all_yt)
+    yp_all = np.concatenate(all_yp)
+
+    # Build per-cell point ranges: track how many points each cell contributed
+    cell_point_counts: list[int] = []
+    n_batches_per_cell = (n_genes_actual + batch_size - 1) // batch_size
+    for ci in range(len(cell_indices)):
+        cnt = 0
+        for bi in range(n_batches_per_cell):
+            idx = ci * n_batches_per_cell + bi
+            if idx < len(all_yt):
+                cnt += len(all_yt[idx])
+        cell_point_counts.append(cnt)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    offset = 0
+    for ci, cnt in enumerate(cell_point_counts):
+        ax.scatter(yt_all[offset:offset + cnt], yp_all[offset:offset + cnt],
+                   s=15, alpha=0.5, color=colors[ci], label=cell_labels[ci])
+        offset += cnt
+
+    # Annotate top-100 by predicted and top-100 by true (global)
+    top_pred = np.argsort(yp_all)[-annotate_top:]
+    top_true = np.argsort(yt_all)[-annotate_top:]
+    highlight = np.union1d(top_pred, top_true)
+    for idx in highlight:
+        ax.annotate(all_labels[idx], (yt_all[idx], yp_all[idx]),
+                    fontsize=3, alpha=0.5, rotation=30, ha='left', va='bottom')
+
+    if len(yt_all) > 1 and np.std(yt_all) > 0 and np.std(yp_all) > 0:
+        diag_lo = float(max(yt_all.min(), yp_all.min()))
+        diag_hi = float(min(yt_all.max(), yp_all.max()))
         ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "r--", linewidth=1)
-        if len(all_t) > 1 and np.std(all_t) > 0 and np.std(all_p) > 0:
-            corr = float(np.corrcoef(all_t, all_p)[0, 1])
-            ax.set_title(f"Per-cell prediction ({len(cell_indices)} cells, {n_genes} genes)\n"
-                         f"Pearson r={corr:.4f}")
+        corr = float(np.corrcoef(yt_all, yp_all)[0, 1])
+        ax.set_title(f"Per-cell prediction ({len(cell_indices)} cells, {n_genes_actual} genes)\n"
+                     f"Pearson r={corr:.4f}")
 
     ax.set_xlabel("True")
     ax.set_ylabel("Predicted")
-    ax.legend(fontsize=6, loc="upper left", markerscale=1.5,
-              title="Cell (total UMIs)", title_fontsize=7)
+    if len(cell_indices) > 1:
+        ax.legend(fontsize=6, loc="upper left", markerscale=1.5,
+                  title="sample_id", title_fontsize=7)
+    else:
+        ax.text(0.95, 0.05, cell_labels[0], transform=ax.transAxes,
+                fontsize=8, ha='right', va='bottom',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     plt.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)

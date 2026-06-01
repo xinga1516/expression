@@ -12,7 +12,7 @@ from scipy import sparse
 
 
 project_root = pathlib.Path(__file__).resolve().parent.parent
-data_dir = project_root / "data" / "log_processed"#"highquality"
+data_dir = project_root / "data" / "E-MTAB-10519-hqcells"#"log_processed"#"highquality"
 out_dir = data_dir#project_root / "outputs"
 
 
@@ -527,14 +527,14 @@ def main() -> None:
     #         normalize=False,
     #     )
 
-    # h5ad_path = data_dir / "integrated_data.h5ad"
-    # summary = summarize_integrated_data(h5ad_path)
-    # print("=== 训练前数据分布摘要（integrated_data.h5ad）===")
-    # print(json.dumps(summary, indent=2, ensure_ascii=False))
-    # out_path = out_dir / "data_sanity_summary.json"
-    # with open(out_path, "w", encoding="utf-8") as f:
-    #     json.dump(summary, f, indent=2, ensure_ascii=False)
-    # print(f"\n摘要已保存到: {out_path}")
+    h5ad_path = data_dir / "integrated_data.h5ad"
+    summary = summarize_integrated_data(h5ad_path)
+    print("=== 训练前数据分布摘要（integrated_data.h5ad）===")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    out_path = out_dir / "data_sanity_summary.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"\n摘要已保存到: {out_path}")
 
     # # Gene variance vs median plot (scRNA-seq h5ad)
     # data_h5ad = data_dir / "integrated_data.h5ad"
