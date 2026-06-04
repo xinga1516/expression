@@ -630,7 +630,7 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_pr
     colors = plt.cm.tab10(np.linspace(0, 1, len(pro_indices)))
 
     # Pre-fetch promoter tensors
-    promoter_tensors = dataset.promoter_tensor[pro_indices].to(device)  # (P, 400, 5)
+    promoter_tensors = dataset.get_promoter_tensors(pro_indices).to(device)  # (P, 400, 5)
     X_csr = dataset.X.tocsr()
     id2symbol = dict(zip(dataset.scrna.var["gene_id"], dataset.scrna.var["gene_symbol"]))
 
@@ -758,7 +758,7 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
     colors = plt.cm.tab10(np.linspace(0, 1, len(cell_indices)))
 
     # Pre-fetch promoter tensors and gene names
-    promoter_all = dataset.promoter_tensor[pro_indices].to(device)  # (G, 400, 5)
+    promoter_all = dataset.get_promoter_tensors(pro_indices).to(device)  # (G, 400, 5)
     target_indices = [int(dataset.promoter2expr_idx[p]) for p in pro_indices]
     gene_ids = dataset.promoters["gene_id"].iloc[pro_indices].values
     gene_names = [id2symbol.get(gid, gid) for gid in gene_ids]

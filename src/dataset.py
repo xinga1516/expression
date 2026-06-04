@@ -55,6 +55,7 @@ class MyDataset(Dataset):
         seed: int = 42,
         cell_ratio: float = 1.0,
         log1p_cpm_target: bool = False,
+        preencode_promoters: bool = False,
     ) -> None:
         self.promoter_file = Path(promoter_file)
         self.scrna_file = Path(scrna_file)
@@ -64,9 +65,14 @@ class MyDataset(Dataset):
         self.X = self.scrna.X.tocsr() if sparse.issparse(self.scrna.X) else self.scrna.X
 
         self.promoter_encoder = PromoterOneHotEncoder(length=400)
-        print("Pre-encoding promoter sequences...")
-        self.promoter_tensor = self._preencode_promoters()
-        print("Done.")
+        self.preencode_promoters = preencode_promoters
+        self.promoter_tensor: torch.Tensor | None = None
+        if self.preencode_promoters:
+            print("Pre-encoding promoter sequences...")
+            self.promoter_tensor = self._preencode_promoters()
+            print("Done.")
+        else:
+            print("Promoter pre-encoding disabled; sequences will be encoded per sample.")
         #self.gene_ids = gene_ids_subset
         if cell_ids_subset is None:
             self.cells = np.arange(self.scrna.n_obs, dtype=np.int64)
@@ -139,8 +145,20 @@ class MyDataset(Dataset):
     def __len__(self) -> int:
         return self.P * self.C
 
+    def get_promoter_tensor(self, pro_i: int) -> torch.Tensor:
+        if self.promoter_tensor is not None:
+            return self.promoter_tensor[pro_i]
+        seq = str(self.promoters["sequence"].iloc[pro_i])
+        return self.promoter_encoder(seq)
+
+    def get_promoter_tensors(self, pro_indices: np.ndarray | list[int]) -> torch.Tensor:
+        if self.promoter_tensor is not None:
+            return self.promoter_tensor[pro_indices]
+        tensors = [self.get_promoter_tensor(int(pro_i)) for pro_i in pro_indices]
+        return torch.stack(tensors, dim=0)
+
     def in_getitem(self, pro_i: int, cell_i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        promoter = self.promoter_tensor[pro_i]
+        promoter = self.get_promoter_tensor(pro_i)
         #gene_id = (self.promoters["gene_id"]).iloc[pro_i]
         cell_id = self.cells[cell_i]
         expr_all = self.X[cell_id]

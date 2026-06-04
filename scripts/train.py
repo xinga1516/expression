@@ -517,6 +517,7 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
+    parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode all promoter sequences in memory. Faster, but uses much more RAM.")
     parser.add_argument("--samples-per-epoch", type=int, default=0, help="Number of samples per epoch. 0 = auto-select from pool sizes (no forced duplication).")
     parser.add_argument("--val-samples", type=int, default=128000, help="Number of unique samples to use for validation (uses zeroNonZeroSampler)")
     parser.add_argument("--max-duplication", type=float, default=1.0, help="Max duplication factor for auto samples_per_epoch (1.0 = no duplication, 2.0 = up to 2x)")
@@ -554,6 +555,7 @@ def main():
         scrna_file=data_dir / "integrated_data.h5ad",
         cell_ratio=args.cell_ratio,
         log1p_cpm_target=use_log1p,
+        preencode_promoters=args.preencode_promoters,
     )
     val_dataset = MyDataset(
         promoter_file=data_dir / "promoter_val.csv",
@@ -562,6 +564,7 @@ def main():
         seed=args.seed,
         cell_ratio=args.val_cell_ratio,
         log1p_cpm_target=use_log1p,
+        preencode_promoters=args.preencode_promoters,
     )
 
     pin_memory = torch.cuda.is_available()
