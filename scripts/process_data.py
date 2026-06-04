@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional, Any
 
+
 def hdf5_matrix_to_sparse(
     mat: Any,
     chunk_size: int = 5000,
@@ -78,6 +79,74 @@ def hdf5_matrix_to_sparse(
         X = X.tocsr()     # gene × cell
 
     return X
+
+
+def augment_promoter_windows(
+    promoter_df: pd.DataFrame,
+    genome_fasta_path: Path,
+    shift_bp: int = 20,
+    include_original: bool = True,
+) -> pd.DataFrame:
+    """
+    Build shifted 400bp promoter windows from genome sequence.
+
+    Offsets are genomic-coordinate shifts of the existing window. With
+    shift_bp=20 and include_original=True, each original promoter can produce
+    up to 41 rows with augment_offset from -20 to +20.
+    """
+    required_cols = {"gene_id", "chrom", "start", "end", "strand"}
+    missing = required_cols - set(promoter_df.columns)
+    if missing:
+        raise ValueError(f"augment_promoter_windows missing required columns: {sorted(missing)}")
+    if shift_bp < 0:
+        raise ValueError("shift_bp must be >= 0")
+    if not genome_fasta_path.exists():
+        raise FileNotFoundError(f"Genome FASTA not found: {genome_fasta_path}")
+
+    genome = SeqIO.to_dict(SeqIO.parse(str(genome_fasta_path), "fasta"))
+    offsets = list(range(-shift_bp, shift_bp + 1))
+    if not include_original:
+        offsets = [offset for offset in offsets if offset != 0]
+
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for row in promoter_df.itertuples(index=False):
+        row_dict = row._asdict()
+        chrom = str(row_dict["chrom"])
+        if chrom not in genome:
+            skipped += len(offsets)
+            continue
+
+        chrom_seq = genome[chrom].seq
+        start = int(row_dict["start"])
+        end = int(row_dict["end"])
+        strand = str(row_dict["strand"])
+
+        for offset in offsets:
+            shifted_start = start + offset
+            shifted_end = end + offset
+            if shifted_start < 0 or shifted_end > len(chrom_seq):
+                skipped += 1
+                continue
+
+            seq = chrom_seq[shifted_start:shifted_end]
+            if strand == "-":
+                seq = seq.reverse_complement()
+
+            augmented = dict(row_dict)
+            augmented["start"] = shifted_start
+            augmented["end"] = shifted_end
+            augmented["sequence"] = str(seq).upper()
+            augmented["length"] = shifted_end - shifted_start
+            augmented["augment_offset"] = offset
+            rows.append(augmented)
+
+    augmented_df = pd.DataFrame(rows)
+    print(
+        f"  Augmented promoters: {len(promoter_df)} -> {len(augmented_df)} rows "
+        f"(shift_bp={shift_bp}, skipped={skipped})"
+    )
+    return augmented_df
 
 
 def add_gene_annotation(rawdata: ad.AnnData, synonym_path: Optional[str] = None, gtf_path: Optional[str] = None) -> ad.AnnData:
@@ -436,6 +505,8 @@ def filter_genes(
     rawdata: ad.AnnData,
     promoter_fa_path: Optional[Path] = None,
     output_dir: Optional[Path] = None,
+    genome_fasta_path: Optional[Path] = None,
+    augment_shift_bp: int = 20,
 ) -> ad.AnnData:
     '''
     Remove genes without promoter sequences, and split into train/val/test.
@@ -447,10 +518,18 @@ def filter_genes(
         Path to promoters.fa.  Default: data/processed/promoters.fa
     output_dir : Path or None
         Directory for promoter CSV files.  Default: data/processed/
+    genome_fasta_path : Path or None
+        Genome FASTA used to rebuild shifted promoter windows.
+        Default: data/raw/dmel-all-chromosome-r6.54.fasta
+    augment_shift_bp : int
+        Genomic-coordinate shift range. Default 20 means offsets -20..+20.
+        Set to 0 to keep only the original centered window.
     '''
     base_dir = Path(__file__).resolve().parent.parent
     if promoter_fa_path is None:
         promoter_fa_path = base_dir / "data" / "processed" / "promoters.fa"
+    if genome_fasta_path is None:
+        genome_fasta_path = base_dir / "data" / "raw" / "dmel-all-chromosome-r6.54.fasta"
 
     promoters = SeqIO.parse(str(promoter_fa_path), 'fasta')
     rows = []
@@ -491,7 +570,11 @@ def filter_genes(
 
     filtered_promoters = promoters[promoters["gene_id"].isin(eligible_genes)]
     print(f"promoters number: {len(filtered_promoters)}")
-    promoter_df = filtered_promoters
+    promoter_df = augment_promoter_windows(
+        filtered_promoters,
+        genome_fasta_path=genome_fasta_path,
+        shift_bp=augment_shift_bp,
+    )
     promoter_df["start"] = promoter_df["start"].astype(int)
     split_train_val(promoter_df, by_gene=True, output_dir=output_dir)
 

@@ -510,7 +510,7 @@ def main():
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
     parser.add_argument("--model", type=str, default="LSTMmodel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
-    parser.add_argument("--data", type=str, default="umi_processed", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells"], help="Which dataset version to use (affects data paths in config)")
+    parser.add_argument("--data", type=str, default="umi_processed", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells","umi_E-MTAB-10519-hqcells_aug20","umi_E-MTAB-10519-hqcells_aug15"], help="Which dataset version to use (affects data paths in config)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
     parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
@@ -565,7 +565,7 @@ def main():
     )
 
     pin_memory = torch.cuda.is_available()
-    if args.data in ("processed", "log_processed", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells"):
+    if args.data in ("processed", "log_processed", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells","umi_E-MTAB-10519-hqcells_aug20","umi_E-MTAB-10519-hqcells_aug15"):
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,

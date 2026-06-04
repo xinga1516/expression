@@ -113,9 +113,10 @@ class ZeroNonZeroSampler(Sampler):
 
         print("Precomputing zero/non-zero pools for sampler...")
         X_csr = dataset.X.tocsr()
-        gene_idx_to_pro = {}
+        gene_idx_to_pros: dict[int, list[int]] = {}
         for pro_i in range(self.P):
-            gene_idx_to_pro[int(dataset.promoter2expr_idx[pro_i])] = pro_i
+            gene_idx = int(dataset.promoter2expr_idx[pro_i])
+            gene_idx_to_pros.setdefault(gene_idx, []).append(pro_i)
 
         nz_list: list[int] = []  # flat indices of non-zero (promoter, cell) pairs
         for cell_pos in range(self.C):
@@ -126,9 +127,10 @@ class ZeroNonZeroSampler(Sampler):
             else:
                 nz_gene_idx = np.where(np.asarray(row).ravel() > 0)[0]
             for gene_idx in nz_gene_idx:
-                pro_i = gene_idx_to_pro.get(int(gene_idx))
-                if pro_i is not None:
-                    nz_list.append(pro_i * self.C + cell_pos)
+                pro_indices = gene_idx_to_pros.get(int(gene_idx))
+                if pro_indices is not None:
+                    for pro_i in pro_indices:
+                        nz_list.append(pro_i * self.C + cell_pos)
             if cell_pos % 5000 == 0:
                 print(f"  processed cell {cell_pos}/{self.C}")
 
