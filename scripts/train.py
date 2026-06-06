@@ -186,6 +186,7 @@ def train_model(
                 resume_ckpt, model, optimizer, scheduler, earlystopping, device
             )
             print(f"[Resume] loaded: {resume_ckpt} | start_epoch={start_epoch} | best_score={earlystopping.best_score}")
+            earlystopping.early_stop = False
         else:
             print(f"[Resume] checkpoint not found, start from scratch: {resume_ckpt}")
 

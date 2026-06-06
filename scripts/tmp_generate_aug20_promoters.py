@@ -24,16 +24,19 @@ def link_or_copy_h5ad(src: Path, dst: Path) -> None:
         print(f"Copied {dst}")
 
 
-def write_augmented_split(src_dir: Path, dst_dir: Path, genome_fasta: Path, split: str, shift_bp: int) -> None:
+def write_split(src_dir: Path, dst_dir: Path, genome_fasta: Path, split: str, shift_bp: int, augment: bool) -> None:
     src_csv = src_dir / f"promoter_{split}.csv"
     dst_csv = dst_dir / f"promoter_{split}.csv"
     tmp_csv = dst_dir / f"promoter_{split}.csv.tmp"
 
     promoters = pd.read_csv(src_csv)
-    augmented = augment_promoter_windows(promoters, genome_fasta_path=genome_fasta, shift_bp=shift_bp)
-    augmented.to_csv(tmp_csv, index=False)
+    if augment:
+        output = augment_promoter_windows(promoters, genome_fasta_path=genome_fasta, shift_bp=shift_bp)
+    else:
+        output = promoters
+    output.to_csv(tmp_csv, index=False)
     tmp_csv.replace(dst_csv)
-    print(f"{split}: {len(promoters)} -> {len(augmented)} rows")
+    print(f"{split}: {len(promoters)} -> {len(output)} rows")
 
 
 def main() -> None:
@@ -49,8 +52,9 @@ def main() -> None:
     genome_fasta = PROJECT_ROOT / "data" / "raw" / "dmel-all-chromosome-r6.54.fasta"
 
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for split in ("train", "val", "test"):
-        write_augmented_split(src_dir, dst_dir, genome_fasta, split, args.shift_bp)
+    write_split(src_dir, dst_dir, genome_fasta, "train", args.shift_bp, augment=True)
+    write_split(src_dir, dst_dir, genome_fasta, "val", args.shift_bp, augment=False)
+    write_split(src_dir, dst_dir, genome_fasta, "test", args.shift_bp, augment=False)
 
     for filename in ("data_sanity_summary.json", "gene_check.csv", "sample_tissue.json"):
         src = src_dir / filename

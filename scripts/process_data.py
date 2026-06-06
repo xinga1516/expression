@@ -570,13 +570,21 @@ def filter_genes(
 
     filtered_promoters = promoters[promoters["gene_id"].isin(eligible_genes)]
     print(f"promoters number: {len(filtered_promoters)}")
-    promoter_df = augment_promoter_windows(
-        filtered_promoters,
-        genome_fasta_path=genome_fasta_path,
-        shift_bp=augment_shift_bp,
-    )
+    promoter_df = filtered_promoters.copy()
     promoter_df["start"] = promoter_df["start"].astype(int)
-    split_train_val(promoter_df, by_gene=True, output_dir=output_dir)
+    train_genes, _, _ = split_train_val(promoter_df, by_gene=True, output_dir=output_dir)
+
+    if augment_shift_bp > 0:
+        base_dir = Path(__file__).resolve().parent.parent
+        outdir = Path(output_dir) if output_dir is not None else (base_dir / "data" / "highquality")
+        train_promoters = promoter_df[promoter_df["gene_id"].isin(train_genes)].copy()
+        augmented_train = augment_promoter_windows(
+            train_promoters,
+            genome_fasta_path=genome_fasta_path,
+            shift_bp=augment_shift_bp,
+        )
+        augmented_train.to_csv(outdir / "promoter_train.csv", index=False)
+        print(f"  Wrote augmented train promoters only: {outdir / 'promoter_train.csv'}")
 
     return filtered_data
 

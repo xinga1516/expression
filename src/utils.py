@@ -274,6 +274,8 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "use_vae": getattr(args, "vae_encoder", None) is not None,
         "vae_encoder_path": getattr(args, "vae_encoder", None),
         "vae_fine_tune": getattr(args, "vae_fine_tune", False),
+        "fusion": getattr(args, "fusion", "gate"),
+        "preencode_promoters": getattr(args, "preencode_promoters", False),
     })
 
     with open(config_path, "w", encoding="utf-8") as f:
