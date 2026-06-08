@@ -25,6 +25,8 @@ import copy
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dataset import MyDataset
 from src.model import MODEL_REGISTRY, build_model
@@ -105,6 +107,18 @@ def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1
     mse = weighted_mse_loss(pred, target, nonzero_weight)
     p_loss = pearson_loss(pred, target, eps)
     return mse + pearson_lambda * p_loss
+
+
+def compute_val_loss_ema(prev_ema: float | None, monitor_loss: float, ema_alpha: float) -> float:
+    """Compute the validation-loss EMA used for early stopping and best-model selection."""
+    if prev_ema is None:
+        return float(monitor_loss)
+    return float(ema_alpha * prev_ema + (1.0 - ema_alpha) * monitor_loss)
+
+
+def should_save_best_model(current_monitor_loss: float, best_score: float | None) -> bool:
+    """Match the training loop's current best-model decision."""
+    return best_score is not None and current_monitor_loss == best_score
 
 
 def train_model(
@@ -343,10 +357,7 @@ def train_model(
         # ── Post-validation: EMA, logging, early-stopping, checkpoint ──
         prev_train = train_losses[-1] if train_losses else float("nan")
         monitor_loss = avg_val_loss if not math.isnan(avg_val_loss) else prev_train
-        if val_loss_ema is None:
-            val_loss_ema = monitor_loss
-        else:
-            val_loss_ema = ema_alpha * val_loss_ema + (1 - ema_alpha) * monitor_loss
+        val_loss_ema = compute_val_loss_ema(val_loss_ema, monitor_loss, ema_alpha)
 
         current_lr = optimizer.param_groups[0]["lr"]
         prev_train_str = f"Train={prev_train:.6f} " if train_losses else ""
@@ -386,7 +397,7 @@ def train_model(
 
         # Update best metric and early-stopping counter (uses EMA-smoothed loss)
         earlystopping(val_loss_ema)
-        if val_loss_ema == earlystopping.best_score:
+        if should_save_best_model(val_loss_ema, earlystopping.best_score):
             utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
 
         utils.save_checkpoint(
@@ -428,8 +439,6 @@ def train_model(
         train_zero_sum = 0.0
         train_zero_count = 0
         epoch_step_losses = []
-
-        scheduler.step()
 
         for batch in train_loader:
             promoters, exprs, ys = batch
@@ -491,6 +500,8 @@ def train_model(
                 torch.cuda.synchronize()
 
             epoch_step_losses.append(loss.item())
+
+        scheduler.step()
 
         if loss_type in ("pearson", "zinb"):
             avg_train_loss = sum(epoch_step_losses) / max(len(epoch_step_losses), 1)
