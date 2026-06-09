@@ -253,6 +253,7 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "model": args.model,
         "hidden_size": args.hidden_size,
         "batch_size": args.batch_size,
+        "prefetch_factor": getattr(args, "prefetch_factor", 2),
         "samples_per_epoch": args.samples_per_epoch,
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,
@@ -276,6 +277,7 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "vae_fine_tune": getattr(args, "vae_fine_tune", False),
         "fusion": getattr(args, "fusion", "gate"),
         "preencode_promoters": getattr(args, "preencode_promoters", False),
+        "amp": getattr(args, "amp", False),
     })
 
     with open(config_path, "w", encoding="utf-8") as f:

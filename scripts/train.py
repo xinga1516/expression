@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 import shutil
 import sys
+from typing import Any
 
 import torch
 import time
@@ -33,6 +34,49 @@ from src.model import MODEL_REGISTRY, build_model
 from src.earlystopping import EarlyStopping
 import src.utils as utils
 from safetensors.torch import save_file, load_file
+
+
+def dataloader_worker_kwargs(num_workers: int, prefetch_factor: int) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
+
+
+def count_model_parameters(model: nn.Module) -> tuple[int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def estimate_batch_input_mib(batch_size: int, expr_dim: int, promoter_len: int = 400, promoter_channels: int = 5) -> float:
+    bytes_per_batch = batch_size * (promoter_len * promoter_channels + expr_dim) * 4
+    return bytes_per_batch / (1024 ** 2)
+
+
+def print_training_resource_summary(
+    model: nn.Module,
+    batch_size: int,
+    expr_dim: int,
+    samples_per_epoch: int,
+    val_samples: int,
+    cell_ratio: float,
+    val_cell_ratio: float,
+    num_workers: int,
+    prefetch_factor: int,
+    amp: bool,
+) -> None:
+    total_params, trainable_params = count_model_parameters(model)
+    input_mib = estimate_batch_input_mib(batch_size=batch_size, expr_dim=expr_dim)
+    print("===== Resource Summary =====")
+    print(f"params: total={total_params:,} trainable={trainable_params:,}")
+    print(f"batch_size={batch_size} expr_dim={expr_dim} estimated_input={input_mib:.1f} MiB/batch")
+    print(
+        f"samples_per_epoch={samples_per_epoch} val_samples={val_samples} "
+        f"cell_ratio={cell_ratio} val_cell_ratio={val_cell_ratio}"
+    )
+    print(f"num_workers={num_workers} prefetch_factor={prefetch_factor} amp={amp}")
 
 class ZINBLoss(nn.Module):
     '''Zero-inflated negative binomial negative log-likelihood, computed entirely
@@ -138,6 +182,7 @@ def train_model(
     ema_alpha=0.9,
     loss_type="mse",
     pearson_lambda=1.0,
+    amp: bool = False,
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -145,6 +190,12 @@ def train_model(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    amp_enabled = bool(amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    if amp and not amp_enabled:
+        print("[AMP] requested but CUDA is unavailable; running in FP32.")
+    elif amp_enabled:
+        print("[AMP] enabled.")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=1e-2)
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -255,10 +306,14 @@ def train_model(
                     ys = ys.to(device, non_blocking=True).float()
 
                     if loss_type == "zinb":
-                        mu_ratio, theta, pi = model(promoters, exprs)
+                        with torch.amp.autocast("cuda", enabled=amp_enabled):
+                            mu_ratio, theta, pi = model(promoters, exprs)
                         mu_ratio = mu_ratio.squeeze(1)
                         theta = theta.squeeze(1)
                         pi = pi.squeeze(1)
+                        mu_ratio = mu_ratio.float()
+                        theta = theta.float()
+                        pi = pi.float()
                         lib_size = exprs.sum(dim=1) + ys
                         mu = mu_ratio * lib_size
                         val_loss = zinb_loss_fn(ys, mu, theta, pi)
@@ -273,7 +328,9 @@ def train_model(
 
                         sq = (y_pred_log - y_log) ** 2
                     else:
-                        out = model(promoters, exprs).squeeze(1)
+                        with torch.amp.autocast("cuda", enabled=amp_enabled):
+                            out = model(promoters, exprs).squeeze(1)
+                        out = out.float()
                         sq = (out - ys) ** 2
 
                         if loss_type in ("pearson", "combined"):
@@ -446,26 +503,39 @@ def train_model(
             exprs = exprs.to(device, non_blocking=True)
             ys = ys.to(device, non_blocking=True).float()
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if loss_type == "zinb":
-                mu_ratio, theta, pi = model(promoters, exprs)
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    mu_ratio, theta, pi = model(promoters, exprs)
                 mu_ratio = mu_ratio.squeeze(1)
                 theta = theta.squeeze(1)
                 pi = pi.squeeze(1)
+                mu_ratio = mu_ratio.float()
+                theta = theta.float()
+                pi = pi.float()
                 lib_size = exprs.sum(dim=1) + ys  # exprs has target masked to 0
                 mu = mu_ratio * lib_size
                 loss = zinb_loss_fn(ys, mu, theta, pi)
             else:
-                out = model(promoters, exprs).squeeze(1)
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    out = model(promoters, exprs).squeeze(1)
+                out = out.float()
                 if loss_type == "pearson":
                     loss = pearson_loss(out, ys)
                 elif loss_type == "combined":
                     loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
                 else:
                     loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
             # calculate weighted MSE components for each batch
             with torch.no_grad():
@@ -529,7 +599,9 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for LSTM and MLP in the model")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Dataloader prefetch factor used when num_workers > 0")
     parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode all promoter sequences in memory. Faster, but uses much more RAM.")
+    parser.add_argument("--amp", action="store_true", default=False, help="Use CUDA automatic mixed precision for model forward/backward.")
     parser.add_argument("--samples-per-epoch", type=int, default=0, help="Number of samples per epoch. 0 = auto-select from pool sizes (no forced duplication).")
     parser.add_argument("--val-samples", type=int, default=128000, help="Number of unique samples to use for validation (uses zeroNonZeroSampler)")
     parser.add_argument("--max-duplication", type=float, default=1.0, help="Max duplication factor for auto samples_per_epoch (1.0 = no duplication, 2.0 = up to 2x)")
@@ -580,6 +652,7 @@ def main():
     )
 
     pin_memory = torch.cuda.is_available()
+    loader_worker_kwargs = dataloader_worker_kwargs(args.num_workers, args.prefetch_factor)
     if args.data in ("processed", "log_processed", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells","umi_E-MTAB-10519-hqcells_aug20","umi_E-MTAB-10519-hqcells_aug15"):
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
@@ -597,6 +670,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
                 drop_last=True,
+                **loader_worker_kwargs,
             )
             val_sampler = utils.ZeroNonZeroSampler(
                 val_dataset,
@@ -613,6 +687,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
                 drop_last=True,
+                **loader_worker_kwargs,
             )
         else:
             train_sampler = utils.BalancedEpochSubsetSampler(
@@ -628,6 +703,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
                 drop_last=True,
+                **loader_worker_kwargs,
             )
             val_sampler = utils.BalancedEpochSubsetSampler(
                 val_dataset,
@@ -641,6 +717,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
                 drop_last=True,
+                **loader_worker_kwargs,
             )
     elif args.data in ("highquality", "umi_highquality"):
         if args.nonzero_ratio is not None:
@@ -658,6 +735,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
                 drop_last=True,
+                **loader_worker_kwargs,
             )
         else:
             train_loader = DataLoader(
@@ -667,6 +745,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
                 drop_last=True,
+                **loader_worker_kwargs,
             )
         val_loader = DataLoader(
             val_dataset,
@@ -675,6 +754,7 @@ def main():
             num_workers=args.num_workers,
             pin_memory=pin_memory,
             drop_last=True,
+            **loader_worker_kwargs,
         )
 
     expr_dim = train_dataset.X.shape[1]
@@ -690,6 +770,18 @@ def main():
         vae_fine_tune=args.vae_fine_tune,
         output_mode=output_mode,
         fusion=args.fusion,
+    )
+    print_training_resource_summary(
+        model=model,
+        batch_size=args.batch_size,
+        expr_dim=expr_dim,
+        samples_per_epoch=args.samples_per_epoch,
+        val_samples=args.val_samples,
+        cell_ratio=args.cell_ratio,
+        val_cell_ratio=args.val_cell_ratio,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        amp=args.amp,
     )
 
     run_dir, ckpt_dir, plots_dir, _ = utils._prepare_output_dirs(base_dir, args.exp_name)
@@ -741,6 +833,7 @@ def main():
         ema_alpha=args.ema_alpha,
         loss_type=args.loss,
         pearson_lambda=args.pearson_lambda,
+        amp=args.amp,
     )
  
     if args.plot_loss:

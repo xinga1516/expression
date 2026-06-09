@@ -1,3 +1,8 @@
+''' three ways to test model effect
+1. position significance using mutation, and find important denovo motif and match existing motifs
+2. test points pearson r and spearman r
+3. shuffle input (promoters or expression) to see the model prediction effect
+'''
 from pathlib import Path
 import argparse
 from collections import Counter, defaultdict
