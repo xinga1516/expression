@@ -7,6 +7,7 @@ import torch
 
 from scripts.model_test import (
     parse_meme_motifs,
+    resolve_max_pairs_per_gene,
     select_top_expressed_pairs,
     shuffle_expression_batch,
     shuffle_promoter_batch,
@@ -28,6 +29,29 @@ def test_select_top_expressed_pairs_respects_gene_cap(tiny_data_dir) -> None:
     assert len(top_pairs) <= 5
     assert top_pairs.groupby("gene_id").size().max() <= 2
     assert int(top_pairs["max_pairs_per_gene"].iloc[0]) == 2
+
+
+def test_select_top_expressed_pairs_respects_absolute_gene_cap(tiny_data_dir) -> None:
+    dataset = MyDataset(tiny_data_dir / "promoter_train.csv", tiny_data_dir / "integrated_data.h5ad")
+
+    top_pairs = select_top_expressed_pairs(
+        dataset,
+        top_n=5,
+        max_pairs_per_gene_ratio=1.0,
+        max_pairs_per_gene=1,
+    )
+
+    assert len(top_pairs) <= 5
+    assert top_pairs.groupby("gene_id").size().max() <= 1
+    assert int(top_pairs["max_pairs_per_gene"].iloc[0]) == 1
+
+
+def test_resolve_max_pairs_per_gene_combines_ratio_and_absolute_caps() -> None:
+    assert resolve_max_pairs_per_gene(top_n=1000, max_pairs_per_gene_ratio=0.02, max_pairs_per_gene=20) == 20
+    assert resolve_max_pairs_per_gene(top_n=1000, max_pairs_per_gene_ratio=0.10, max_pairs_per_gene=20) == 20
+    assert resolve_max_pairs_per_gene(top_n=1000, max_pairs_per_gene_ratio=0.02, max_pairs_per_gene=5) == 5
+    assert resolve_max_pairs_per_gene(top_n=10, max_pairs_per_gene_ratio=0.01, max_pairs_per_gene=20) == 1
+    assert resolve_max_pairs_per_gene(top_n=100, max_pairs_per_gene_ratio=0.02, max_pairs_per_gene=0) == 2
 
 
 def test_update_spearman_reservoir_all_samples_and_limited_samples() -> None:

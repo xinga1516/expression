@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=0, help="0 means evaluate all test samples.")
     parser.add_argument("--spearman-samples", type=int, default=1_000_000, help="Reservoir sample size for Spearman. 0 means store all samples.")
     parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode test promoters in memory.")
+    parser.add_argument("--use-cell-split", action="store_true", default=False, help="Use cell_test.txt to restrict evaluated test cells.")
+    parser.add_argument("--cell-split-dir", type=str, default=None, help="Directory containing cell_test.txt. Default: resolved data directory.")
     parser.add_argument("--skip-standard-test", action="store_true", default=False, help="Skip metrics/scatter and only run requested extra analyses.")
     parser.add_argument("--run-input-ablation", action="store_true", default=False, help="Run promoter/expression input shuffling tests.")
     parser.add_argument("--ablation-repeats", type=int, default=3, help="Random repeats for input ablation.")
@@ -49,7 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-mutagenesis", action="store_true", default=False, help="Run in silico point-mutagenesis on top expressed test promoter-cell pairs.")
     parser.add_argument("--top-n", type=int, default=100, help="Top expressed promoter-cell pairs for mutagenesis.")
     parser.add_argument("--mutation-batch-size", type=int, default=512, help="Batch size for mutated promoter forward passes.")
-    parser.add_argument("--max-pairs-per-gene-ratio", type=float, default=0.1, help="Maximum fraction of mutagenesis top_n pairs allowed for one gene_id.")
+    parser.add_argument("--max-pairs-per-gene-ratio", type=float, default=0.02, help="Maximum fraction of mutagenesis top_n pairs allowed for one gene_id.")
+    parser.add_argument("--max-pairs-per-gene", type=int, default=20, help="Absolute maximum mutagenesis top pairs allowed for one gene_id. <=0 disables this cap.")
     parser.add_argument("--motif-window-size", type=int, default=9, help="Window size for de novo motif extraction around important positions.")
     parser.add_argument("--motif-top-windows", type=int, default=200, help="Number of top important windows used for motif outputs.")
     parser.add_argument("--motif-top-k", type=int, default=20, help="Number of de novo motif sequences to report.")
@@ -75,6 +78,25 @@ def resolve_data_dir(base_dir: Path, cfg: dict[str, Any], data_arg: str | None) 
     if data_arg is None:
         raise ValueError("--data is required when config.json has no scrna_file")
     return base_dir / "data" / data_arg
+
+
+def resolve_cell_split_dir(base_dir: Path, data_dir: Path, cell_split_dir: str | None) -> Path:
+    if cell_split_dir is None:
+        return data_dir
+    path = Path(cell_split_dir)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
+
+def read_cell_split(cell_split_dir: Path, split: str) -> np.ndarray:
+    split_path = cell_split_dir / f"cell_{split}.txt"
+    if not split_path.exists():
+        raise FileNotFoundError(f"Cell split file not found: {split_path}")
+    cells = [line.strip() for line in split_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not cells:
+        raise ValueError(f"Cell split file is empty: {split_path}")
+    return np.asarray(cells, dtype=object)
 
 
 def build_test_model(cfg: dict[str, Any], expr_dim: int, checkpoint: Path, device: torch.device) -> torch.nn.Module:
@@ -110,13 +132,29 @@ def compute_target_values(dataset: MyDataset, cell_rows: np.ndarray, gene_idx: i
     return values.astype(np.float64, copy=False)
 
 
-def select_top_expressed_pairs(dataset: MyDataset, top_n: int, max_pairs_per_gene_ratio: float) -> pd.DataFrame:
+def resolve_max_pairs_per_gene(top_n: int, max_pairs_per_gene_ratio: float, max_pairs_per_gene: int | None) -> int:
     if top_n <= 0:
         raise ValueError("top_n must be > 0")
     if max_pairs_per_gene_ratio <= 0:
         raise ValueError("max_pairs_per_gene_ratio must be > 0")
+    ratio_cap = max(1, int(math.floor(top_n * max_pairs_per_gene_ratio)))
+    if max_pairs_per_gene is None or max_pairs_per_gene <= 0:
+        return ratio_cap
+    return max(1, min(ratio_cap, int(max_pairs_per_gene)))
 
-    max_pairs_per_gene = max(1, int(math.floor(top_n * max_pairs_per_gene_ratio)))
+
+def select_top_expressed_pairs(
+    dataset: MyDataset,
+    top_n: int,
+    max_pairs_per_gene_ratio: float,
+    max_pairs_per_gene: int | None = None,
+) -> pd.DataFrame:
+    max_pairs_per_gene_resolved = resolve_max_pairs_per_gene(
+        top_n=top_n,
+        max_pairs_per_gene_ratio=max_pairs_per_gene_ratio,
+        max_pairs_per_gene=max_pairs_per_gene,
+    )
+
 
     x_csc = dataset.X.tocsc()
     totals = np.asarray(dataset.X.sum(axis=1)).ravel().astype(np.float64)
@@ -139,7 +177,7 @@ def select_top_expressed_pairs(dataset: MyDataset, top_n: int, max_pairs_per_gen
                 continue
             item = (float(score), int(pro_i), int(cell_pos), int(cell_row), gene_idx, float(raw_value), gene_id)
             gene_heap = gene_heaps[gene_id]
-            if len(gene_heap) < max_pairs_per_gene:
+            if len(gene_heap) < max_pairs_per_gene_resolved:
                 heapq.heappush(gene_heap, item)
             elif item[0] > gene_heap[0][0]:
                 heapq.heapreplace(gene_heap, item)
@@ -170,8 +208,9 @@ def select_top_expressed_pairs(dataset: MyDataset, top_n: int, max_pairs_per_gen
             "gene_idx": gene_idx,
             "gene_id": gene_id,
             "gene_pair_count": int(gene_counts[gene_id]),
-            "max_pairs_per_gene": int(max_pairs_per_gene),
+            "max_pairs_per_gene": int(max_pairs_per_gene_resolved),
             "max_pairs_per_gene_ratio": float(max_pairs_per_gene_ratio),
+            "max_pairs_per_gene_absolute": int(max_pairs_per_gene) if max_pairs_per_gene is not None else 0,
             "chrom": promoter_row.get("chrom", ""),
             "start": promoter_row.get("start", ""),
             "end": promoter_row.get("end", ""),
@@ -560,6 +599,7 @@ def run_sequence_mutagenesis(
     top_n: int,
     mutation_batch_size: int,
     max_pairs_per_gene_ratio: float,
+    max_pairs_per_gene: int | None,
     motif_window_size: int,
     motif_top_windows: int,
     motif_top_k: int,
@@ -579,10 +619,34 @@ def run_sequence_mutagenesis(
         dataset,
         top_n=top_n,
         max_pairs_per_gene_ratio=max_pairs_per_gene_ratio,
+        max_pairs_per_gene=max_pairs_per_gene,
     )
     top_pairs.to_csv(mut_dir / f"top{top_n}_pairs.csv", index=False)
     max_pairs = int(top_pairs["max_pairs_per_gene"].iloc[0]) if len(top_pairs) > 0 else 0
-    print(f"[Mutagenesis] Selected {len(top_pairs)} top expressed test pairs with <= {max_pairs} pairs per gene.")
+    if top_pairs.empty:
+        gene_summary = pd.DataFrame(columns=["gene_id", "pair_count", "pair_fraction", "max_target_score", "mean_target_score"])
+        unique_genes = 0
+        top_gene_fraction = 0.0
+    else:
+        gene_summary = (
+            top_pairs
+            .groupby("gene_id", as_index=False)
+            .agg(
+                pair_count=("gene_id", "count"),
+                max_target_score=("target_score", "max"),
+                mean_target_score=("target_score", "mean"),
+            )
+            .sort_values(["pair_count", "max_target_score"], ascending=False)
+        )
+        gene_summary["pair_fraction"] = gene_summary["pair_count"] / max(len(top_pairs), 1)
+        gene_summary = gene_summary[["gene_id", "pair_count", "pair_fraction", "max_target_score", "mean_target_score"]]
+        unique_genes = int(gene_summary["gene_id"].nunique())
+        top_gene_fraction = float(gene_summary["pair_fraction"].max())
+    gene_summary.to_csv(mut_dir / "top_pairs_gene_summary.csv", index=False)
+    print(
+        f"[Mutagenesis] Selected {len(top_pairs)} top expressed test pairs with <= {max_pairs} pairs per gene. "
+        f"unique_genes={unique_genes}, top_gene_fraction={top_gene_fraction:.4f}"
+    )
 
     long_rows: list[dict[str, Any]] = []
     model.eval()
@@ -1130,9 +1194,16 @@ def main() -> None:
 
     loss_type = cfg.get("loss_type", "mse")
     is_umi = data_dir.name.startswith("umi_") and loss_type != "zinb"
+    test_cell_ids = None
+    cell_split_dir = None
+    if args.use_cell_split:
+        cell_split_dir = resolve_cell_split_dir(base_dir, data_dir, args.cell_split_dir)
+        test_cell_ids = read_cell_split(cell_split_dir, "test")
+        print(f"Using cell split from {cell_split_dir}: test_cells={len(test_cell_ids)}")
     dataset = MyDataset(
         promoter_file=data_dir / "promoter_test.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
+        cell_ids_subset=test_cell_ids,
         mode="test",
         seed=args.seed,
         log1p_cpm_target=is_umi,
@@ -1166,6 +1237,9 @@ def main() -> None:
             "checkpoint": str(checkpoint),
             "loss_type": loss_type,
             "max_samples": int(args.max_samples),
+            "use_cell_split": bool(args.use_cell_split),
+            "cell_split_dir": str(cell_split_dir) if cell_split_dir is not None else None,
+            "test_cells": int(dataset.C),
         })
 
         metrics_path = test_dir / "test_metrics.json"
@@ -1218,6 +1292,7 @@ def main() -> None:
             top_n=args.top_n,
             mutation_batch_size=args.mutation_batch_size,
             max_pairs_per_gene_ratio=args.max_pairs_per_gene_ratio,
+            max_pairs_per_gene=args.max_pairs_per_gene,
             motif_window_size=args.motif_window_size,
             motif_top_windows=args.motif_top_windows,
             motif_top_k=args.motif_top_k,

@@ -269,12 +269,15 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "ema_alpha": getattr(args, "ema_alpha", 0.9),
         "cell_ratio": getattr(args, "cell_ratio", 1.0),
         "val_cell_ratio": getattr(args, "val_cell_ratio", 1.0),
+        "use_cell_split": getattr(args, "use_cell_split", False),
+        "cell_split_dir": getattr(args, "cell_split_dir", None),
         "max_duplication": getattr(args, "max_duplication", 1.0),
         "loss_type": getattr(args, "loss", "mse"),
         "pearson_lambda": getattr(args, "pearson_lambda", 1.0),
         "use_vae": getattr(args, "vae_encoder", None) is not None,
         "vae_encoder_path": getattr(args, "vae_encoder", None),
         "vae_fine_tune": getattr(args, "vae_fine_tune", False),
+        "vae_fine_tune_start_epoch": getattr(args, "vae_fine_tune_start_epoch", -1),
         "fusion": getattr(args, "fusion", "gate"),
         "preencode_promoters": getattr(args, "preencode_promoters", False),
         "amp": getattr(args, "amp", False),
@@ -937,6 +940,15 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
                 ax1.plot(endpoints[:n_pts], ema_arr[:n_pts], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
         else:
             ax1.plot(df_epoch["epoch"], df_epoch["val_loss_ema"], color="red", linewidth=1.5, linestyle="--", label="Val Loss (EMA)")
+    vae_start_epoch = get_vae_fine_tune_start_epoch_from_log(df_epoch)
+    if vae_start_epoch is not None:
+        if step_log_file.exists() and "step_bounds" in locals() and vae_start_epoch in step_bounds.index:
+            marker_x = float(step_bounds.loc[vae_start_epoch, "min"])
+            label = f"VAE fine-tune (epoch {vae_start_epoch})"
+        else:
+            marker_x = float(vae_start_epoch)
+            label = f"VAE fine-tune"
+        ax1.axvline(marker_x, color="purple", linestyle=":", linewidth=1.5, label=label)
     ax1.legend(loc="upper right")
     ax1.tick_params(axis="y", labelcolor=val_color)
 
@@ -947,6 +959,33 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
         print(f"Loss curve saved to: {save_path}")
     plt.close()
+
+
+def get_vae_fine_tune_start_epoch_from_log(df: pd.DataFrame) -> int | None:
+    if "vae_fine_tune_active" in df.columns:
+        active = pd.to_numeric(df["vae_fine_tune_active"], errors="coerce").fillna(0)
+        active_rows = df.loc[active > 0, "epoch"]
+        if not active_rows.empty:
+            return int(active_rows.iloc[0])
+    if "vae_fine_tune_start_epoch" in df.columns:
+        starts = pd.to_numeric(df["vae_fine_tune_start_epoch"], errors="coerce")
+        starts = starts[starts >= 0]
+        if not starts.empty:
+            return int(starts.iloc[0])
+    return None
+
+
+def add_vae_fine_tune_epoch_marker(ax: Any, df: pd.DataFrame) -> None:
+    vae_start_epoch = get_vae_fine_tune_start_epoch_from_log(df)
+    if vae_start_epoch is None:
+        return
+    ax.axvline(
+        vae_start_epoch,
+        color="purple",
+        linestyle=":",
+        linewidth=1.5,
+        label=f"VAE fine-tune (epoch {vae_start_epoch})",
+    )
 
 
 def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None) -> None:
@@ -967,6 +1006,7 @@ def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None)
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Normalized Loss")
     ax1.set_title("Non-Zero Sample Loss")
+    add_vae_fine_tune_epoch_marker(ax1, df)
     ax1.legend()
 
     ax2.plot(df["epoch"], df["train_loss_zero"] / z_max, label="Train Zero")
@@ -974,6 +1014,7 @@ def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None)
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Normalized Loss")
     ax2.set_title("Zero Sample Loss")
+    add_vae_fine_tune_epoch_marker(ax2, df)
     ax2.legend()
 
     plt.tight_layout()
@@ -1002,19 +1043,23 @@ def plot_val_metrics(log_file: Path, save_path: Path | None = None) -> None:
 
     plot_idx = 0
     if has_pearson:
-        axes[plot_idx].plot(df["epoch"], df["val_pearson_nonzero"], "o-", markersize=4)
+        axes[plot_idx].plot(df["epoch"], df["val_pearson_nonzero"], "o-", markersize=4, label="Pearson")
         axes[plot_idx].axhline(0, color="gray", linestyle="--", linewidth=0.5)
+        add_vae_fine_tune_epoch_marker(axes[plot_idx], df)
         axes[plot_idx].set_xlabel("Epoch")
         axes[plot_idx].set_ylabel("Pearson r")
         axes[plot_idx].set_title("Non-Zero Sample Pearson Correlation")
+        axes[plot_idx].legend()
         plot_idx += 1
 
     if has_acc:
-        axes[plot_idx].plot(df["epoch"], df["val_zero_accuracy"], "s-", markersize=4)
+        axes[plot_idx].plot(df["epoch"], df["val_zero_accuracy"], "s-", markersize=4, label="Zero accuracy")
+        add_vae_fine_tune_epoch_marker(axes[plot_idx], df)
         axes[plot_idx].set_xlabel("Epoch")
         axes[plot_idx].set_ylabel("Accuracy")
         axes[plot_idx].set_ylim(0, 1)
         axes[plot_idx].set_title("Zero Sample Accuracy ($|\\hat{y}| < \\epsilon$)")
+        axes[plot_idx].legend()
         plot_idx += 1
 
     plt.tight_layout()

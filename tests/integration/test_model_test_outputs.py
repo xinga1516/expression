@@ -56,6 +56,7 @@ def test_model_test_metrics_and_tiny_mutagenesis_outputs(tiny_data_dir, tmp_path
         top_n=4,
         mutation_batch_size=128,
         max_pairs_per_gene_ratio=0.5,
+        max_pairs_per_gene=2,
         motif_window_size=9,
         motif_top_windows=4,
         motif_top_k=10,
@@ -68,6 +69,7 @@ def test_model_test_metrics_and_tiny_mutagenesis_outputs(tiny_data_dir, tmp_path
 
     mut_dir = tmp_path / "sequence_mutagenesis"
     assert (mut_dir / "top4_pairs.csv").exists()
+    assert (mut_dir / "top_pairs_gene_summary.csv").exists()
     assert (mut_dir / "mutation_effects_long.csv").exists()
     assert (mut_dir / "position_importance.csv").exists()
     assert (mut_dir / "motif_windows.csv").exists()

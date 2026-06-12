@@ -16,8 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
     "script",
     [
         "scripts/train.py",
+        "scripts/annotate_emtab_cells.py",
         "scripts/evaluate.py",
         "scripts/model_test.py",
+        "scripts/pretrain_scvi.py",
         "scripts/project_test.py",
     ],
 )

@@ -44,6 +44,25 @@ def dataloader_worker_kwargs(num_workers: int, prefetch_factor: int) -> dict[str
     return kwargs
 
 
+def resolve_cell_split_dir(base_dir: Path, data_name: str, cell_split_dir: str | None) -> Path:
+    if cell_split_dir is None:
+        return base_dir / "data" / data_name
+    path = Path(cell_split_dir)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
+
+def read_cell_split(cell_split_dir: Path, split: str) -> np.ndarray:
+    split_path = cell_split_dir / f"cell_{split}.txt"
+    if not split_path.exists():
+        raise FileNotFoundError(f"Cell split file not found: {split_path}")
+    cells = [line.strip() for line in split_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not cells:
+        raise ValueError(f"Cell split file is empty: {split_path}")
+    return np.asarray(cells, dtype=object)
+
+
 def count_model_parameters(model: nn.Module) -> tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -77,6 +96,43 @@ def print_training_resource_summary(
         f"cell_ratio={cell_ratio} val_cell_ratio={val_cell_ratio}"
     )
     print(f"num_workers={num_workers} prefetch_factor={prefetch_factor} amp={amp}")
+
+
+def set_vae_trainable(model: nn.Module, trainable: bool) -> bool:
+    if not hasattr(model, "vae_encoder"):
+        return False
+    vae_encoder = getattr(model, "vae_encoder")
+    for param in vae_encoder.parameters():
+        param.requires_grad = trainable
+    if hasattr(model, "vae_fine_tune"):
+        setattr(model, "vae_fine_tune", trainable)
+    if trainable:
+        vae_encoder.train()
+    else:
+        vae_encoder.eval()
+    return trainable
+
+
+def count_vae_parameters(model: nn.Module) -> tuple[int, int]:
+    if not hasattr(model, "vae_encoder"):
+        return 0, 0
+    vae_encoder = getattr(model, "vae_encoder")
+    total = sum(param.numel() for param in vae_encoder.parameters())
+    trainable = sum(param.numel() for param in vae_encoder.parameters() if param.requires_grad)
+    return total, trainable
+
+
+def apply_vae_fine_tune_schedule(
+    model: nn.Module,
+    epoch: int,
+    vae_fine_tune_start_epoch: int,
+    force_initial_fine_tune: bool,
+) -> bool:
+    if force_initial_fine_tune:
+        return set_vae_trainable(model, True)
+    if vae_fine_tune_start_epoch < 0:
+        return set_vae_trainable(model, False)
+    return set_vae_trainable(model, epoch >= vae_fine_tune_start_epoch)
 
 class ZINBLoss(nn.Module):
     '''Zero-inflated negative binomial negative log-likelihood, computed entirely
@@ -183,6 +239,8 @@ def train_model(
     loss_type="mse",
     pearson_lambda=1.0,
     amp: bool = False,
+    vae_fine_tune_start_epoch: int = -1,
+    force_vae_fine_tune: bool = False,
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -196,6 +254,22 @@ def train_model(
         print("[AMP] requested but CUDA is unavailable; running in FP32.")
     elif amp_enabled:
         print("[AMP] enabled.")
+    vae_trainable = apply_vae_fine_tune_schedule(
+        model,
+        epoch=0,
+        vae_fine_tune_start_epoch=vae_fine_tune_start_epoch,
+        force_initial_fine_tune=force_vae_fine_tune,
+    )
+    if hasattr(model, "vae_encoder"):
+        status = "trainable" if vae_trainable else "frozen"
+        vae_total, vae_trainable_params = count_vae_parameters(model)
+        if force_vae_fine_tune:
+            print(f"[VAE] fine-tune enabled from epoch 0 ({status}).")
+        elif vae_fine_tune_start_epoch >= 0:
+            print(f"[VAE] fine-tune scheduled at epoch {vae_fine_tune_start_epoch}; initial status={status}.")
+        else:
+            print(f"[VAE] fine-tune disabled; initial status={status}.")
+        print(f"[VAE] encoder params: total={vae_total:,} trainable={vae_trainable_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=1e-2)
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -252,6 +326,17 @@ def train_model(
             )
             print(f"[Resume] loaded: {resume_ckpt} | start_epoch={start_epoch} | best_score={earlystopping.best_score}")
             earlystopping.early_stop = False
+            resume_vae_trainable = apply_vae_fine_tune_schedule(
+                model,
+                epoch=start_epoch,
+                vae_fine_tune_start_epoch=vae_fine_tune_start_epoch,
+                force_initial_fine_tune=force_vae_fine_tune,
+            )
+            if hasattr(model, "vae_encoder") and resume_vae_trainable != vae_trainable:
+                vae_trainable = resume_vae_trainable
+                vae_total, vae_trainable_params = count_vae_parameters(model)
+                print(f"[VAE] resume adjusted fine-tune status: {'trainable' if vae_trainable else 'frozen'} at epoch {start_epoch}.")
+                print(f"[VAE] encoder params: total={vae_total:,} trainable={vae_trainable_params:,}")
         else:
             print(f"[Resume] checkpoint not found, start from scratch: {resume_ckpt}")
 
@@ -263,6 +348,18 @@ def train_model(
 
     # Training loop — validate first (captures initial loss at epoch 0), then train
     for epoch in range(start_epoch, epochs):
+        epoch_vae_trainable = apply_vae_fine_tune_schedule(
+            model,
+            epoch=epoch,
+            vae_fine_tune_start_epoch=vae_fine_tune_start_epoch,
+            force_initial_fine_tune=force_vae_fine_tune,
+        )
+        if hasattr(model, "vae_encoder") and epoch_vae_trainable != vae_trainable:
+            vae_trainable = epoch_vae_trainable
+            vae_total, vae_trainable_params = count_vae_parameters(model)
+            print(f"[VAE] fine-tune {'enabled' if vae_trainable else 'disabled'} at epoch {epoch}.")
+            print(f"[VAE] encoder params: total={vae_total:,} trainable={vae_trainable_params:,}")
+
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
         
@@ -432,6 +529,9 @@ def train_model(
             log_msg += f" | LstmVar={epoch_lstm_var:.4f}"
         if not math.isnan(epoch_expr_var):
             log_msg += f" | ExprVar={epoch_expr_var:.4f}"
+        if hasattr(model, "vae_encoder"):
+            vae_total, vae_trainable_params = count_vae_parameters(model)
+            log_msg += f" | VAE={'on' if vae_trainable else 'off'}({vae_trainable_params}/{vae_total})"
         print(log_msg)
 
         utils.append_epoch_log(
@@ -450,6 +550,10 @@ def train_model(
             val_zero_accuracy=epoch_val_zero_acc,
             lstm_var=epoch_lstm_var,
             expr_var=epoch_expr_var,
+            vae_fine_tune_active=int(vae_trainable) if hasattr(model, "vae_encoder") else None,
+            vae_trainable_params=count_vae_parameters(model)[1] if hasattr(model, "vae_encoder") else None,
+            vae_total_params=count_vae_parameters(model)[0] if hasattr(model, "vae_encoder") else None,
+            vae_fine_tune_start_epoch=vae_fine_tune_start_epoch if hasattr(model, "vae_encoder") else None,
         )
 
         # Update best metric and early-stopping counter (uses EMA-smoothed loss)
@@ -617,11 +721,14 @@ def main():
     parser.add_argument("--ema-alpha", type=float, default=0.9, help="EMA smoothing factor for validation loss (0=use raw, higher=smoother)")
     parser.add_argument("--cell-ratio", type=float, default=1.0, help="Fraction of cells to randomly subsample (0-1). Useful for reducing memory usage with processed data + ZeroNonZeroSampler")
     parser.add_argument("--val-cell-ratio", type=float, default=0.5, help="Fraction of cells for the validation dataset (0-1). Default 1.0 (no subsampling) since val uses fewer samples.")
+    parser.add_argument("--use-cell-split", action="store_true", default=False, help="Use cell_train.txt and cell_val.txt to restrict train/validation cells.")
+    parser.add_argument("--cell-split-dir", type=str, default=None, help="Directory containing cell_train.txt/cell_val.txt. Default: data/<data>.")
     parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined", "zinb"], help="Loss function: 'mse', 'pearson', 'combined', or 'zinb' (ZINB distribution loss)")
     parser.add_argument("--fusion", type=str, default="gate", choices=["concat", "gate"], help="Fusion method for combining LSTM and expression features")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
+    parser.add_argument("--vae-fine-tune-start-epoch", type=int, default=-1, help="Epoch to start fine-tuning the VAE encoder. -1 keeps current freeze/unfreeze behavior.")
     args = parser.parse_args()
 
     # # 允许 cuDNN 自动寻找最适合当前配置的算法（提高速度）
@@ -632,11 +739,22 @@ def main():
     print("start")
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "data" / args.data
+    train_cell_ids = None
+    val_cell_ids = None
+    if args.use_cell_split:
+        cell_split_dir = resolve_cell_split_dir(base_dir, args.data, args.cell_split_dir)
+        train_cell_ids = read_cell_split(cell_split_dir, "train")
+        val_cell_ids = read_cell_split(cell_split_dir, "val")
+        print(
+            f"Using cell split from {cell_split_dir}: "
+            f"train_cells={len(train_cell_ids)} val_cells={len(val_cell_ids)}"
+        )
 
     use_log1p = args.data.startswith("umi_") and args.loss != "zinb"
     train_dataset = MyDataset(
         promoter_file=data_dir / "promoter_train.csv",
         scrna_file=data_dir / "integrated_data.h5ad",
+        cell_ids_subset=train_cell_ids,
         cell_ratio=args.cell_ratio,
         log1p_cpm_target=use_log1p,
         preencode_promoters=args.preencode_promoters,
@@ -646,6 +764,7 @@ def main():
         scrna_file=data_dir / "integrated_data.h5ad",
         mode="val",
         seed=args.seed,
+        cell_ids_subset=val_cell_ids,
         cell_ratio=args.val_cell_ratio,
         log1p_cpm_target=use_log1p,
         preencode_promoters=args.preencode_promoters,
@@ -834,6 +953,8 @@ def main():
         loss_type=args.loss,
         pearson_lambda=args.pearson_lambda,
         amp=args.amp,
+        vae_fine_tune_start_epoch=args.vae_fine_tune_start_epoch,
+        force_vae_fine_tune=args.vae_fine_tune,
     )
  
     if args.plot_loss:

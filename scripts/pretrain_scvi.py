@@ -32,6 +32,80 @@ import scanpy as sc
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_CHOICES = [
+    "umi_processed",
+    "umi_highquality",
+    "processed",
+    "log_processed",
+    "emtab",
+    "umi_E-MTAB-10519-hqcells",
+    "umi_E-MTAB-10519-hqcells_aug15",
+    "umi_E-MTAB-10519-hqcells_aug20",
+]
+
+
+def resolve_pretrain_data_path(project_root: Path, data_name: str) -> Path:
+    if data_name == "emtab":
+        current = project_root / "data" / "umi_E-MTAB-10519-hqcells" / "integrated_data.h5ad"
+        if current.exists():
+            return current
+        return project_root / "data" / "E-MTAB-10519-hqcells" / "integrated_data.h5ad"
+    return project_root / "data" / data_name / "integrated_data.h5ad"
+
+
+def default_out_name(data_name: str) -> str:
+    return "E-MTAB10519_VAE" if data_name == "emtab" else f"scvi_{data_name}"
+
+
+def resolve_cell_split_dir(project_root: Path, data_name: str, cell_split_dir: str | None) -> Path:
+    if cell_split_dir is None:
+        return resolve_pretrain_data_path(project_root, data_name).parent
+    path = Path(cell_split_dir)
+    if not path.is_absolute():
+        path = project_root / path
+    return path
+
+
+def read_cell_split(cell_split_dir: Path, split: str = "train") -> list[str]:
+    split_path = cell_split_dir / f"cell_{split}.txt"
+    if not split_path.exists():
+        raise FileNotFoundError(f"Cell split file not found: {split_path}")
+    cells = [line.strip() for line in split_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not cells:
+        raise ValueError(f"Cell split file is empty: {split_path}")
+    return cells
+
+
+def subset_adata_to_cells(adata: Any, cell_ids: list[str]) -> Any:
+    idx = adata.obs_names.get_indexer(cell_ids)
+    if (idx < 0).any():
+        missing = [cell_ids[i] for i in np.flatnonzero(idx < 0)[:5]]
+        raise ValueError(f"Some cell ids not found in AnnData obs_names, e.g. {missing}")
+    return adata[idx, :].copy()
+
+
+def build_scvi_config(
+    n_genes: int,
+    n_latent: int,
+    n_hidden: int,
+    n_layers: int,
+    dropout_rate: float,
+    data_name: str,
+    use_cell_split: bool,
+    cell_split_dir: str | None,
+    train_cell_count: int,
+) -> dict[str, Any]:
+    return {
+        "n_input": int(n_genes),
+        "n_latent": int(n_latent),
+        "n_hidden": int(n_hidden),
+        "n_layers": int(n_layers),
+        "dropout_rate": float(dropout_rate),
+        "data": data_name,
+        "use_cell_split": bool(use_cell_split),
+        "cell_split_dir": cell_split_dir,
+        "train_cell_count": int(train_cell_count),
+    }
 
 
 def plot_loss_curves(history: dict, save_path: Path) -> None:
@@ -174,8 +248,14 @@ def evaluate_reconstruction(model: Any, adata: Any, save_path: Path, n_cells: in
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pretrain scVI on scRNA-seq data")
     parser.add_argument("--data", type=str, default="umi_highquality",
-                        choices=["umi_processed", "umi_highquality", "processed", "log_processed", "emtab"],
+                        choices=DATA_CHOICES,
                         help="Data version (umi_* = raw UMI counts; emtab = E-MTAB-10519)")
+    parser.add_argument("--out-name", type=str, default=None,
+                        help="Output directory name under outputs/. Default: scvi_<data> or E-MTAB10519_VAE for emtab.")
+    parser.add_argument("--use-cell-split", action="store_true", default=False,
+                        help="Use cell_train.txt to restrict scVI pretraining cells.")
+    parser.add_argument("--cell-split-dir", type=str, default=None,
+                        help="Directory containing cell_train.txt. Default: selected data directory.")
     parser.add_argument("--n-latent", type=int, default=128,
                         help="Latent dimension")
     parser.add_argument("--n-hidden", type=int, default=512,
@@ -207,21 +287,29 @@ def main() -> None:
     if args.load_model and not Path(args.load_model).exists():
         raise FileNotFoundError(f"Model dir not found: {args.load_model}")
 
-    if args.data == "emtab":
-        data_path = PROJECT_ROOT / "data" / "E-MTAB-10519-hqcells" / "integrated_data.h5ad"
-    else:
-        data_path = PROJECT_ROOT / "data" / args.data / "integrated_data.h5ad"
+    data_path = resolve_pretrain_data_path(PROJECT_ROOT, args.data)
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
 
-    out_name = "E-MTAB10519_VAE" if args.data == "emtab" else f"scvi_{args.data}"
+    out_name = args.out_name or default_out_name(args.data)
     eval_dir = PROJECT_ROOT / "outputs" / out_name / "evaluation"
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading data: {data_path}")
     adata = sc.read(data_path)
+    original_n_cells, n_genes = adata.shape
+    print(f"  Cells: {original_n_cells}, Genes: {n_genes}")
+
+    cell_split_dir_str = None
+    if args.use_cell_split:
+        cell_split_dir = resolve_cell_split_dir(PROJECT_ROOT, args.data, args.cell_split_dir)
+        cell_ids = read_cell_split(cell_split_dir, "train")
+        adata = subset_adata_to_cells(adata, cell_ids)
+        cell_split_dir_str = str(cell_split_dir)
+        print(f"  Using cell split from {cell_split_dir}: train_cells={adata.n_obs}")
+
     n_cells, n_genes = adata.shape
-    print(f"  Cells: {n_cells}, Genes: {n_genes}")
+    print(f"  Pretraining cells: {n_cells} / {original_n_cells}")
 
     # Ensure integer raw UMI counts for scVI ZINB model
     if "counts" in adata.layers:
@@ -315,13 +403,17 @@ def main() -> None:
     print(f"Saving encoder weights to {encoder_path}")
     torch.save(model.module.z_encoder.state_dict(), encoder_path)
 
-    config = {
-        "n_input": n_genes,
-        "n_latent": n_latent_saved,
-        "n_hidden": n_hidden_saved,
-        "n_layers": n_layers_saved,
-        "dropout_rate": args.dropout_rate,
-    }
+    config = build_scvi_config(
+        n_genes=n_genes,
+        n_latent=n_latent_saved,
+        n_hidden=n_hidden_saved,
+        n_layers=n_layers_saved,
+        dropout_rate=args.dropout_rate,
+        data_name=args.data,
+        use_cell_split=args.use_cell_split,
+        cell_split_dir=cell_split_dir_str,
+        train_cell_count=n_cells,
+    )
     config_path = out_dir / "config.json"
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
