@@ -291,6 +291,10 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "input_gene_panel_file": str(getattr(args, "input_gene_panel_file", None)) if getattr(args, "input_gene_panel_file", None) is not None else None,
         "checkpoint_metric": getattr(args, "checkpoint_metric", "val_loss_ema"),
         "run_test_after_train": getattr(args, "run_test_after_train", False),
+        "contrastive_weight": getattr(args, "contrastive_weight", 0.0),
+        "contrastive_margin": getattr(args, "contrastive_margin", 1.0),
+        "contrastive_negative_column": getattr(args, "contrastive_negative_column", "control_sequence"),
+        "contrastive_normalize": not getattr(args, "no_contrastive_normalize", False),
     })
 
     with open(config_path, "w", encoding="utf-8") as f:
@@ -453,7 +457,7 @@ def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, lear
 
     # test if dataset and dataloader work well
     batch = next(iter(train_loader))
-    promoters, exprs, ys = batch  # (batch, 400, 5), (batch, 16300), (batch,)
+    promoters, exprs, ys = batch[:3]  # (batch, 400, 5), (batch, 16300), (batch,)
     print(promoters.shape, exprs.shape, ys.shape)
     ys = ys.float()
     #记录一个 LSTM 参数训练前的值
@@ -465,7 +469,7 @@ def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, lear
     losses = []
     for step in range(steps):
         batch = next(iter(train_loader))
-        promoters, exprs, ys = batch
+        promoters, exprs, ys = batch[:3]
         ys = ys.float()
 
         optimizer.zero_grad()

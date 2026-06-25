@@ -59,11 +59,13 @@ class MyDataset(Dataset):
         sequence_column: str = "sequence",
         input_gene_ids: Optional[Sequence[str]] = None,
         input_gene_panel_file: Optional[str | Path] = None,
+        return_indices: bool = False,
     ) -> None:
         self.promoter_file = Path(promoter_file)
         self.scrna_file = Path(scrna_file)
         self.promoters = pd.read_csv(promoter_file)
         self.sequence_column = sequence_column
+        self.return_indices = bool(return_indices)
         if self.sequence_column not in self.promoters.columns:
             raise ValueError(
                 f"Sequence column {self.sequence_column!r} not found in {self.promoter_file}. "
@@ -196,17 +198,33 @@ class MyDataset(Dataset):
     def __len__(self) -> int:
         return self.P * self.C
 
-    def get_promoter_tensor(self, pro_i: int) -> torch.Tensor:
-        if self.promoter_tensor is not None:
+    def has_sequence_column(self, column: str) -> bool:
+        return column in self.promoters.columns
+
+    def get_sequence_tensor(self, pro_i: int, column: str | None = None) -> torch.Tensor:
+        sequence_column = self.sequence_column if column is None else column
+        if sequence_column not in self.promoters.columns:
+            raise ValueError(
+                f"Sequence column {sequence_column!r} not found in {self.promoter_file}. "
+                f"Available columns: {sorted(self.promoters.columns)}"
+            )
+        if self.promoter_tensor is not None and sequence_column == self.sequence_column:
             return self.promoter_tensor[pro_i]
-        seq = str(self.promoters[self.sequence_column].iloc[pro_i])
+        seq = str(self.promoters[sequence_column].iloc[pro_i])
         return self.promoter_encoder(seq)
 
-    def get_promoter_tensors(self, pro_indices: np.ndarray | list[int]) -> torch.Tensor:
-        if self.promoter_tensor is not None:
+    def get_promoter_tensor(self, pro_i: int) -> torch.Tensor:
+        return self.get_sequence_tensor(pro_i, self.sequence_column)
+
+    def get_sequence_tensors(self, pro_indices: np.ndarray | list[int], column: str | None = None) -> torch.Tensor:
+        sequence_column = self.sequence_column if column is None else column
+        if self.promoter_tensor is not None and sequence_column == self.sequence_column:
             return self.promoter_tensor[pro_indices]
-        tensors = [self.get_promoter_tensor(int(pro_i)) for pro_i in pro_indices]
+        tensors = [self.get_sequence_tensor(int(pro_i), sequence_column) for pro_i in pro_indices]
         return torch.stack(tensors, dim=0)
+
+    def get_promoter_tensors(self, pro_indices: np.ndarray | list[int]) -> torch.Tensor:
+        return self.get_sequence_tensors(pro_indices, self.sequence_column)
 
     def in_getitem(self, pro_i: int, cell_i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         promoter = self.get_promoter_tensor(pro_i)
@@ -244,9 +262,17 @@ class MyDataset(Dataset):
             expr_input[target_pos] = 0.0
         return expr_input
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         pro_i = idx // self.C
         cell_i = idx % self.C
-        
-        return self.in_getitem(pro_i,cell_i)
+        promoter, expr_input, y = self.in_getitem(pro_i, cell_i)
+        if self.return_indices:
+            return (
+                promoter,
+                expr_input,
+                y,
+                torch.tensor(pro_i, dtype=torch.long),
+                torch.tensor(cell_i, dtype=torch.long),
+            )
+        return promoter, expr_input, y
 

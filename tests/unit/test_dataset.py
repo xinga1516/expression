@@ -183,3 +183,24 @@ def test_gpu_cached_pair_loader_balanced_sampler_covers_promoters_evenly(tiny_da
     assert counts.max().item() == 3
     assert int(cell_idx.min()) >= 0
     assert int(cell_idx.max()) < dataset.C
+def test_dataset_return_indices_and_negative_sequence_tensors(tiny_data_dir) -> None:
+    promoter_path = tiny_data_dir / "promoter_train.csv"
+    promoters = pd.read_csv(promoter_path)
+    promoters["control_sequence"] = ["T" * 400 for _ in range(len(promoters))]
+    promoters.to_csv(promoter_path, index=False)
+    dataset = MyDataset(
+        promoter_file=promoter_path,
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        return_indices=True,
+    )
+
+    promoter, expr, y, pro_i, cell_i = dataset[0]
+    negatives = dataset.get_sequence_tensors([int(pro_i.item())], column="control_sequence")
+
+    assert promoter.shape == (400, 5)
+    assert expr.shape[0] == dataset.expr_dim
+    assert y.ndim == 0
+    assert int(pro_i.item()) == 0
+    assert int(cell_i.item()) == 0
+    assert negatives.shape == (1, 400, 5)
+    assert torch.all(negatives[0, :, 3] == 1.0)

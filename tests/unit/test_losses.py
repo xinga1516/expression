@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from scripts.train import ZINBLoss, pearson_loss, weighted_mse_loss
+from scripts.train import ZINBLoss, pearson_loss, promoter_triplet_contrastive_loss, weighted_mse_loss
 from src.model import MODEL_REGISTRY, build_model
 
 
@@ -65,3 +65,19 @@ def test_zinb_capable_models_output_shapes() -> None:
         assert torch.all(mu_ratio > 0)
         assert torch.all(theta > 0)
         assert torch.all((pi >= 0) & (pi <= 1))
+
+
+def test_promoter_triplet_contrastive_loss_backpropagates() -> None:
+    promoter = torch.zeros(2, 400, 5)
+    promoter[:, :, 0] = 1.0
+    negative = torch.zeros(2, 400, 5)
+    negative[:, :, 3] = 1.0
+    expr = torch.rand(2, 5)
+    model = build_model("CNNFlattenPromoterModel", expr_dim=5, hidden_size=4, output_mode="scalar")
+
+    _ = model(promoter, expr)
+    loss = promoter_triplet_contrastive_loss(model, promoter, negative, margin=0.5)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert model.promoter_conv[0].weight.grad is not None

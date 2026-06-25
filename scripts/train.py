@@ -18,6 +18,7 @@ import torch
 import time
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
@@ -210,6 +211,39 @@ def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1
     return mse + pearson_lambda * p_loss
 
 
+def unpack_training_batch(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Support legacy 3-field batches and contrastive 5-field batches."""
+    if len(batch) == 3:
+        promoters, exprs, ys = batch
+        return promoters, exprs, ys, None, None
+    if len(batch) == 5:
+        promoters, exprs, ys, pro_indices, cell_indices = batch
+        return promoters, exprs, ys, pro_indices, cell_indices
+    raise ValueError(f"Unexpected batch with {len(batch)} fields.")
+
+
+def promoter_triplet_contrastive_loss(
+    model: nn.Module,
+    promoters: torch.Tensor,
+    negative_promoters: torch.Tensor,
+    margin: float = 1.0,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Triplet loss over promoter embeddings: real view, stochastic real view, matched control."""
+    if not hasattr(model, "encode_promoter"):
+        raise ValueError("Contrastive training requires a model with encode_promoter(), e.g. CNNFlattenPromoterModel.")
+    anchor = getattr(model, "last_lstm_out", None)
+    if anchor is None:
+        anchor = model.encode_promoter(promoters)
+    positive = model.encode_promoter(promoters)
+    negative = model.encode_promoter(negative_promoters)
+    if normalize:
+        anchor = F.normalize(anchor, dim=1)
+        positive = F.normalize(positive, dim=1)
+        negative = F.normalize(negative, dim=1)
+    return F.triplet_margin_loss(anchor, positive, negative, margin=margin, p=2)
+
+
 def compute_val_loss_ema(prev_ema: float | None, monitor_loss: float, ema_alpha: float) -> float:
     """Compute the validation-loss EMA used for early stopping and best-model selection."""
     if prev_ema is None:
@@ -259,6 +293,10 @@ def train_model(
     vae_fine_tune_start_epoch: int = -1,
     force_vae_fine_tune: bool = False,
     checkpoint_metric: str = "val_loss_ema",
+    contrastive_weight: float = 0.0,
+    contrastive_margin: float = 1.0,
+    contrastive_negative_column: str = "control_sequence",
+    contrastive_normalize: bool = True,
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -288,6 +326,23 @@ def train_model(
         else:
             print(f"[VAE] fine-tune disabled; initial status={status}.")
         print(f"[VAE] encoder params: total={vae_total:,} trainable={vae_trainable_params:,}")
+
+    contrastive_enabled = contrastive_weight > 0.0
+    if contrastive_enabled:
+        train_ds = train_loader.dataset
+        if not hasattr(model, "encode_promoter"):
+            raise ValueError("Contrastive training requires a model with encode_promoter(), e.g. CNNFlattenPromoterModel.")
+        if not getattr(train_ds, "return_indices", False):
+            raise ValueError("Contrastive training requires MyDataset(return_indices=True).")
+        if not hasattr(train_ds, "has_sequence_column") or not train_ds.has_sequence_column(contrastive_negative_column):
+            raise ValueError(
+                f"Contrastive training requires negative sequence column {contrastive_negative_column!r} "
+                "in the training promoter CSV."
+            )
+        print(
+            f"[Contrastive] enabled: weight={contrastive_weight} margin={contrastive_margin} "
+            f"negative_column={contrastive_negative_column} normalize={contrastive_normalize}"
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=1e-2)
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -334,6 +389,7 @@ def train_model(
     val_losses_nz = []
     val_pearson_nz = []
     val_zero_acc = []
+    train_contrastive_losses = []
 
     # Resume from checkpoint if provided
     if resume_ckpt is not None:
@@ -416,7 +472,7 @@ def train_model(
 
             with torch.no_grad():
                 for batch in val_loader:
-                    promoters, exprs, ys = batch
+                    promoters, exprs, ys, _pro_indices, _cell_indices = unpack_training_batch(batch)
                     promoters = promoters.to(device, non_blocking=True)
                     exprs = exprs.to(device, non_blocking=True)
                     ys = ys.to(device, non_blocking=True).float()
@@ -578,6 +634,7 @@ def train_model(
             vae_trainable_params=count_vae_parameters(model)[1] if hasattr(model, "vae_encoder") else None,
             vae_total_params=count_vae_parameters(model)[0] if hasattr(model, "vae_encoder") else None,
             vae_fine_tune_start_epoch=vae_fine_tune_start_epoch if hasattr(model, "vae_encoder") else None,
+            train_contrastive_loss=train_contrastive_losses[-1] if train_contrastive_losses else float("nan"),
         )
 
         checkpoint_monitor = select_checkpoint_monitor(
@@ -628,18 +685,40 @@ def train_model(
         train_nz_count = 0
         train_zero_sum = 0.0
         train_zero_count = 0
+        train_contrastive_sum = 0.0
+        train_contrastive_count = 0
         epoch_step_losses = []
 
         for batch in train_loader:
-            promoters, exprs, ys = batch
+            promoters, exprs, ys, pro_indices, _cell_indices = unpack_training_batch(batch)
             promoters = promoters.to(device, non_blocking=True)
             exprs = exprs.to(device, non_blocking=True)
             ys = ys.to(device, non_blocking=True).float()
+            negative_promoters = None
+            if contrastive_enabled:
+                if pro_indices is None:
+                    raise ValueError("Contrastive training batch is missing promoter indices.")
+                pro_indices_np = pro_indices.detach().cpu().numpy().astype(np.int64)
+                negative_promoters = train_loader.dataset.get_sequence_tensors(
+                    pro_indices_np,
+                    column=contrastive_negative_column,
+                ).to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             if loss_type == "zinb":
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     mu_ratio, theta, pi = model(promoters, exprs)
+                    contrastive_loss = (
+                        promoter_triplet_contrastive_loss(
+                            model,
+                            promoters,
+                            negative_promoters,
+                            margin=contrastive_margin,
+                            normalize=contrastive_normalize,
+                        )
+                        if contrastive_enabled and negative_promoters is not None
+                        else torch.zeros((), device=device)
+                    )
                 mu_ratio = mu_ratio.squeeze(1)
                 theta = theta.squeeze(1)
                 pi = pi.squeeze(1)
@@ -652,6 +731,17 @@ def train_model(
             else:
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     out = model(promoters, exprs).squeeze(1)
+                    contrastive_loss = (
+                        promoter_triplet_contrastive_loss(
+                            model,
+                            promoters,
+                            negative_promoters,
+                            margin=contrastive_margin,
+                            normalize=contrastive_normalize,
+                        )
+                        if contrastive_enabled and negative_promoters is not None
+                        else torch.zeros((), device=device)
+                    )
                 out = out.float()
                 if loss_type == "pearson":
                     loss = pearson_loss(out, ys)
@@ -659,6 +749,10 @@ def train_model(
                     loss = pearson_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight, pearson_lambda=pearson_lambda)
                 else:
                     loss = weighted_mse_loss(out, ys, nonzero_weight=nonzero_loss_weight)
+            if contrastive_enabled:
+                loss = loss + contrastive_weight * contrastive_loss.float()
+                train_contrastive_sum += float(contrastive_loss.detach().float().item())
+                train_contrastive_count += 1
             if amp_enabled:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -713,6 +807,8 @@ def train_model(
         train_losses.append(avg_train_loss)
         train_losses_zero.append(train_zero_sum / max(train_zero_count, 1))
         train_losses_nz.append(train_nz_sum / max(train_nz_count, 1))
+        avg_train_contrastive_loss = train_contrastive_sum / max(train_contrastive_count, 1)
+        train_contrastive_losses.append(avg_train_contrastive_loss if contrastive_enabled else float("nan"))
 
         utils.append_step_log(step_log_file, epoch_step_losses, epoch, global_step)
         global_step += len(epoch_step_losses)
@@ -764,6 +860,10 @@ def main():
     parser.add_argument("--loss", type=str, default="combined", choices=["mse", "pearson", "combined", "zinb"], help="Loss function: 'mse', 'pearson', 'combined', or 'zinb' (ZINB distribution loss)")
     parser.add_argument("--fusion", type=str, default="gate", choices=["concat", "gate"], help="Fusion method for combining LSTM and expression features")
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
+    parser.add_argument("--contrastive-weight", type=float, default=0.0, help="Stage 2 promoter triplet contrastive loss weight. 0 disables contrastive training.")
+    parser.add_argument("--contrastive-margin", type=float, default=1.0, help="Triplet margin for promoter vs matched intergenic contrastive loss.")
+    parser.add_argument("--contrastive-negative-column", type=str, default="control_sequence", help="Promoter CSV column used as matched negative sequence for contrastive training.")
+    parser.add_argument("--no-contrastive-normalize", action="store_true", default=False, help="Disable L2 normalization before triplet contrastive loss.")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
     parser.add_argument("--vae-fine-tune-start-epoch", type=int, default=-1, help="Epoch to start fine-tuning the VAE encoder. -1 keeps current freeze/unfreeze behavior.")
@@ -781,6 +881,8 @@ def main():
     if not scrna_file.is_absolute():
         scrna_file = base_dir / scrna_file
     args.scrna_file = str(scrna_file)
+    if args.contrastive_weight > 0.0 and args.sequence_column != "sequence":
+        raise ValueError("Stage 2 contrastive training is only allowed for real promoter runs with --sequence-column sequence.")
     input_gene_panel_file = None
     if args.input_gene_panel_file is not None:
         input_gene_panel_file = Path(args.input_gene_panel_file)
@@ -808,6 +910,7 @@ def main():
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
         input_gene_panel_file=input_gene_panel_file,
+        return_indices=args.contrastive_weight > 0.0,
     )
     val_dataset = MyDataset(
         promoter_file=data_dir / "promoter_val.csv",
@@ -820,6 +923,7 @@ def main():
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
         input_gene_panel_file=input_gene_panel_file,
+        return_indices=False,
     )
 
     pin_memory = torch.cuda.is_available()
@@ -1033,6 +1137,10 @@ def main():
         vae_fine_tune_start_epoch=args.vae_fine_tune_start_epoch,
         force_vae_fine_tune=args.vae_fine_tune,
         checkpoint_metric=args.checkpoint_metric,
+        contrastive_weight=args.contrastive_weight,
+        contrastive_margin=args.contrastive_margin,
+        contrastive_negative_column=args.contrastive_negative_column,
+        contrastive_normalize=not args.no_contrastive_normalize,
     )
  
     if args.plot_loss:
