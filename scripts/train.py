@@ -221,6 +221,22 @@ def should_save_best_model(current_monitor_loss: float, best_score: float | None
     return best_score is not None and current_monitor_loss == best_score
 
 
+def select_checkpoint_monitor(
+    checkpoint_metric: str,
+    val_loss: float,
+    val_loss_ema: float,
+    val_rmse: float,
+) -> float:
+    """Select the scalar metric used by early stopping and best-model saving."""
+    if checkpoint_metric == "val_loss_ema":
+        return float(val_loss_ema)
+    if checkpoint_metric == "val_loss":
+        return float(val_loss)
+    if checkpoint_metric == "val_rmse":
+        return float(val_rmse)
+    raise ValueError(f"Unsupported checkpoint_metric: {checkpoint_metric}")
+
+
 def train_model(
     model,
     train_loader,
@@ -241,6 +257,7 @@ def train_model(
     amp: bool = False,
     vae_fine_tune_start_epoch: int = -1,
     force_vae_fine_tune: bool = False,
+    checkpoint_metric: str = "val_loss_ema",
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -373,6 +390,7 @@ def train_model(
 
         # ── Validation (runs before training so epoch 0 captures initial loss) ──
         avg_val_loss = float("nan")
+        epoch_val_rmse = float("nan")
         epoch_val_pearson = float("nan")
         epoch_val_pearson_all = float("nan")
         epoch_val_zero_acc = float("nan")
@@ -484,6 +502,9 @@ def train_model(
                     epoch_val_pearson_all = float(np.corrcoef(val_true_all, val_pred_all)[0, 1])
             val_losses_zero.append(val_zero_sum / max(val_zero_count, 1))
             val_losses_nz.append(val_nz_sum / max(val_nz_count, 1))
+            val_sq_count = val_zero_count + val_nz_count
+            if val_sq_count > 0:
+                epoch_val_rmse = float(math.sqrt((val_zero_sum + val_nz_sum) / val_sq_count))
 
             # Pearson correlation on non-zero samples
             if all_nz_true:
@@ -517,7 +538,7 @@ def train_model(
         prev_train_str = f"Train={prev_train:.6f} " if train_losses else ""
         log_msg = (
             f"Epoch {epoch}/{epochs}: {prev_train_str}Val={avg_val_loss:.6f} "
-            f"ValEMA={val_loss_ema:.6f} LR={current_lr:.3e}"
+            f"ValEMA={val_loss_ema:.6f} ValRMSE={epoch_val_rmse:.6f} LR={current_lr:.3e}"
         )
         if not math.isnan(epoch_val_pearson_all):
             log_msg += f" | Pearson(All)={epoch_val_pearson_all:.4f}"
@@ -541,6 +562,8 @@ def train_model(
             val_loss=avg_val_loss if not math.isnan(avg_val_loss) else np.nan,
             lr=current_lr,
             val_loss_ema=val_loss_ema,
+            val_rmse=epoch_val_rmse,
+            checkpoint_metric=checkpoint_metric,
             train_loss_zero=train_losses_zero[-1] if train_losses_zero else float("nan"),
             train_loss_nonzero=train_losses_nz[-1] if train_losses_nz else float("nan"),
             val_loss_zero=val_losses_zero[-1],
@@ -556,9 +579,14 @@ def train_model(
             vae_fine_tune_start_epoch=vae_fine_tune_start_epoch if hasattr(model, "vae_encoder") else None,
         )
 
-        # Update best metric and early-stopping counter (uses EMA-smoothed loss)
-        earlystopping(val_loss_ema)
-        if should_save_best_model(val_loss_ema, earlystopping.best_score):
+        checkpoint_monitor = select_checkpoint_monitor(
+            checkpoint_metric=checkpoint_metric,
+            val_loss=monitor_loss,
+            val_loss_ema=val_loss_ema,
+            val_rmse=epoch_val_rmse if not math.isnan(epoch_val_rmse) else monitor_loss,
+        )
+        earlystopping(checkpoint_monitor)
+        if should_save_best_model(checkpoint_monitor, earlystopping.best_score):
             utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
 
         utils.save_checkpoint(
@@ -696,7 +724,8 @@ def main():
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
     parser.add_argument("--model", type=str, default="LSTMmodel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
-    parser.add_argument("--data", type=str, default="umi_processed", choices=["highquality", "processed", "log_processed", "umi_highquality", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells","umi_E-MTAB-10519-hqcells_aug20","umi_E-MTAB-10519-hqcells_aug15"], help="Which dataset version to use (affects data paths in config)")
+    parser.add_argument("--data", type=str, default="umi_processed", help="Dataset directory name under data/ (affects data paths in config)")
+    parser.add_argument("--scrna-file", type=str, default=None, help="Optional h5ad path. Default: data/<data>/integrated_data.h5ad")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for resuming training")
     parser.add_argument("--dryrun", action="store_true", default=False, help="Run dryrun_cpu before real training")
     parser.add_argument("--plot-loss", action="store_true", default=True, help="Plot training loss curve after training")
@@ -705,6 +734,12 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Dataloader prefetch factor used when num_workers > 0")
     parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode all promoter sequences in memory. Faster, but uses much more RAM.")
+    parser.add_argument("--sequence-column", type=str, default="sequence", help="Promoter CSV sequence column to encode, e.g. sequence or control_sequence.")
+    parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional file listing fixed input gene IDs for expression branch.")
+    parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse"], help="Metric monitored by early stopping and best_model saving.")
+    parser.add_argument("--run-test-after-train", action="store_true", default=False, help="Run scripts.model_test standard test after training finishes.")
+    parser.add_argument("--test-max-samples", type=int, default=0, help="Max test samples for --run-test-after-train. 0 means all.")
+    parser.add_argument("--test-spearman-samples", type=int, default=1_000_000, help="Spearman reservoir size for --run-test-after-train. 0 means all.")
     parser.add_argument("--amp", action="store_true", default=False, help="Use CUDA automatic mixed precision for model forward/backward.")
     parser.add_argument("--samples-per-epoch", type=int, default=0, help="Number of samples per epoch. 0 = auto-select from pool sizes (no forced duplication).")
     parser.add_argument("--val-samples", type=int, default=128000, help="Number of unique samples to use for validation (uses zeroNonZeroSampler)")
@@ -739,6 +774,16 @@ def main():
     print("start")
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "data" / args.data
+    scrna_file = Path(args.scrna_file) if args.scrna_file is not None else data_dir / "integrated_data.h5ad"
+    if not scrna_file.is_absolute():
+        scrna_file = base_dir / scrna_file
+    args.scrna_file = str(scrna_file)
+    input_gene_panel_file = None
+    if args.input_gene_panel_file is not None:
+        input_gene_panel_file = Path(args.input_gene_panel_file)
+        if not input_gene_panel_file.is_absolute():
+            input_gene_panel_file = base_dir / input_gene_panel_file
+        args.input_gene_panel_file = str(input_gene_panel_file)
     train_cell_ids = None
     val_cell_ids = None
     if args.use_cell_split:
@@ -750,29 +795,33 @@ def main():
             f"train_cells={len(train_cell_ids)} val_cells={len(val_cell_ids)}"
         )
 
-    use_log1p = args.data.startswith("umi_") and args.loss != "zinb"
+    use_log1p = (args.data.startswith("umi_") or scrna_file.parent.name.startswith("umi_")) and args.loss != "zinb"
     train_dataset = MyDataset(
         promoter_file=data_dir / "promoter_train.csv",
-        scrna_file=data_dir / "integrated_data.h5ad",
+        scrna_file=scrna_file,
         cell_ids_subset=train_cell_ids,
         cell_ratio=args.cell_ratio,
         log1p_cpm_target=use_log1p,
         preencode_promoters=args.preencode_promoters,
+        sequence_column=args.sequence_column,
+        input_gene_panel_file=input_gene_panel_file,
     )
     val_dataset = MyDataset(
         promoter_file=data_dir / "promoter_val.csv",
-        scrna_file=data_dir / "integrated_data.h5ad",
+        scrna_file=scrna_file,
         mode="val",
         seed=args.seed,
         cell_ids_subset=val_cell_ids,
         cell_ratio=args.val_cell_ratio,
         log1p_cpm_target=use_log1p,
         preencode_promoters=args.preencode_promoters,
+        sequence_column=args.sequence_column,
+        input_gene_panel_file=input_gene_panel_file,
     )
 
     pin_memory = torch.cuda.is_available()
     loader_worker_kwargs = dataloader_worker_kwargs(args.num_workers, args.prefetch_factor)
-    if args.data in ("processed", "log_processed", "umi_processed","umi_E-MTAB-10519-raw","umi_E-MTAB-10519-hqcells","umi_E-MTAB-10519-hqcells_aug20","umi_E-MTAB-10519-hqcells_aug15"):
+    if args.data not in ("highquality", "umi_highquality"):
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,
@@ -838,7 +887,7 @@ def main():
                 drop_last=True,
                 **loader_worker_kwargs,
             )
-    elif args.data in ("highquality", "umi_highquality"):
+    else:
         if args.nonzero_ratio is not None:
             train_sampler = utils.ZeroNonZeroSampler(
                 train_dataset,
@@ -876,7 +925,7 @@ def main():
             **loader_worker_kwargs,
         )
 
-    expr_dim = train_dataset.X.shape[1]
+    expr_dim = train_dataset.expr_dim
     if args.vae_encoder is not None and not Path(args.vae_encoder).exists():
         raise FileNotFoundError(f"VAE encoder dir not found: {args.vae_encoder}")
     output_mode = "zinb" if args.loss == "zinb" else "scalar"
@@ -955,6 +1004,7 @@ def main():
         amp=args.amp,
         vae_fine_tune_start_epoch=args.vae_fine_tune_start_epoch,
         force_vae_fine_tune=args.vae_fine_tune,
+        checkpoint_metric=args.checkpoint_metric,
     )
  
     if args.plot_loss:
@@ -977,6 +1027,43 @@ def main():
             utils.plot_per_cell_scatter(model, val_dataset, is_umi=use_log1p, n_cells=3, save_path=plots_dir / "per_cell_scatter.png")
         else:
             print(f"Log file not found for plotting: {log_file}")
+
+    if args.run_test_after_train:
+        from scripts.model_test import run_model_test
+
+        test_args = argparse.Namespace(
+            exp_name=args.exp_name,
+            data=args.data,
+            checkpoint=None,
+            scrna_file=args.scrna_file,
+            sequence_column=args.sequence_column,
+            input_gene_panel_file=args.input_gene_panel_file,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            max_samples=args.test_max_samples,
+            spearman_samples=args.test_spearman_samples,
+            preencode_promoters=args.preencode_promoters,
+            use_cell_split=args.use_cell_split,
+            cell_split_dir=args.cell_split_dir,
+            skip_standard_test=False,
+            run_input_ablation=False,
+            ablation_repeats=3,
+            ablation_max_samples=None,
+            run_mutagenesis=False,
+            top_n=100,
+            mutation_batch_size=512,
+            max_pairs_per_gene_ratio=0.02,
+            max_pairs_per_gene=20,
+            motif_window_size=9,
+            motif_top_windows=200,
+            motif_top_k=20,
+            motif_min_support=3,
+            known_motif_file=None,
+            known_motif_min_score_ratio=0.8,
+            known_motif_max_hits_per_motif=1000,
+        )
+        run_model_test(test_args)
 # %%       
 if __name__ == "__main__":
     main()

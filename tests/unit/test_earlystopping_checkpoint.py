@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from scripts.train import compute_val_loss_ema, should_save_best_model
+from scripts.train import compute_val_loss_ema, select_checkpoint_monitor, should_save_best_model
 from src.earlystopping import EarlyStopping
 import src.utils as utils
 
@@ -44,6 +44,14 @@ def test_ema_helper_and_best_model_decision_lock_current_behavior() -> None:
 
     stopper(ema2)
     assert not should_save_best_model(ema2, stopper.best_score)
+
+
+def test_select_checkpoint_monitor_supports_val_rmse() -> None:
+    assert select_checkpoint_monitor("val_loss_ema", 2.0, 1.5, 1.2) == pytest.approx(1.5)
+    assert select_checkpoint_monitor("val_loss", 2.0, 1.5, 1.2) == pytest.approx(2.0)
+    assert select_checkpoint_monitor("val_rmse", 2.0, 1.5, 1.2) == pytest.approx(1.2)
+    with pytest.raises(ValueError):
+        select_checkpoint_monitor("unknown", 2.0, 1.5, 1.2)
 
 
 def test_save_and_resume_checkpoint_round_trip(tmp_path) -> None:

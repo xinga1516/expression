@@ -1,0 +1,36 @@
+{
+  "protocol": "promoter_stage1_clean_gate",
+  "data": "promoter_stage1_v1",
+  "seeds": [1, 7, 42],
+  "runs": [
+    {
+      "name_template": "stage1_expr_seed{seed}",
+      "model": "ExpressionBaseline",
+      "sequence_column": "sequence"
+    },
+    {
+      "name_template": "stage1_promoter_seed{seed}",
+      "model": "CNNFlattenPromoterModel",
+      "sequence_column": "sequence"
+    },
+    {
+      "name_template": "stage1_intergenic_seed{seed}",
+      "model": "CNNFlattenPromoterModel",
+      "sequence_column": "control_sequence"
+    }
+  ],
+  "common_args": {
+    "scrna_file": "data/umi_E-MTAB-10519-hqcells/integrated_data.h5ad",
+    "use_cell_split": true,
+    "cell_split_dir": "data/promoter_stage1_v1",
+    "input_gene_panel_file": "data/promoter_stage1_v1/input_gene_panel_train.txt",
+    "loss": "mse",
+    "checkpoint_metric": "val_rmse",
+    "run_test_after_train": true,
+    "test_spearman_samples": 0,
+    "batch_size": 512,
+    "learning_rate": 0.0005,
+    "patience": 32,
+    "ema_alpha": 0.9999
+  }
+}

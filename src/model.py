@@ -252,6 +252,104 @@ class ConvAttentionModel(nn.Module):
         return self
 
 
+class CNNFlattenPromoterModel(nn.Module):
+    """Promoter CNN-flatten encoder fused with a masked expression MLP."""
+
+    def __init__(
+        self,
+        promoter_len: int = 400,
+        promoter_channels: int = 5,
+        hidden_size: int = 128,
+        expr_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        use_vae: bool = False,
+        vae_encoder_path: Optional[str] = None,
+        vae_fine_tune: bool = False,
+        output_mode: str = "scalar",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        if expr_dim is None:
+            raise ValueError("expr_dim must be provided")
+
+        conv_width = max(16, min(64, hidden_size))
+        self.promoter_conv = nn.Sequential(
+            nn.Conv1d(promoter_channels, conv_width, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(conv_width, conv_width, kernel_size=7, padding=3),
+            nn.GELU(),
+        )
+        self.promoter_fc = nn.Sequential(
+            nn.Linear(promoter_len * conv_width, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        self.use_vae = use_vae
+        self.vae_fine_tune = vae_fine_tune
+        if use_vae and vae_encoder_path:
+            self.vae_encoder = SCVIEncoder.from_pretrained(vae_encoder_path)
+            if not vae_fine_tune:
+                for p in self.vae_encoder.parameters():
+                    p.requires_grad = False
+            expr_in = self.vae_encoder.mean_encoder.out_features
+        else:
+            expr_in = expr_dim
+
+        self.expr_mlp = nn.Sequential(
+            nn.Linear(expr_in, hidden_size * 2),
+            nn.LayerNorm(hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        self.output_mode = output_mode
+        if output_mode == "zinb":
+            self.mu_head = nn.Linear(hidden_size, 1)
+            self.theta_head = nn.Linear(hidden_size, 1)
+            self.pi_head = nn.Linear(hidden_size, 1)
+        else:
+            self.fc_out = nn.Linear(hidden_size, 1)
+
+    def encode_promoter(self, promoter: torch.Tensor) -> torch.Tensor:
+        x = promoter.permute(0, 2, 1)
+        x = self.promoter_conv(x)
+        x = x.flatten(start_dim=1)
+        return self.promoter_fc(x)
+
+    def forward(self, promoter: torch.Tensor, expr: torch.Tensor):
+        promoter_out = self.encode_promoter(promoter)
+        self.last_lstm_out = promoter_out
+        if self.use_vae:
+            expr = self.vae_encoder(expr)
+        expr_out = self.expr_mlp(expr)
+        self.last_expr_out = expr_out
+        x = self.fusion(torch.cat([promoter_out, expr_out], dim=1))
+
+        if self.output_mode == "zinb":
+            mu_ratio = torch.exp(torch.clamp(self.mu_head(x), max=10))
+            theta = torch.exp(torch.clamp(self.theta_head(x), max=10))
+            pi = torch.sigmoid(self.pi_head(x))
+            return mu_ratio, theta, pi
+        return self.fc_out(x)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.use_vae and not self.vae_fine_tune:
+            self.vae_encoder.eval()
+        return self
+
+
 class PromoterBaseline(nn.Module):
     """Promoter-only baseline: CNN → attention pooling → output."""
 

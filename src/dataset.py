@@ -11,7 +11,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from scipy import sparse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 class PromoterOneHotEncoder:
     # One-hot encode DNA sequence (pad with N up to fixed length).
@@ -56,10 +56,19 @@ class MyDataset(Dataset):
         cell_ratio: float = 1.0,
         log1p_cpm_target: bool = False,
         preencode_promoters: bool = False,
+        sequence_column: str = "sequence",
+        input_gene_ids: Optional[Sequence[str]] = None,
+        input_gene_panel_file: Optional[str | Path] = None,
     ) -> None:
         self.promoter_file = Path(promoter_file)
         self.scrna_file = Path(scrna_file)
         self.promoters = pd.read_csv(promoter_file)
+        self.sequence_column = sequence_column
+        if self.sequence_column not in self.promoters.columns:
+            raise ValueError(
+                f"Sequence column {self.sequence_column!r} not found in {self.promoter_file}. "
+                f"Available columns: {sorted(self.promoters.columns)}"
+            )
         self.scrna = sc.read(scrna_file, sparse=True)
         # CSR: fast row access; CSC: fast column access.
         self.X = self.scrna.X.tocsr() if sparse.issparse(self.scrna.X) else self.scrna.X
@@ -100,6 +109,24 @@ class MyDataset(Dataset):
                 raise ValueError(f"gene_id {gene_id} not found in scRNA var")
         #print(self.gene2idx)
 
+        self.input_gene_ids = self._resolve_input_gene_ids(input_gene_ids, input_gene_panel_file)
+        self.input_expr_indices: np.ndarray | None = None
+        self.input_gene_idx_to_position: dict[int, int] = {}
+        if self.input_gene_ids is not None:
+            missing_input_genes = [gene_id for gene_id in self.input_gene_ids if gene_id not in self.gene2idx]
+            if missing_input_genes:
+                raise ValueError(
+                    f"{len(missing_input_genes)} input genes not found in scRNA var, "
+                    f"e.g. {missing_input_genes[:5]}"
+                )
+            self.input_expr_indices = np.asarray(
+                [self.gene2idx[gene_id] for gene_id in self.input_gene_ids],
+                dtype=np.int64,
+            )
+            self.input_gene_idx_to_position = {
+                int(gene_idx): pos for pos, gene_idx in enumerate(self.input_expr_indices)
+            }
+
         self._cell_ratio = cell_ratio
         self._original_cells = self.cells.copy()
         if cell_ratio < 1.0:
@@ -113,6 +140,30 @@ class MyDataset(Dataset):
         self.mode = mode
         self.seed = seed
         self.log1p_cpm_target = log1p_cpm_target
+        self.expr_dim = len(self.input_expr_indices) if self.input_expr_indices is not None else self.X.shape[1]
+
+    def _resolve_input_gene_ids(
+        self,
+        input_gene_ids: Optional[Sequence[str]],
+        input_gene_panel_file: Optional[str | Path],
+    ) -> list[str] | None:
+        if input_gene_ids is not None and input_gene_panel_file is not None:
+            raise ValueError("Provide only one of input_gene_ids or input_gene_panel_file.")
+        if input_gene_ids is not None:
+            return [str(gene_id) for gene_id in input_gene_ids]
+        if input_gene_panel_file is None:
+            return None
+        panel_path = Path(input_gene_panel_file)
+        if not panel_path.exists():
+            raise FileNotFoundError(f"Input gene panel file not found: {panel_path}")
+        genes = [
+            line.strip().split("\t")[0].split(",")[0]
+            for line in panel_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not genes:
+            raise ValueError(f"Input gene panel file is empty: {panel_path}")
+        return genes
 
     def resample_cells(self, seed: int) -> None:
         '''Re-select a random subset of cells using cell_ratio with a new seed.
@@ -126,7 +177,7 @@ class MyDataset(Dataset):
         self.C = len(self.cells)
 
     def _preencode_promoters(self) -> torch.Tensor:
-        sequences = self.promoters["sequence"].values
+        sequences = self.promoters[self.sequence_column].values
         n = len(sequences)
 
         # (N, 400, 5)
@@ -148,7 +199,7 @@ class MyDataset(Dataset):
     def get_promoter_tensor(self, pro_i: int) -> torch.Tensor:
         if self.promoter_tensor is not None:
             return self.promoter_tensor[pro_i]
-        seq = str(self.promoters["sequence"].iloc[pro_i])
+        seq = str(self.promoters[self.sequence_column].iloc[pro_i])
         return self.promoter_encoder(seq)
 
     def get_promoter_tensors(self, pro_indices: np.ndarray | list[int]) -> torch.Tensor:
@@ -165,18 +216,33 @@ class MyDataset(Dataset):
 
         if hasattr(expr_all, "toarray"):
             expr_all = expr_all.toarray().astype("float32").squeeze()     # (16300,)
-        expr_all = torch.from_numpy(expr_all).float()
+        expr_all_np = np.asarray(expr_all, dtype=np.float32).ravel()
         
         target_idx = self.promoter2expr_idx[pro_i]
-        y = expr_all[target_idx].clone()
-        expr_all[target_idx] = 0.0 # mask the promoter expression
+        y_value = float(expr_all_np[target_idx])
+        expr_input_np = self.make_masked_expression_input(expr_all_np, int(target_idx))
+        expr_input = torch.from_numpy(expr_input_np).float()
+        y = torch.tensor(y_value, dtype=torch.float32)
 
         if self.log1p_cpm_target:
-            lib_size = expr_all.sum()
+            lib_size = max(float(expr_all_np.sum() - y_value), 1.0)
             cpm = y / max(float(lib_size), 1.0) * 1e6
             y = torch.log1p(cpm)
 
-        return promoter, expr_all, y
+        return promoter, expr_input, y
+
+    def make_masked_expression_input(self, full_expr: np.ndarray, target_idx: int) -> np.ndarray:
+        full_expr = np.asarray(full_expr, dtype=np.float32).ravel()
+        if self.input_expr_indices is None:
+            expr_input = full_expr.copy()
+            expr_input[target_idx] = 0.0
+            return expr_input
+
+        expr_input = full_expr[self.input_expr_indices].copy()
+        target_pos = self.input_gene_idx_to_position.get(int(target_idx))
+        if target_pos is not None:
+            expr_input[target_pos] = 0.0
+        return expr_input
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pro_i = idx // self.C

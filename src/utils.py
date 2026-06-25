@@ -263,7 +263,7 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "seed": args.seed,
         "train_promoter_file": str(base_dir / "data" / args.data / "promoter_train.csv"),
         "val_promoter_file": str(base_dir / "data" / args.data / "promoter_val.csv"),
-        "scrna_file": str(base_dir / "data" / args.data / "integrated_data.h5ad"),
+        "scrna_file": str(getattr(args, "scrna_file", base_dir / "data" / args.data / "integrated_data.h5ad")),
         "expr_dim": int(expr_dim),
         "git_hash": get_git_hash(),
         "ema_alpha": getattr(args, "ema_alpha", 0.9),
@@ -281,6 +281,10 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "fusion": getattr(args, "fusion", "gate"),
         "preencode_promoters": getattr(args, "preencode_promoters", False),
         "amp": getattr(args, "amp", False),
+        "sequence_column": getattr(args, "sequence_column", "sequence"),
+        "input_gene_panel_file": str(getattr(args, "input_gene_panel_file", None)) if getattr(args, "input_gene_panel_file", None) is not None else None,
+        "checkpoint_metric": getattr(args, "checkpoint_metric", "val_loss_ema"),
+        "run_test_after_train": getattr(args, "run_test_after_train", False),
     })
 
     with open(config_path, "w", encoding="utf-8") as f:
@@ -659,26 +663,30 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_pr
                 batch_cells = cell_indices[start:end]
                 cell_rows = [int(dataset.cells[j]) for j in batch_cells]
 
-                X_batch = torch.from_numpy(
-                    np.vstack([X_csr[r].toarray().ravel() for r in cell_rows]).astype(np.float32)
-                ).to(device)  # (B, n_genes)
-
-                ys = X_batch[:, target_idx].clone()
-                X_masked = X_batch.clone()
-                X_masked[:, target_idx] = 0.0
+                full_batch_np = np.vstack([X_csr[r].toarray().ravel() for r in cell_rows]).astype(np.float32)
+                ys_np = full_batch_np[:, target_idx].astype(np.float32, copy=False)
+                X_masked_np = np.vstack([
+                    dataset.make_masked_expression_input(row, target_idx)
+                    for row in full_batch_np
+                ]).astype(np.float32, copy=False)
+                ys = torch.from_numpy(ys_np).to(device)
+                X_masked = torch.from_numpy(X_masked_np).to(device)
+                full_lib_size = torch.from_numpy(
+                    np.maximum(full_batch_np.sum(axis=1) - ys_np, 1.0).astype(np.float32)
+                ).to(device)
 
                 p_batch = p_single.unsqueeze(0).expand(len(batch_cells), -1, -1)  # (B, 400, 5)
 
                 if is_zinb:
                     mu_ratio, _theta, _pi = model(p_batch, X_masked)
                     mu_ratio = mu_ratio.squeeze(1)
-                    lib_size = X_masked.sum(dim=1) + ys
+                    lib_size = full_lib_size
                     yp = torch.log(mu_ratio * 1e6 + 1).cpu().numpy()
                     yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
                 else:
                     preds = model(p_batch, X_masked).squeeze(1).cpu().numpy()
                     if is_umi:
-                        lib_size = X_masked.sum(dim=1) + ys
+                        lib_size = full_lib_size
                         yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
                         yp = preds
                     else:
@@ -779,9 +787,7 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
     with torch.no_grad():
         for ci, cell_i in enumerate(cell_indices):
             cell_row = int(dataset.cells[cell_i])
-            expr_vec = torch.from_numpy(
-                X_csr[cell_row].toarray().ravel().astype(np.float32)
-            ).to(device)  # (n_genes,)
+            expr_vec_np = X_csr[cell_row].toarray().ravel().astype(np.float32)
 
             for g_start in range(0, n_genes_actual, batch_size):
                 g_end = min(g_start + batch_size, n_genes_actual)
@@ -790,23 +796,27 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
                 batch_genes = gene_names[g_start:g_end]
                 batch_promoters = promoter_all[g_start:g_end]  # (B, 400, 5)
 
-                expr_batch = expr_vec.unsqueeze(0).expand(len(batch_pro), -1).clone()  # (B, n_genes)
-                ys_list = []
-                for g, tgt in enumerate(batch_targets):
-                    ys_list.append(expr_batch[g, tgt].item())
-                    expr_batch[g, tgt] = 0.0
-                ys = torch.tensor(ys_list, device=device)
+                ys_np = np.asarray([expr_vec_np[tgt] for tgt in batch_targets], dtype=np.float32)
+                expr_batch_np = np.vstack([
+                    dataset.make_masked_expression_input(expr_vec_np, int(tgt))
+                    for tgt in batch_targets
+                ]).astype(np.float32, copy=False)
+                expr_batch = torch.from_numpy(expr_batch_np).to(device)
+                ys = torch.from_numpy(ys_np).to(device)
+                full_lib_size = torch.from_numpy(
+                    np.maximum(expr_vec_np.sum() - ys_np, 1.0).astype(np.float32)
+                ).to(device)
 
                 if is_zinb:
                     mu_ratio, _theta, _pi = model(batch_promoters, expr_batch)
                     mu_ratio = mu_ratio.squeeze(1)
-                    lib_size = expr_batch.sum(dim=1) + ys
+                    lib_size = full_lib_size
                     yp = torch.log(mu_ratio * 1e6 + 1).cpu().numpy()
                     yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
                 else:
                     preds = model(batch_promoters, expr_batch).squeeze(1).cpu().numpy()
                     if is_umi:
-                        lib_size = expr_batch.sum(dim=1) + ys
+                        lib_size = full_lib_size
                         yt = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6).cpu().numpy()
                         yp = preds
                     else:

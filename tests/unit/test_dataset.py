@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -86,3 +87,43 @@ def test_resample_cells_updates_subset_size(tiny_data_dir) -> None:
     assert dataset.C == max(1, int(len(dataset._original_cells) * 0.5))
     assert len(dataset.cells) == dataset.C
     assert not np.array_equal(before, dataset.cells)
+
+
+def test_dataset_uses_control_sequence_and_fixed_input_panel(tiny_data_dir) -> None:
+    promoter_path = tiny_data_dir / "promoter_train.csv"
+    promoters = pd.read_csv(promoter_path)
+    promoters["control_sequence"] = ["T" * 400 for _ in range(len(promoters))]
+    promoters.to_csv(promoter_path, index=False)
+    panel_path = tiny_data_dir / "input_gene_panel_train.txt"
+    panel_path.write_text("g1\ng2\n", encoding="utf-8")
+
+    dataset = MyDataset(
+        promoter_file=promoter_path,
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        sequence_column="control_sequence",
+        input_gene_panel_file=panel_path,
+    )
+
+    promoter, expr, y = dataset.in_getitem(pro_i=0, cell_i=0)
+
+    assert dataset.expr_dim == 2
+    assert promoter.shape == (400, 5)
+    assert torch.all(promoter[:, 3] == 1.0)
+    assert y.item() == pytest.approx(10.0)
+    assert expr.tolist() == pytest.approx([0.0, 5.0])
+
+
+def test_dataset_masks_target_inside_fixed_input_panel(tiny_data_dir) -> None:
+    panel_path = tiny_data_dir / "input_gene_panel_train.txt"
+    panel_path.write_text("g0\ng1\ng2\n", encoding="utf-8")
+    dataset = MyDataset(
+        promoter_file=tiny_data_dir / "promoter_train.csv",
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        input_gene_panel_file=panel_path,
+    )
+
+    _promoter, expr, y = dataset.in_getitem(pro_i=0, cell_i=0)
+
+    assert dataset.expr_dim == 3
+    assert y.item() == pytest.approx(10.0)
+    assert expr.tolist() == pytest.approx([0.0, 0.0, 5.0])

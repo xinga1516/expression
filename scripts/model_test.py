@@ -36,6 +36,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exp_name", type=str, required=True, help="Experiment name under outputs/")
     parser.add_argument("--data", type=str, default=None, help="Fallback data directory name under data/")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path. Default: outputs/<exp_name>/checkpoints/best_model.safetensors")
+    parser.add_argument("--scrna-file", type=str, default=None, help="Optional h5ad path. Default: resolved data_dir/integrated_data.h5ad or config scrna_file.")
+    parser.add_argument("--sequence-column", type=str, default=None, help="Promoter CSV sequence column. Default: config value or sequence.")
+    parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional fixed input gene panel file. Default: config value.")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -72,12 +75,15 @@ def load_config(run_dir: Path) -> dict[str, Any]:
 
 
 def resolve_data_dir(base_dir: Path, cfg: dict[str, Any], data_arg: str | None) -> Path:
+    if data_arg is not None:
+        return base_dir / "data" / data_arg
+    train_promoter_file = cfg.get("train_promoter_file", "")
+    if train_promoter_file:
+        return Path(train_promoter_file).parent
     scrna_file = cfg.get("scrna_file", "")
     if scrna_file:
         return Path(scrna_file).parent
-    if data_arg is None:
-        raise ValueError("--data is required when config.json has no scrna_file")
-    return base_dir / "data" / data_arg
+    raise ValueError("--data is required when config.json has no train_promoter_file or scrna_file")
 
 
 def resolve_cell_split_dir(base_dir: Path, data_dir: Path, cell_split_dir: str | None) -> Path:
@@ -226,8 +232,8 @@ def build_masked_expression(dataset: MyDataset, cell_row: int, target_idx: int) 
     else:
         expr_arr = np.asarray(expr, dtype=np.float32).squeeze()
     y_raw = float(expr_arr[target_idx])
-    expr_arr[target_idx] = 0.0
-    return torch.from_numpy(expr_arr).float(), y_raw
+    expr_input = dataset.make_masked_expression_input(expr_arr, target_idx)
+    return torch.from_numpy(expr_input).float(), y_raw
 
 
 def centered_window_bounds(position: int, sequence_length: int, window_size: int) -> tuple[int, int]:
@@ -822,6 +828,63 @@ def update_spearman_reservoir(
     return seen
 
 
+def _empty_group_state() -> dict[str, float]:
+    return {
+        "n": 0.0,
+        "sum_y": 0.0,
+        "sum_p": 0.0,
+        "sum_yy": 0.0,
+        "sum_pp": 0.0,
+        "sum_yp": 0.0,
+        "sse": 0.0,
+        "nonzero_n": 0.0,
+        "nonzero_sse": 0.0,
+        "zero_n": 0.0,
+        "zero_sse": 0.0,
+    }
+
+
+def _accumulate_group_state(state: dict[str, float], y: np.ndarray, p: np.ndarray) -> None:
+    diff = p - y
+    nonzero = y != 0
+    zero = ~nonzero
+    state["n"] += float(y.size)
+    state["sum_y"] += float(np.sum(y))
+    state["sum_p"] += float(np.sum(p))
+    state["sum_yy"] += float(np.sum(y * y))
+    state["sum_pp"] += float(np.sum(p * p))
+    state["sum_yp"] += float(np.sum(y * p))
+    state["sse"] += float(np.sum(diff * diff))
+    state["nonzero_n"] += float(np.sum(nonzero))
+    state["zero_n"] += float(np.sum(zero))
+    if np.any(nonzero):
+        state["nonzero_sse"] += float(np.sum(diff[nonzero] * diff[nonzero]))
+    if np.any(zero):
+        state["zero_sse"] += float(np.sum(diff[zero] * diff[zero]))
+
+
+def _finalize_group_state(state: dict[str, float]) -> dict[str, float | int]:
+    n = max(int(state["n"]), 1)
+    denom_y = state["sum_yy"] - state["sum_y"] * state["sum_y"] / n
+    denom_p = state["sum_pp"] - state["sum_p"] * state["sum_p"] / n
+    denom = float(np.sqrt(max(denom_y, 0.0) * max(denom_p, 0.0)))
+    pearson = (state["sum_yp"] - state["sum_y"] * state["sum_p"] / n) / denom if denom > 0 else float("nan")
+    nonzero_n = int(state["nonzero_n"])
+    zero_n = int(state["zero_n"])
+    return {
+        "n": int(state["n"]),
+        "mse": float(state["sse"] / max(state["n"], 1.0)),
+        "rmse": float(np.sqrt(state["sse"] / max(state["n"], 1.0))),
+        "pearson_r": float(pearson),
+        "mean_true": float(state["sum_y"] / max(state["n"], 1.0)),
+        "mean_pred": float(state["sum_p"] / max(state["n"], 1.0)),
+        "nonzero_n": nonzero_n,
+        "nonzero_rmse": float(np.sqrt(state["nonzero_sse"] / nonzero_n)) if nonzero_n > 0 else float("nan"),
+        "zero_n": zero_n,
+        "zero_rmse": float(np.sqrt(state["zero_sse"] / zero_n)) if zero_n > 0 else float("nan"),
+    }
+
+
 def compute_test_metrics(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -829,6 +892,7 @@ def compute_test_metrics(
     max_samples: int,
     spearman_samples: int,
     seed: int,
+    detail_dir: Path | None = None,
 ) -> dict[str, float | int]:
     ''' compute
     '''
@@ -842,6 +906,12 @@ def compute_test_metrics(
     sum_pp = 0.0
     sum_yp = 0.0
     sse = 0.0
+    nonzero_sse = 0.0
+    nonzero_count = 0
+    zero_sse = 0.0
+    zero_count = 0
+    per_gene: dict[str, dict[str, float]] = defaultdict(_empty_group_state)
+    per_cell: dict[str, dict[str, float]] = defaultdict(_empty_group_state)
     reservoir_true: list[np.ndarray] = []
     reservoir_pred: list[np.ndarray] = []
     spearman_seen = 0
@@ -869,10 +939,19 @@ def compute_test_metrics(
 
             y = true.detach().cpu().numpy().astype(np.float64, copy=False)
             p = pred.detach().cpu().numpy().astype(np.float64, copy=False)
+            flat_indices = np.arange(count, count + y.size, dtype=np.int64)
 
             count += int(y.size)
             diff = p - y
             sse += float(np.sum(diff * diff))
+            nonzero_mask = y != 0
+            zero_mask = ~nonzero_mask
+            nonzero_count += int(np.sum(nonzero_mask))
+            zero_count += int(np.sum(zero_mask))
+            if np.any(nonzero_mask):
+                nonzero_sse += float(np.sum(diff[nonzero_mask] * diff[nonzero_mask]))
+            if np.any(zero_mask):
+                zero_sse += float(np.sum(diff[zero_mask] * diff[zero_mask]))
             sum_y += float(np.sum(y))
             sum_p += float(np.sum(p))
             sum_yy += float(np.sum(y * y))
@@ -882,6 +961,18 @@ def compute_test_metrics(
             spearman_seen = update_spearman_reservoir(
                 y, p, reservoir_true, reservoir_pred, spearman_seen, spearman_samples, rng
             )
+
+            dataset = loader.dataset
+            if hasattr(dataset, "promoters") and hasattr(dataset, "C"):
+                pro_indices = flat_indices // int(dataset.C)
+                cell_positions = flat_indices % int(dataset.C)
+                for pro_i, yt, yp in zip(pro_indices, y, p):
+                    gene_id = str(dataset.promoters["gene_id"].iloc[int(pro_i)])
+                    _accumulate_group_state(per_gene[gene_id], np.asarray([yt]), np.asarray([yp]))
+                for cell_pos, yt, yp in zip(cell_positions, y, p):
+                    cell_row = int(dataset.cells[int(cell_pos)])
+                    cell_id = str(dataset.scrna.obs_names[cell_row])
+                    _accumulate_group_state(per_cell[cell_id], np.asarray([yt]), np.asarray([yp]))
 
             if max_samples > 0 and count >= max_samples:
                 break
@@ -903,12 +994,34 @@ def compute_test_metrics(
     else:
         spearman = float("nan")
 
+    per_gene_df = pd.DataFrame(
+        [{"gene_id": key, **_finalize_group_state(state)} for key, state in sorted(per_gene.items())]
+    )
+    per_cell_df = pd.DataFrame(
+        [{"cell_id": key, **_finalize_group_state(state)} for key, state in sorted(per_cell.items())]
+    )
+    if detail_dir is not None:
+        detail_dir.mkdir(parents=True, exist_ok=True)
+        if not per_gene_df.empty:
+            per_gene_df.to_csv(detail_dir / "per_gene_metrics.csv", index=False)
+        if not per_cell_df.empty:
+            per_cell_df.to_csv(detail_dir / "per_cell_metrics.csv", index=False)
+
     return {
         "num_samples": int(count),
         "mse": float(mse),
+        "rmse": float(np.sqrt(mse)),
         "pearson_r": float(pearson),
         "spearman_r": float(spearman),
         "spearman_num_samples": int(len(spearman_true)),
+        "nonzero_count": int(nonzero_count),
+        "nonzero_rmse": float(np.sqrt(nonzero_sse / nonzero_count)) if nonzero_count > 0 else float("nan"),
+        "zero_count": int(zero_count),
+        "zero_rmse": float(np.sqrt(zero_sse / zero_count)) if zero_count > 0 else float("nan"),
+        "per_gene_n": int(len(per_gene_df)),
+        "per_gene_median_rmse": float(per_gene_df["rmse"].median()) if not per_gene_df.empty else float("nan"),
+        "per_cell_n": int(len(per_cell_df)),
+        "per_cell_median_rmse": float(per_cell_df["rmse"].median()) if not per_cell_df.empty else float("nan"),
     }
 
 
@@ -1179,8 +1292,16 @@ def write_input_ablation_outputs(metrics: pd.DataFrame, output_dir: Path) -> Non
     print(f"outputs: {ablation_dir}")
 
 
-def main() -> None:
-    args = parse_args()
+def _resolve_optional_path(base_dir: Path, path_value: str | None) -> Path | None:
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
+
+def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
     base_dir = PROJECT_ROOT
     run_dir = base_dir / "outputs" / args.exp_name
     test_dir = run_dir / "test"
@@ -1189,11 +1310,22 @@ def main() -> None:
     cfg = load_config(run_dir)
     data_dir = resolve_data_dir(base_dir, cfg, args.data)
     checkpoint = Path(args.checkpoint) if args.checkpoint else run_dir / "checkpoints" / "best_model.safetensors"
+    if not checkpoint.is_absolute():
+        checkpoint = base_dir / checkpoint
     if not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
     loss_type = cfg.get("loss_type", "mse")
-    is_umi = data_dir.name.startswith("umi_") and loss_type != "zinb"
+    scrna_file = _resolve_optional_path(base_dir, args.scrna_file)
+    if scrna_file is None:
+        cfg_scrna = cfg.get("scrna_file")
+        scrna_file = _resolve_optional_path(base_dir, cfg_scrna) if cfg_scrna else data_dir / "integrated_data.h5ad"
+    sequence_column = args.sequence_column or cfg.get("sequence_column", "sequence")
+    input_gene_panel_file = _resolve_optional_path(
+        base_dir,
+        args.input_gene_panel_file or cfg.get("input_gene_panel_file"),
+    )
+    is_umi = (data_dir.name.startswith("umi_") or scrna_file.parent.name.startswith("umi_")) and loss_type != "zinb"
     test_cell_ids = None
     cell_split_dir = None
     if args.use_cell_split:
@@ -1202,12 +1334,14 @@ def main() -> None:
         print(f"Using cell split from {cell_split_dir}: test_cells={len(test_cell_ids)}")
     dataset = MyDataset(
         promoter_file=data_dir / "promoter_test.csv",
-        scrna_file=data_dir / "integrated_data.h5ad",
+        scrna_file=scrna_file,
         cell_ids_subset=test_cell_ids,
         mode="test",
         seed=args.seed,
         log1p_cpm_target=is_umi,
         preencode_promoters=args.preencode_promoters,
+        sequence_column=sequence_column,
+        input_gene_panel_file=input_gene_panel_file,
     )
     loader = DataLoader(
         dataset,
@@ -1219,8 +1353,9 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    expr_dim = int(cfg.get("expr_dim", dataset.X.shape[1]))
+    expr_dim = int(cfg.get("expr_dim", dataset.expr_dim))
     model = build_test_model(cfg, expr_dim=expr_dim, checkpoint=checkpoint, device=device)
+    metrics: dict[str, Any] = {}
 
     if not args.skip_standard_test:
         metrics = compute_test_metrics(
@@ -1230,12 +1365,16 @@ def main() -> None:
             max_samples=args.max_samples,
             spearman_samples=args.spearman_samples,
             seed=args.seed,
+            detail_dir=test_dir,
         )
         metrics.update({
             "exp_name": args.exp_name,
             "data_dir": str(data_dir),
+            "scrna_file": str(scrna_file),
             "checkpoint": str(checkpoint),
             "loss_type": loss_type,
+            "sequence_column": sequence_column,
+            "input_gene_panel_file": str(input_gene_panel_file) if input_gene_panel_file is not None else None,
             "max_samples": int(args.max_samples),
             "use_cell_split": bool(args.use_cell_split),
             "cell_split_dir": str(cell_split_dir) if cell_split_dir is not None else None,
@@ -1302,6 +1441,12 @@ def main() -> None:
             known_motif_max_hits_per_motif=args.known_motif_max_hits_per_motif,
             device=device,
         )
+
+    return metrics
+
+
+def main() -> None:
+    run_model_test(parse_args())
 
 
 if __name__ == "__main__":

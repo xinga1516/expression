@@ -56,7 +56,7 @@ def test_zinb_capable_models_output_shapes() -> None:
     promoter[:, :, 4] = 1.0
     expr = torch.rand(2, 5)
 
-    for model_name in ["LSTMmodel", "ConvAttentionModel"]:
+    for model_name in ["LSTMmodel", "ConvAttentionModel", "CNNFlattenPromoterModel"]:
         model = build_model(model_name, expr_dim=5, hidden_size=4, output_mode="zinb")
         mu_ratio, theta, pi = model(promoter, expr)
         assert mu_ratio.shape == (2, 1)
