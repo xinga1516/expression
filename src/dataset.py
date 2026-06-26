@@ -57,6 +57,7 @@ class MyDataset(Dataset):
         log1p_cpm_target: bool = False,
         preencode_promoters: bool = False,
         sequence_column: str = "sequence",
+        sequence_length: int = 400,
         input_gene_ids: Optional[Sequence[str]] = None,
         input_gene_panel_file: Optional[str | Path] = None,
         return_indices: bool = False,
@@ -65,6 +66,7 @@ class MyDataset(Dataset):
         self.scrna_file = Path(scrna_file)
         self.promoters = pd.read_csv(promoter_file)
         self.sequence_column = sequence_column
+        self.sequence_length = int(sequence_length)
         self.return_indices = bool(return_indices)
         if self.sequence_column not in self.promoters.columns:
             raise ValueError(
@@ -75,7 +77,7 @@ class MyDataset(Dataset):
         # CSR: fast row access; CSC: fast column access.
         self.X = self.scrna.X.tocsr() if sparse.issparse(self.scrna.X) else self.scrna.X
 
-        self.promoter_encoder = PromoterOneHotEncoder(length=400)
+        self.promoter_encoder = PromoterOneHotEncoder(length=self.sequence_length)
         self.preencode_promoters = preencode_promoters
         self.promoter_tensor: torch.Tensor | None = None
         if self.preencode_promoters:
@@ -184,7 +186,7 @@ class MyDataset(Dataset):
 
         # (N, 400, 5)
         promoter_tensor = torch.zeros(
-            n, 400, 5, dtype=torch.float32
+            n, self.sequence_length, 5, dtype=torch.float32
         )
 
         for i, seq in enumerate(sequences):

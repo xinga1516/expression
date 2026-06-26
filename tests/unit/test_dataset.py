@@ -204,3 +204,21 @@ def test_dataset_return_indices_and_negative_sequence_tensors(tiny_data_dir) -> 
     assert int(cell_i.item()) == 0
     assert negatives.shape == (1, 400, 5)
     assert torch.all(negatives[0, :, 3] == 1.0)
+
+
+def test_dataset_supports_custom_sequence_length(tiny_data_dir) -> None:
+    promoter_path = tiny_data_dir / "promoter_train.csv"
+    promoters = pd.read_csv(promoter_path)
+    promoters["utr_sequence"] = ["A" * 801 for _ in range(len(promoters))]
+    promoters.to_csv(promoter_path, index=False)
+    dataset = MyDataset(
+        promoter_file=promoter_path,
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        sequence_column="utr_sequence",
+        sequence_length=801,
+    )
+
+    promoter, _expr, _y = dataset[0]
+
+    assert promoter.shape == (801, 5)
+    assert torch.all(promoter[:, 0] == 1.0)

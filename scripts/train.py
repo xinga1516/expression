@@ -80,6 +80,7 @@ def print_training_resource_summary(
     model: nn.Module,
     batch_size: int,
     expr_dim: int,
+    sequence_length: int,
     samples_per_epoch: int,
     val_samples: int,
     cell_ratio: float,
@@ -89,10 +90,10 @@ def print_training_resource_summary(
     amp: bool,
 ) -> None:
     total_params, trainable_params = count_model_parameters(model)
-    input_mib = estimate_batch_input_mib(batch_size=batch_size, expr_dim=expr_dim)
+    input_mib = estimate_batch_input_mib(batch_size=batch_size, expr_dim=expr_dim, promoter_len=sequence_length)
     print("===== Resource Summary =====")
     print(f"params: total={total_params:,} trainable={trainable_params:,}")
-    print(f"batch_size={batch_size} expr_dim={expr_dim} estimated_input={input_mib:.1f} MiB/batch")
+    print(f"batch_size={batch_size} expr_dim={expr_dim} sequence_length={sequence_length} estimated_input={input_mib:.1f} MiB/batch")
     print(
         f"samples_per_epoch={samples_per_epoch} val_samples={val_samples} "
         f"cell_ratio={cell_ratio} val_cell_ratio={val_cell_ratio}"
@@ -225,17 +226,18 @@ def unpack_training_batch(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor
 def promoter_triplet_contrastive_loss(
     model: nn.Module,
     promoters: torch.Tensor,
+    positive_promoters: torch.Tensor,
     negative_promoters: torch.Tensor,
     margin: float = 1.0,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Triplet loss over promoter embeddings: real view, stochastic real view, matched control."""
+    """Triplet loss over promoter embeddings: center crop, shifted crop, matched control."""
     if not hasattr(model, "encode_promoter"):
         raise ValueError("Contrastive training requires a model with encode_promoter(), e.g. CNNFlattenPromoterModel.")
     anchor = getattr(model, "last_lstm_out", None)
     if anchor is None:
         anchor = model.encode_promoter(promoters)
-    positive = model.encode_promoter(promoters)
+    positive = model.encode_promoter(positive_promoters)
     negative = model.encode_promoter(negative_promoters)
     if normalize:
         anchor = F.normalize(anchor, dim=1)
@@ -295,6 +297,7 @@ def train_model(
     checkpoint_metric: str = "val_loss_ema",
     contrastive_weight: float = 0.0,
     contrastive_margin: float = 1.0,
+    contrastive_positive_column: str = "positive_sequence",
     contrastive_negative_column: str = "control_sequence",
     contrastive_normalize: bool = True,
 ):
@@ -339,9 +342,15 @@ def train_model(
                 f"Contrastive training requires negative sequence column {contrastive_negative_column!r} "
                 "in the training promoter CSV."
             )
+        if not hasattr(train_ds, "has_sequence_column") or not train_ds.has_sequence_column(contrastive_positive_column):
+            raise ValueError(
+                f"Contrastive training requires positive sequence column {contrastive_positive_column!r} "
+                "in the training promoter CSV."
+            )
         print(
             f"[Contrastive] enabled: weight={contrastive_weight} margin={contrastive_margin} "
-            f"negative_column={contrastive_negative_column} normalize={contrastive_normalize}"
+            f"positive_column={contrastive_positive_column} negative_column={contrastive_negative_column} "
+            f"normalize={contrastive_normalize}"
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=1e-2)
@@ -694,11 +703,16 @@ def train_model(
             promoters = promoters.to(device, non_blocking=True)
             exprs = exprs.to(device, non_blocking=True)
             ys = ys.to(device, non_blocking=True).float()
+            positive_promoters = None
             negative_promoters = None
             if contrastive_enabled:
                 if pro_indices is None:
                     raise ValueError("Contrastive training batch is missing promoter indices.")
                 pro_indices_np = pro_indices.detach().cpu().numpy().astype(np.int64)
+                positive_promoters = train_loader.dataset.get_sequence_tensors(
+                    pro_indices_np,
+                    column=contrastive_positive_column,
+                ).to(device, non_blocking=True)
                 negative_promoters = train_loader.dataset.get_sequence_tensors(
                     pro_indices_np,
                     column=contrastive_negative_column,
@@ -712,11 +726,12 @@ def train_model(
                         promoter_triplet_contrastive_loss(
                             model,
                             promoters,
+                            positive_promoters,
                             negative_promoters,
                             margin=contrastive_margin,
                             normalize=contrastive_normalize,
                         )
-                        if contrastive_enabled and negative_promoters is not None
+                        if contrastive_enabled and positive_promoters is not None and negative_promoters is not None
                         else torch.zeros((), device=device)
                     )
                 mu_ratio = mu_ratio.squeeze(1)
@@ -735,11 +750,12 @@ def train_model(
                         promoter_triplet_contrastive_loss(
                             model,
                             promoters,
+                            positive_promoters,
                             negative_promoters,
                             margin=contrastive_margin,
                             normalize=contrastive_normalize,
                         )
-                        if contrastive_enabled and negative_promoters is not None
+                        if contrastive_enabled and positive_promoters is not None and negative_promoters is not None
                         else torch.zeros((), device=device)
                     )
                 out = out.float()
@@ -834,6 +850,7 @@ def main():
     parser.add_argument("--gpu-cache-dataset", action="store_true", default=False, help="Cache fixed promoter/expression/target tensors on GPU and gather batches on-device. Requires CUDA and cell ratios of 1.0.")
     parser.add_argument("--gpu-sampler", type=str, default="balanced", choices=["balanced", "random"], help="GPU-side pair sampler used by --gpu-cache-dataset.")
     parser.add_argument("--sequence-column", type=str, default="sequence", help="Promoter CSV sequence column to encode, e.g. sequence or control_sequence.")
+    parser.add_argument("--sequence-length", type=int, default=400, help="Sequence length used by the one-hot encoder and model.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional file listing fixed input gene IDs for expression branch.")
     parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse"], help="Metric monitored by early stopping and best_model saving.")
     parser.add_argument("--run-test-after-train", action="store_true", default=False, help="Run scripts.model_test standard test after training finishes.")
@@ -862,6 +879,7 @@ def main():
     parser.add_argument("--pearson-lambda", type=float, default=10.0, help="Lambda weight for the Pearson term in combined loss (only used with --loss combined)")
     parser.add_argument("--contrastive-weight", type=float, default=0.0, help="Stage 2 promoter triplet contrastive loss weight. 0 disables contrastive training.")
     parser.add_argument("--contrastive-margin", type=float, default=1.0, help="Triplet margin for promoter vs matched intergenic contrastive loss.")
+    parser.add_argument("--contrastive-positive-column", type=str, default="positive_sequence", help="Promoter CSV column used as shifted positive sequence for contrastive training.")
     parser.add_argument("--contrastive-negative-column", type=str, default="control_sequence", help="Promoter CSV column used as matched negative sequence for contrastive training.")
     parser.add_argument("--no-contrastive-normalize", action="store_true", default=False, help="Disable L2 normalization before triplet contrastive loss.")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
@@ -909,6 +927,7 @@ def main():
         log1p_cpm_target=use_log1p,
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
+        sequence_length=args.sequence_length,
         input_gene_panel_file=input_gene_panel_file,
         return_indices=args.contrastive_weight > 0.0,
     )
@@ -922,6 +941,7 @@ def main():
         log1p_cpm_target=use_log1p,
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
+        sequence_length=args.sequence_length,
         input_gene_panel_file=input_gene_panel_file,
         return_indices=False,
     )
@@ -1063,6 +1083,7 @@ def main():
     output_mode = "zinb" if args.loss == "zinb" else "scalar"
     model = build_model(
         args.model,
+        promoter_len=args.sequence_length,
         expr_dim=expr_dim,
         hidden_size=args.hidden_size,
         use_vae=args.vae_encoder is not None,
@@ -1075,6 +1096,7 @@ def main():
         model=model,
         batch_size=args.batch_size,
         expr_dim=expr_dim,
+        sequence_length=args.sequence_length,
         samples_per_epoch=args.samples_per_epoch,
         val_samples=args.val_samples,
         cell_ratio=args.cell_ratio,
@@ -1093,6 +1115,7 @@ def main():
         utils.dryrun_cpu(model, train_loader, steps=50, learning_rate=1e-4, save_path=plots_dir / "dryrun.png")
         # dryrun会改参数，重新初始化模型再正式训练
         model = build_model(args.model, expr_dim=expr_dim, hidden_size=args.hidden_size,
+                            promoter_len=args.sequence_length,
                             use_vae=args.vae_encoder is not None, vae_encoder_path=args.vae_encoder,
                             vae_fine_tune=args.vae_fine_tune, output_mode=output_mode,
                             fusion=args.fusion)
@@ -1139,6 +1162,7 @@ def main():
         checkpoint_metric=args.checkpoint_metric,
         contrastive_weight=args.contrastive_weight,
         contrastive_margin=args.contrastive_margin,
+        contrastive_positive_column=args.contrastive_positive_column,
         contrastive_negative_column=args.contrastive_negative_column,
         contrastive_normalize=not args.no_contrastive_normalize,
     )
@@ -1173,6 +1197,7 @@ def main():
             checkpoint=None,
             scrna_file=args.scrna_file,
             sequence_column=args.sequence_column,
+            sequence_length=args.sequence_length,
             input_gene_panel_file=args.input_gene_panel_file,
             batch_size=args.batch_size,
             num_workers=args.num_workers,

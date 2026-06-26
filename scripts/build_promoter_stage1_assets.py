@@ -204,6 +204,75 @@ def reverse_complement(seq: str) -> str:
     return seq.translate(table)[::-1].upper()
 
 
+def extract_shifted_sequence(
+    chrom_seq: str,
+    start0: int,
+    length: int,
+    strand: str,
+    shift_bp: int,
+) -> tuple[str, int, int, str]:
+    shifted_start = int(start0) + int(shift_bp)
+    shifted_end = shifted_start + int(length)
+    if shifted_start < 0 or shifted_end > len(chrom_seq):
+        return "", shifted_start, shifted_end, "out_of_bounds"
+    seq = chrom_seq[shifted_start:shifted_end].upper()
+    if str(strand) == "-":
+        seq = reverse_complement(seq)
+    if len(seq) != length:
+        return seq, shifted_start, shifted_end, "bad_length"
+    if "N" in seq:
+        return seq, shifted_start, shifted_end, "contains_N"
+    return seq, shifted_start, shifted_end, "shifted"
+
+
+def add_positive_shifted_promoters(
+    promoters: pd.DataFrame,
+    genome_fasta: Path,
+    shift_bp: int,
+) -> pd.DataFrame:
+    genome = SeqIO.to_dict(SeqIO.parse(str(genome_fasta), "fasta"))
+    rows: list[dict[str, Any]] = []
+    for row in promoters.itertuples(index=False):
+        chrom = str(row.chrom)
+        length = int(getattr(row, "length", len(str(row.sequence))))
+        if chrom not in genome:
+            rows.append(
+                {
+                    "positive_sequence": str(row.sequence),
+                    "positive_shift_bp": 0,
+                    "positive_start": int(row.start),
+                    "positive_end": int(row.end),
+                    "positive_status": "missing_contig_fallback_center",
+                }
+            )
+            continue
+        seq, pos_start, pos_end, status = extract_shifted_sequence(
+            chrom_seq=str(genome[chrom].seq).upper(),
+            start0=int(row.start),
+            length=length,
+            strand=str(row.strand),
+            shift_bp=shift_bp,
+        )
+        if status != "shifted":
+            seq = str(row.sequence)
+            pos_start = int(row.start)
+            pos_end = int(row.end)
+            effective_shift = 0
+            status = f"{status}_fallback_center"
+        else:
+            effective_shift = int(shift_bp)
+        rows.append(
+            {
+                "positive_sequence": seq,
+                "positive_shift_bp": effective_shift,
+                "positive_start": pos_start,
+                "positive_end": pos_end,
+                "positive_status": status,
+            }
+        )
+    return pd.concat([promoters.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+
+
 def build_interval_index(gtf_genes: pd.DataFrame, promoters: pd.DataFrame) -> dict[str, list[Interval]]:
     index: dict[str, list[Interval]] = defaultdict(list)
     for row in gtf_genes.itertuples(index=False):
@@ -467,6 +536,11 @@ def build_assets(args: argparse.Namespace) -> None:
         seed=args.seed,
         attempts=args.control_attempts,
     )
+    promoters = add_positive_shifted_promoters(
+        promoters,
+        genome_fasta=genome_fasta,
+        shift_bp=getattr(args, "positive_shift_bp", 20),
+    )
     matched_gene_ids = set(promoters.loc[promoters["match_status"] == "matched", "gene_id"].astype(str))
     matched_genes = included.loc[included["gene_id"].isin(matched_gene_ids)].copy()
     split_genes = choose_gene_splits(
@@ -537,6 +611,8 @@ def build_assets(args: argparse.Namespace) -> None:
         "included_gene_class_counts": final_split_genes["gene_class"].value_counts().to_dict(),
         "split_counts": final_split_genes["split"].value_counts().to_dict(),
         "control_match_counts": promoters["match_status"].value_counts().to_dict(),
+        "positive_shift_bp": int(getattr(args, "positive_shift_bp", 20)),
+        "positive_status_counts": promoters["positive_status"].value_counts().to_dict(),
         "input_gene_panel_method": args.input_gene_panel_method,
         "hvg_flavor": args.hvg_flavor,
         "input_gene_panel_size": int(len(input_panel)),
@@ -562,6 +638,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hvg-flavor", type=str, default="cell_ranger")
     parser.add_argument("--max-eval-cells", type=int, default=2048)
     parser.add_argument("--control-attempts", type=int, default=2000)
+    parser.add_argument("--positive-shift-bp", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

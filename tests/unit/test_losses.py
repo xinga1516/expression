@@ -70,13 +70,15 @@ def test_zinb_capable_models_output_shapes() -> None:
 def test_promoter_triplet_contrastive_loss_backpropagates() -> None:
     promoter = torch.zeros(2, 400, 5)
     promoter[:, :, 0] = 1.0
+    positive = torch.zeros(2, 400, 5)
+    positive[:, :, 1] = 1.0
     negative = torch.zeros(2, 400, 5)
     negative[:, :, 3] = 1.0
     expr = torch.rand(2, 5)
     model = build_model("CNNFlattenPromoterModel", expr_dim=5, hidden_size=4, output_mode="scalar")
 
     _ = model(promoter, expr)
-    loss = promoter_triplet_contrastive_loss(model, promoter, negative, margin=0.5)
+    loss = promoter_triplet_contrastive_loss(model, promoter, positive, negative, margin=0.5)
     loss.backward()
 
     assert torch.isfinite(loss)

@@ -11,6 +11,7 @@ import pytest
 import scripts.build_promoter_stage1_assets as stage1_assets
 from scripts.build_promoter_stage1_assets import (
     add_intergenic_controls,
+    add_positive_shifted_promoters,
     build_assets,
     choose_gene_splits,
     read_gtf_gene_table,
@@ -102,6 +103,29 @@ def test_add_intergenic_controls_writes_control_sequence(tmp_path) -> None:
     assert with_controls.loc[0, "match_status"] == "matched"
     assert len(with_controls.loc[0, "control_sequence"]) == 40
     assert not (10 < int(with_controls.loc[0, "control_end"]) and int(with_controls.loc[0, "control_start"]) < 30)
+
+
+def test_add_positive_shifted_promoters_writes_shifted_sequence(tmp_path) -> None:
+    genome = tmp_path / "tiny.fa"
+    genome_seq = ("ACGT" * 100)
+    genome.write_text(">2R\n" + genome_seq + "\n", encoding="utf-8")
+    promoters = pd.DataFrame(
+        {
+            "gene_id": ["g0"],
+            "chrom": ["2R"],
+            "start": [40],
+            "end": [80],
+            "strand": ["+"],
+            "sequence": [genome_seq[40:80]],
+            "length": [40],
+        }
+    )
+
+    shifted = add_positive_shifted_promoters(promoters, genome, shift_bp=5)
+
+    assert shifted.loc[0, "positive_status"] == "shifted"
+    assert shifted.loc[0, "positive_shift_bp"] == 5
+    assert shifted.loc[0, "positive_sequence"] == genome_seq[45:85]
 
 
 def test_select_input_gene_panel_uses_train_cells_and_scanpy_hvg(monkeypatch, tiny_adata) -> None:

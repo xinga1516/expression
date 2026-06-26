@@ -92,6 +92,7 @@ def test_tiny_contrastive_training_smoke(tiny_data_dir, tmp_path, monkeypatch) -
     val_promoter_path = tiny_data_dir / "promoter_val.csv"
     for path in [promoter_path, val_promoter_path]:
         promoters = pd.read_csv(path)
+        promoters["positive_sequence"] = ["C" * 400 for _ in range(len(promoters))]
         promoters["control_sequence"] = ["T" * 400 for _ in range(len(promoters))]
         promoters.to_csv(path, index=False)
     train_dataset = MyDataset(

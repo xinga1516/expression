@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path. Default: outputs/<exp_name>/checkpoints/best_model.safetensors")
     parser.add_argument("--scrna-file", type=str, default=None, help="Optional h5ad path. Default: resolved data_dir/integrated_data.h5ad or config scrna_file.")
     parser.add_argument("--sequence-column", type=str, default=None, help="Promoter CSV sequence column. Default: config value or sequence.")
+    parser.add_argument("--sequence-length", type=int, default=None, help="Sequence length. Default: config value or 400.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional fixed input gene panel file. Default: config value.")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -110,6 +111,7 @@ def build_test_model(cfg: dict[str, Any], expr_dim: int, checkpoint: Path, devic
     output_mode = "zinb" if loss_type == "zinb" else "scalar"
     model = build_model(
         cfg.get("model", "LSTMmodel"),
+        promoter_len=cfg.get("sequence_length", 400),
         expr_dim=expr_dim,
         hidden_size=cfg.get("hidden_size", 128),
         use_vae=cfg.get("use_vae", False),
@@ -1321,6 +1323,7 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         cfg_scrna = cfg.get("scrna_file")
         scrna_file = _resolve_optional_path(base_dir, cfg_scrna) if cfg_scrna else data_dir / "integrated_data.h5ad"
     sequence_column = args.sequence_column or cfg.get("sequence_column", "sequence")
+    sequence_length = int(args.sequence_length or cfg.get("sequence_length", 400))
     input_gene_panel_file = _resolve_optional_path(
         base_dir,
         args.input_gene_panel_file or cfg.get("input_gene_panel_file"),
@@ -1341,6 +1344,7 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         log1p_cpm_target=is_umi,
         preencode_promoters=args.preencode_promoters,
         sequence_column=sequence_column,
+        sequence_length=sequence_length,
         input_gene_panel_file=input_gene_panel_file,
     )
     loader = DataLoader(
@@ -1374,6 +1378,7 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint": str(checkpoint),
             "loss_type": loss_type,
             "sequence_column": sequence_column,
+            "sequence_length": sequence_length,
             "input_gene_panel_file": str(input_gene_panel_file) if input_gene_panel_file is not None else None,
             "max_samples": int(args.max_samples),
             "use_cell_split": bool(args.use_cell_split),
