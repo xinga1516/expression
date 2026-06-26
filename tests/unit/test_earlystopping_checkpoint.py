@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from scripts.train import compute_val_loss_ema, select_checkpoint_monitor, should_save_best_model
+import numpy as np
+
+from scripts.train import compute_val_loss_ema, safe_pearson_corr, safe_spearman_corr, select_checkpoint_monitor, should_save_best_model
 from src.earlystopping import EarlyStopping
 import src.utils as utils
 
@@ -50,8 +52,20 @@ def test_select_checkpoint_monitor_supports_val_rmse() -> None:
     assert select_checkpoint_monitor("val_loss_ema", 2.0, 1.5, 1.2) == pytest.approx(1.5)
     assert select_checkpoint_monitor("val_loss", 2.0, 1.5, 1.2) == pytest.approx(2.0)
     assert select_checkpoint_monitor("val_rmse", 2.0, 1.5, 1.2) == pytest.approx(1.2)
+    assert select_checkpoint_monitor("val_pearson", 2.0, 1.5, 1.2, val_pearson=0.25) == pytest.approx(-0.25)
+    assert select_checkpoint_monitor("val_spearman", 2.0, 1.5, 1.2, val_spearman=0.4) == pytest.approx(-0.4)
     with pytest.raises(ValueError):
         select_checkpoint_monitor("unknown", 2.0, 1.5, 1.2)
+
+
+def test_safe_validation_correlations_handle_constant_vectors() -> None:
+    y_true = np.asarray([0.0, 1.0, 2.0, 3.0])
+    y_pred = np.asarray([0.0, 2.0, 4.0, 6.0])
+
+    assert safe_pearson_corr(y_true, y_pred) == pytest.approx(1.0)
+    assert safe_spearman_corr(y_true, y_pred) == pytest.approx(1.0)
+    assert np.isnan(safe_pearson_corr(y_true, np.ones_like(y_true)))
+    assert np.isnan(safe_spearman_corr(y_true, np.ones_like(y_true)))
 
 
 def test_save_and_resume_checkpoint_round_trip(tmp_path) -> None:

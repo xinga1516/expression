@@ -24,6 +24,7 @@ import pandas as pd
 import numpy as np
 import scanpy as sc
 import copy
+from scipy.stats import rankdata
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -258,11 +259,27 @@ def should_save_best_model(current_monitor_loss: float, best_score: float | None
     return best_score is not None and current_monitor_loss == best_score
 
 
+def safe_pearson_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Return Pearson r, or NaN when either vector is constant or too short."""
+    if len(y_true) <= 1 or np.std(y_true) <= 0 or np.std(y_pred) <= 0:
+        return float("nan")
+    return float(np.corrcoef(y_true, y_pred)[0, 1])
+
+
+def safe_spearman_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Return Spearman r via rank Pearson, or NaN when ranks are constant."""
+    if len(y_true) <= 1:
+        return float("nan")
+    return safe_pearson_corr(rankdata(y_true), rankdata(y_pred))
+
+
 def select_checkpoint_monitor(
     checkpoint_metric: str,
     val_loss: float,
     val_loss_ema: float,
     val_rmse: float,
+    val_pearson: float = float("nan"),
+    val_spearman: float = float("nan"),
 ) -> float:
     """Select the scalar metric used by early stopping and best-model saving."""
     if checkpoint_metric == "val_loss_ema":
@@ -271,6 +288,10 @@ def select_checkpoint_monitor(
         return float(val_loss)
     if checkpoint_metric == "val_rmse":
         return float(val_rmse)
+    if checkpoint_metric == "val_pearson":
+        return float("inf") if math.isnan(val_pearson) else -float(val_pearson)
+    if checkpoint_metric == "val_spearman":
+        return float("inf") if math.isnan(val_spearman) else -float(val_spearman)
     raise ValueError(f"Unsupported checkpoint_metric: {checkpoint_metric}")
 
 
@@ -428,6 +449,11 @@ def train_model(
         return
 
     zinb_loss_fn = ZINBLoss() if loss_type == "zinb" else None
+    diagnostic_best_scores: dict[str, float] = {
+        "val_rmse": float("inf"),
+        "val_pearson": -float("inf"),
+        "val_spearman": -float("inf"),
+    }
 
     # Training loop — validate first (captures initial loss at epoch 0), then train
     for epoch in range(start_epoch, epochs):
@@ -459,6 +485,7 @@ def train_model(
         epoch_val_rmse = float("nan")
         epoch_val_pearson = float("nan")
         epoch_val_pearson_all = float("nan")
+        epoch_val_spearman_all = float("nan")
         epoch_val_zero_acc = float("nan")
 
         if val_loader is not None:
@@ -513,10 +540,8 @@ def train_model(
                             out = model(promoters, exprs).squeeze(1)
                         out = out.float()
                         sq = (out - ys) ** 2
-
-                        if loss_type in ("pearson", "combined"):
-                            all_val_true.append(ys.cpu().numpy())
-                            all_val_pred.append(out.cpu().numpy())
+                        all_val_true.append(ys.cpu().numpy())
+                        all_val_pred.append(out.cpu().numpy())
 
                     zero_mask = (ys == 0)
                     nz_mask = ~zero_mask
@@ -548,11 +573,12 @@ def train_model(
                         all_zero_pred.append(out[zero_mask].cpu().numpy() if loss_type != "zinb" else y_pred_log[zero_mask].cpu().numpy())
 
             avg_val_loss = val_loss_num / max(val_loss_den, 1e-12)
-            if loss_type in ("pearson", "combined") and all_val_true:
+            if all_val_true:
                 val_true_all = np.concatenate(all_val_true)
                 val_pred_all = np.concatenate(all_val_pred)
-                if len(val_true_all) > 1 and np.std(val_true_all) > 0 and np.std(val_pred_all) > 0:
-                    epoch_val_pearson_all = float(np.corrcoef(val_true_all, val_pred_all)[0, 1])
+                epoch_val_pearson_all = safe_pearson_corr(val_true_all, val_pred_all)
+                epoch_val_spearman_all = safe_spearman_corr(val_true_all, val_pred_all)
+                if not math.isnan(epoch_val_pearson_all) and loss_type in ("pearson", "combined"):
                     if loss_type == "pearson":
                         avg_val_loss = 1.0 - epoch_val_pearson_all
                     else:
@@ -561,11 +587,6 @@ def train_model(
                     avg_val_loss = 1.0
             elif loss_type == "pearson":
                 avg_val_loss = 1.0
-            elif loss_type == "zinb" and all_val_true:
-                val_true_all = np.concatenate(all_val_true)
-                val_pred_all = np.concatenate(all_val_pred)
-                if len(val_true_all) > 1 and np.std(val_true_all) > 0 and np.std(val_pred_all) > 0:
-                    epoch_val_pearson_all = float(np.corrcoef(val_true_all, val_pred_all)[0, 1])
             val_losses_zero.append(val_zero_sum / max(val_zero_count, 1))
             val_losses_nz.append(val_nz_sum / max(val_nz_count, 1))
             val_sq_count = val_zero_count + val_nz_count
@@ -576,8 +597,7 @@ def train_model(
             if all_nz_true:
                 nz_true_all = np.concatenate(all_nz_true)
                 nz_pred_all = np.concatenate(all_nz_pred)
-                if len(nz_true_all) > 1 and np.std(nz_true_all) > 0 and np.std(nz_pred_all) > 0:
-                    epoch_val_pearson = float(np.corrcoef(nz_true_all, nz_pred_all)[0, 1])
+                epoch_val_pearson = safe_pearson_corr(nz_true_all, nz_pred_all)
                 val_pearson_nz.append(epoch_val_pearson)
 
             # Accuracy on zero samples: |pred| < threshold
@@ -608,6 +628,8 @@ def train_model(
         )
         if not math.isnan(epoch_val_pearson_all):
             log_msg += f" | Pearson(All)={epoch_val_pearson_all:.4f}"
+        if not math.isnan(epoch_val_spearman_all):
+            log_msg += f" | Spearman(All)={epoch_val_spearman_all:.4f}"
         if not math.isnan(epoch_val_pearson):
             log_msg += f" | Pearson(NZ)={epoch_val_pearson:.4f}"
         if not math.isnan(epoch_val_zero_acc):
@@ -636,6 +658,7 @@ def train_model(
             val_loss_nonzero=val_losses_nz[-1],
             val_pearson_nonzero=epoch_val_pearson,
             val_pearson_all=epoch_val_pearson_all,
+            val_spearman_all=epoch_val_spearman_all,
             val_zero_accuracy=epoch_val_zero_acc,
             lstm_var=epoch_lstm_var,
             expr_var=epoch_expr_var,
@@ -651,10 +674,26 @@ def train_model(
             val_loss=monitor_loss,
             val_loss_ema=val_loss_ema,
             val_rmse=epoch_val_rmse if not math.isnan(epoch_val_rmse) else monitor_loss,
+            val_pearson=epoch_val_pearson_all,
+            val_spearman=epoch_val_spearman_all,
         )
         earlystopping(checkpoint_monitor)
         if should_save_best_model(checkpoint_monitor, earlystopping.best_score):
             utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
+        diagnostic_metrics = {
+            "val_rmse": epoch_val_rmse,
+            "val_pearson": epoch_val_pearson_all,
+            "val_spearman": epoch_val_spearman_all,
+        }
+        for metric_name, metric_value in diagnostic_metrics.items():
+            if math.isnan(metric_value):
+                continue
+            is_min_metric = metric_name == "val_rmse"
+            current_best = diagnostic_best_scores[metric_name]
+            improved = metric_value < current_best if is_min_metric else metric_value > current_best
+            if improved:
+                diagnostic_best_scores[metric_name] = float(metric_value)
+                utils.robust_save_model(model, ckpt_dir / f"best_{metric_name}.safetensors")
 
         utils.save_checkpoint(
             checkpoint_path=ckpt_dir / "last.ckpt",
@@ -852,7 +891,7 @@ def main():
     parser.add_argument("--sequence-column", type=str, default="sequence", help="Promoter CSV sequence column to encode, e.g. sequence or control_sequence.")
     parser.add_argument("--sequence-length", type=int, default=400, help="Sequence length used by the one-hot encoder and model.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional file listing fixed input gene IDs for expression branch.")
-    parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse"], help="Metric monitored by early stopping and best_model saving.")
+    parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse", "val_pearson", "val_spearman"], help="Metric monitored by early stopping and best_model saving.")
     parser.add_argument("--run-test-after-train", action="store_true", default=False, help="Run scripts.model_test standard test after training finishes.")
     parser.add_argument("--test-max-samples", type=int, default=0, help="Max test samples for --run-test-after-train. 0 means all.")
     parser.add_argument("--test-spearman-samples", type=int, default=1_000_000, help="Spearman reservoir size for --run-test-after-train. 0 means all.")
