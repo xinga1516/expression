@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dataset import MyDataset
+from src.gpu_cache import GpuCachedPairLoader
 from src.model import MODEL_REGISTRY, build_model
 from src.earlystopping import EarlyStopping
 import src.utils as utils
@@ -734,6 +735,8 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers (0 avoids extra memory copies)")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Dataloader prefetch factor used when num_workers > 0")
     parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode all promoter sequences in memory. Faster, but uses much more RAM.")
+    parser.add_argument("--gpu-cache-dataset", action="store_true", default=False, help="Cache fixed promoter/expression/target tensors on GPU and gather batches on-device. Requires CUDA and cell ratios of 1.0.")
+    parser.add_argument("--gpu-sampler", type=str, default="balanced", choices=["balanced", "random"], help="GPU-side pair sampler used by --gpu-cache-dataset.")
     parser.add_argument("--sequence-column", type=str, default="sequence", help="Promoter CSV sequence column to encode, e.g. sequence or control_sequence.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional file listing fixed input gene IDs for expression branch.")
     parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse"], help="Metric monitored by early stopping and best_model saving.")
@@ -923,6 +926,31 @@ def main():
             pin_memory=pin_memory,
             drop_last=True,
             **loader_worker_kwargs,
+        )
+
+    if args.gpu_cache_dataset:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--gpu-cache-dataset requires CUDA.")
+        if args.cell_ratio < 1.0 or args.val_cell_ratio < 1.0:
+            raise ValueError("--gpu-cache-dataset currently requires --cell-ratio 1.0 and --val-cell-ratio 1.0.")
+        cache_device = torch.device("cuda")
+        train_loader = GpuCachedPairLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            device=cache_device,
+            samples_per_epoch=args.samples_per_epoch,
+            seed=args.seed,
+            sampler_mode=args.gpu_sampler,
+            drop_last=True,
+        )
+        val_loader = GpuCachedPairLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            device=cache_device,
+            samples_per_epoch=args.val_samples,
+            seed=args.seed,
+            sampler_mode=args.gpu_sampler,
+            drop_last=True,
         )
 
     expr_dim = train_dataset.expr_dim

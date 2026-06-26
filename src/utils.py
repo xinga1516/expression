@@ -29,7 +29,6 @@ class BalancedEpochSubsetSampler(Sampler):
 
     def __init__(self, dataset: Any, samples_per_epoch: int, seed: int = 42) -> None:
         self.dataset = dataset
-        self.samples_per_epoch = int(samples_per_epoch)
         self.seed = int(seed)
         self.epoch = 0
 
@@ -38,7 +37,12 @@ class BalancedEpochSubsetSampler(Sampler):
         self.total_len = self.P * self.C
         if self.total_len <= 0:
             raise ValueError("Dataset is empty.")
-        self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
+        requested_samples = int(samples_per_epoch)
+        if requested_samples < 0:
+            raise ValueError("samples_per_epoch must be non-negative.")
+        if requested_samples == 0:
+            requested_samples = 128_000
+        self.samples_per_epoch = min(requested_samples, self.total_len)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -280,6 +284,8 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "vae_fine_tune_start_epoch": getattr(args, "vae_fine_tune_start_epoch", -1),
         "fusion": getattr(args, "fusion", "gate"),
         "preencode_promoters": getattr(args, "preencode_promoters", False),
+        "gpu_cache_dataset": getattr(args, "gpu_cache_dataset", False),
+        "gpu_sampler": getattr(args, "gpu_sampler", "balanced"),
         "amp": getattr(args, "amp", False),
         "sequence_column": getattr(args, "sequence_column", "sequence"),
         "input_gene_panel_file": str(getattr(args, "input_gene_panel_file", None)) if getattr(args, "input_gene_panel_file", None) is not None else None,

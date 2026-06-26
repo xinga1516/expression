@@ -32,6 +32,14 @@ def test_balanced_sampler_length_bounds_and_promoter_balance(tiny_data_dir) -> N
     assert promoter_counts.max() - promoter_counts.min() <= 1
 
 
+def test_balanced_sampler_auto_samples_uses_dataset_size_for_small_dataset(tiny_data_dir) -> None:
+    dataset = MyDataset(tiny_data_dir / "promoter_train.csv", tiny_data_dir / "integrated_data.h5ad")
+    sampler = BalancedEpochSubsetSampler(dataset, samples_per_epoch=0, seed=7)
+
+    assert len(sampler) == len(dataset)
+    assert len(list(iter(sampler))) == len(dataset)
+
+
 def test_zero_nonzero_sampler_respects_requested_ratio(tiny_data_dir) -> None:
     dataset = MyDataset(tiny_data_dir / "promoter_train.csv", tiny_data_dir / "integrated_data.h5ad")
     sampler = ZeroNonZeroSampler(dataset, nonzero_ratio=0.5, samples_per_epoch=8, seed=3)

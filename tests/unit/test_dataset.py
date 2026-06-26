@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from src.dataset import MyDataset, PromoterOneHotEncoder
+from src.gpu_cache import GpuCachedPairLoader
 
 
 pytestmark = pytest.mark.unit
@@ -127,3 +128,58 @@ def test_dataset_masks_target_inside_fixed_input_panel(tiny_data_dir) -> None:
     assert dataset.expr_dim == 3
     assert y.item() == pytest.approx(10.0)
     assert expr.tolist() == pytest.approx([0.0, 0.0, 5.0])
+
+
+def test_gpu_cached_pair_loader_matches_dataset_fixed_panel_and_masking(tiny_data_dir) -> None:
+    panel_path = tiny_data_dir / "input_gene_panel_train.txt"
+    panel_path.write_text("g0\ng1\ng2\n", encoding="utf-8")
+    dataset = MyDataset(
+        promoter_file=tiny_data_dir / "promoter_train.csv",
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        input_gene_panel_file=panel_path,
+        log1p_cpm_target=True,
+        preencode_promoters=True,
+    )
+    flat_indices = [0, dataset.C + 1, 2 * dataset.C + 2]
+    loader = GpuCachedPairLoader(
+        dataset=dataset,
+        batch_size=3,
+        device=torch.device("cpu"),
+        samples_per_epoch=3,
+        seed=11,
+        drop_last=False,
+    )
+
+    promoters, exprs, ys = loader._make_batch(flat_indices)
+
+    expected = [dataset[idx] for idx in flat_indices]
+    assert torch.equal(promoters, torch.stack([item[0] for item in expected]))
+    assert torch.allclose(exprs, torch.stack([item[1] for item in expected]))
+    assert torch.allclose(ys.cpu(), torch.stack([item[2] for item in expected]))
+
+
+def test_gpu_cached_pair_loader_balanced_sampler_covers_promoters_evenly(tiny_data_dir) -> None:
+    dataset = MyDataset(
+        promoter_file=tiny_data_dir / "promoter_train.csv",
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        preencode_promoters=True,
+    )
+    loader = GpuCachedPairLoader(
+        dataset=dataset,
+        batch_size=2,
+        device=torch.device("cpu"),
+        samples_per_epoch=dataset.P * 2 + 1,
+        seed=13,
+        sampler_mode="balanced",
+        drop_last=False,
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(13)
+
+    promoter_idx, cell_idx = loader._sample_pair_indices(dataset.P * 2 + 1, generator)
+    counts = torch.bincount(promoter_idx.cpu(), minlength=dataset.P)
+
+    assert counts.min().item() == 2
+    assert counts.max().item() == 3
+    assert int(cell_idx.min()) >= 0
+    assert int(cell_idx.max()) < dataset.C
