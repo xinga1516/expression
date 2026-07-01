@@ -290,6 +290,16 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "sequence_column": getattr(args, "sequence_column", "sequence"),
         "sequence_length": getattr(args, "sequence_length", 400),
         "input_gene_panel_file": str(getattr(args, "input_gene_panel_file", None)) if getattr(args, "input_gene_panel_file", None) is not None else None,
+        "expression_layer": getattr(args, "expression_layer_resolved", getattr(args, "expression_layer", "auto")),
+        "expression_transform": getattr(args, "expression_transform_resolved", getattr(args, "expression_transform", "auto")),
+        "target_count_layer": getattr(args, "target_count_layer_resolved", getattr(args, "target_count_layer", "auto")),
+        "target_value_layer": getattr(args, "target_value_layer_resolved", getattr(args, "target_value_layer", "auto")),
+        "target_transform": getattr(args, "target_transform_resolved", getattr(args, "target_transform", "auto")),
+        "expression_layer_requested": getattr(args, "expression_layer", None),
+        "expression_transform_requested": getattr(args, "expression_transform", None),
+        "target_count_layer_requested": getattr(args, "target_count_layer", None),
+        "target_value_layer_requested": getattr(args, "target_value_layer", None),
+        "target_transform_requested": getattr(args, "target_transform", None),
         "checkpoint_metric": getattr(args, "checkpoint_metric", "val_loss_ema"),
         "run_test_after_train": getattr(args, "run_test_after_train", False),
         "contrastive_weight": getattr(args, "contrastive_weight", 0.0),
@@ -654,7 +664,6 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_pr
 
     # Pre-fetch promoter tensors
     promoter_tensors = dataset.get_promoter_tensors(pro_indices).to(device)  # (P, 400, 5)
-    X_csr = dataset.X.tocsr()
     id2symbol = dict(zip(dataset.scrna.var["gene_id"], dataset.scrna.var["gene_symbol"]))
 
     # Collect all points for annotation
@@ -675,16 +684,19 @@ def plot_per_promoter_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_pr
                 batch_cells = cell_indices[start:end]
                 cell_rows = [int(dataset.cells[j]) for j in batch_cells]
 
-                full_batch_np = np.vstack([X_csr[r].toarray().ravel() for r in cell_rows]).astype(np.float32)
-                ys_np = full_batch_np[:, target_idx].astype(np.float32, copy=False)
+                target_batch_np = np.vstack([dataset.get_target_row(r) for r in cell_rows]).astype(np.float32)
+                target_value_batch_np = np.vstack([dataset.get_target_value_row(r) for r in cell_rows]).astype(np.float32)
+                expr_batch_full_np = np.vstack([dataset.get_expression_row(r) for r in cell_rows]).astype(np.float32)
+                raw_ys_np = target_batch_np[:, target_idx].astype(np.float32, copy=False)
+                ys_np = target_value_batch_np[:, target_idx].astype(np.float32, copy=False)
                 X_masked_np = np.vstack([
                     dataset.make_masked_expression_input(row, target_idx)
-                    for row in full_batch_np
+                    for row in expr_batch_full_np
                 ]).astype(np.float32, copy=False)
                 ys = torch.from_numpy(ys_np).to(device)
                 X_masked = torch.from_numpy(X_masked_np).to(device)
                 full_lib_size = torch.from_numpy(
-                    np.maximum(full_batch_np.sum(axis=1) - ys_np, 1.0).astype(np.float32)
+                    np.maximum(target_batch_np.sum(axis=1) - raw_ys_np, 1.0).astype(np.float32)
                 ).to(device)
 
                 p_batch = p_single.unsqueeze(0).expand(len(batch_cells), -1, -1)  # (B, 400, 5)
@@ -789,7 +801,6 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
     target_indices = [int(dataset.promoter2expr_idx[p]) for p in pro_indices]
     gene_ids = dataset.promoters["gene_id"].iloc[pro_indices].values
     gene_names = [id2symbol.get(gid, gid) for gid in gene_ids]
-    X_csr = dataset.X.tocsr()
 
     # Collect all points
     all_yt: list[np.ndarray] = []
@@ -799,7 +810,9 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
     with torch.no_grad():
         for ci, cell_i in enumerate(cell_indices):
             cell_row = int(dataset.cells[cell_i])
-            expr_vec_np = X_csr[cell_row].toarray().ravel().astype(np.float32)
+            target_vec_np = dataset.get_target_row(cell_row)
+            target_value_vec_np = dataset.get_target_value_row(cell_row)
+            expr_vec_np = dataset.get_expression_row(cell_row)
 
             for g_start in range(0, n_genes_actual, batch_size):
                 g_end = min(g_start + batch_size, n_genes_actual)
@@ -808,7 +821,8 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
                 batch_genes = gene_names[g_start:g_end]
                 batch_promoters = promoter_all[g_start:g_end]  # (B, 400, 5)
 
-                ys_np = np.asarray([expr_vec_np[tgt] for tgt in batch_targets], dtype=np.float32)
+                raw_ys_np = np.asarray([target_vec_np[tgt] for tgt in batch_targets], dtype=np.float32)
+                ys_np = np.asarray([target_value_vec_np[tgt] for tgt in batch_targets], dtype=np.float32)
                 expr_batch_np = np.vstack([
                     dataset.make_masked_expression_input(expr_vec_np, int(tgt))
                     for tgt in batch_targets
@@ -816,7 +830,7 @@ def plot_per_cell_scatter(model: nn.Module, dataset: Any, is_umi: bool, n_cells:
                 expr_batch = torch.from_numpy(expr_batch_np).to(device)
                 ys = torch.from_numpy(ys_np).to(device)
                 full_lib_size = torch.from_numpy(
-                    np.maximum(expr_vec_np.sum() - ys_np, 1.0).astype(np.float32)
+                    np.maximum(target_vec_np.sum() - raw_ys_np, 1.0).astype(np.float32)
                 ).to(device)
 
                 if is_zinb:

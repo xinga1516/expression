@@ -58,6 +58,10 @@ class MyDataset(Dataset):
         preencode_promoters: bool = False,
         sequence_column: str = "sequence",
         sequence_length: int = 400,
+        expression_layer: Optional[str] = None,
+        expression_transform: str = "none",
+        target_count_layer: Optional[str] = None,
+        target_value_layer: Optional[str] = None,
         input_gene_ids: Optional[Sequence[str]] = None,
         input_gene_panel_file: Optional[str | Path] = None,
         return_indices: bool = False,
@@ -74,8 +78,20 @@ class MyDataset(Dataset):
                 f"Available columns: {sorted(self.promoters.columns)}"
             )
         self.scrna = sc.read(scrna_file, sparse=True)
-        # CSR: fast row access; CSC: fast column access.
-        self.X = self.scrna.X.tocsr() if sparse.issparse(self.scrna.X) else self.scrna.X
+        self.expression_layer_name = self._normalize_layer_name(expression_layer)
+        self.target_count_layer_name = self._normalize_layer_name(target_count_layer)
+        self.target_value_layer_name = self._normalize_layer_name(target_value_layer)
+        self.expression_transform = expression_transform.lower()
+        if self.expression_transform not in {"none", "log1p"}:
+            raise ValueError("expression_transform must be 'none' or 'log1p'.")
+        # Keep self.X as the target/count source for samplers and legacy helpers.
+        self.X = self._select_matrix(self.target_count_layer_name, purpose="target")
+        self.expression_X = self._select_matrix(self.expression_layer_name, purpose="expression")
+        self.target_value_X = (
+            self._select_matrix(self.target_value_layer_name, purpose="target value")
+            if self.target_value_layer_name is not None
+            else None
+        )
 
         self.promoter_encoder = PromoterOneHotEncoder(length=self.sequence_length)
         self.preencode_promoters = preencode_promoters
@@ -144,7 +160,73 @@ class MyDataset(Dataset):
         self.mode = mode
         self.seed = seed
         self.log1p_cpm_target = log1p_cpm_target
-        self.expr_dim = len(self.input_expr_indices) if self.input_expr_indices is not None else self.X.shape[1]
+        self.expr_dim = len(self.input_expr_indices) if self.input_expr_indices is not None else self.expression_X.shape[1]
+
+    @staticmethod
+    def _normalize_layer_name(layer: Optional[str]) -> str | None:
+        if layer is None:
+            return None
+        layer = str(layer).strip()
+        if layer == "" or layer.lower() in {"x", "none"}:
+            return None
+        return layer
+
+    def _select_matrix(self, layer: str | None, purpose: str):
+        if layer is None:
+            matrix = self.scrna.X
+        elif layer in self.scrna.layers:
+            matrix = self.scrna.layers[layer]
+        elif layer.lower() in {"logcpm", "log_cpm", "logcpm1p", "log1p_cpm"}:
+            fallback = next(
+                (candidate for candidate in ("logcpm", "log_cpm", "logCPM", "log1p_cpm", "cpm") if candidate in self.scrna.layers),
+                None,
+            )
+            if fallback is None:
+                available = sorted(map(str, self.scrna.layers.keys()))
+                raise KeyError(
+                    f"AnnData logCPM layer requested for {purpose} but not found in {self.scrna_file}. "
+                    f"Expected one of logcpm/log_cpm/logCPM/log1p_cpm/cpm. Available layers: {available}."
+                )
+            if fallback == "cpm":
+                print(
+                    f"[Dataset] Using layer 'cpm' as precomputed logCPM for {purpose}; "
+                    "project convention expects this layer to already be log-transformed."
+                )
+            matrix = self.scrna.layers[fallback]
+        elif layer == "counts":
+            print(f"[Dataset] WARNING: layer 'counts' not found for {purpose}; falling back to adata.X.")
+            matrix = self.scrna.X
+        else:
+            available = sorted(map(str, self.scrna.layers.keys()))
+            raise KeyError(
+                f"AnnData layer {layer!r} requested for {purpose} but not found in {self.scrna_file}. "
+                f"Available layers: {available}; use 'X' to read adata.X."
+            )
+        return matrix.tocsr() if sparse.issparse(matrix) else matrix
+
+    @staticmethod
+    def _dense_row(matrix, row_idx: int) -> np.ndarray:
+        row = matrix[row_idx]
+        if hasattr(row, "toarray"):
+            row = row.toarray().astype("float32").squeeze()
+        return np.asarray(row, dtype=np.float32).ravel()
+
+    def _apply_expression_transform(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32)
+        if self.expression_transform == "log1p":
+            return np.log1p(np.maximum(values, 0.0)).astype(np.float32, copy=False)
+        return values.astype(np.float32, copy=False)
+
+    def get_target_row(self, cell_row: int) -> np.ndarray:
+        return self._dense_row(self.X, int(cell_row))
+
+    def get_target_value_row(self, cell_row: int) -> np.ndarray:
+        if self.target_value_X is not None:
+            return self._dense_row(self.target_value_X, int(cell_row))
+        return self.get_target_row(cell_row)
+
+    def get_expression_row(self, cell_row: int) -> np.ndarray:
+        return self._apply_expression_transform(self._dense_row(self.expression_X, int(cell_row)))
 
     def _resolve_input_gene_ids(
         self,
@@ -232,21 +314,20 @@ class MyDataset(Dataset):
         promoter = self.get_promoter_tensor(pro_i)
         #gene_id = (self.promoters["gene_id"]).iloc[pro_i]
         cell_id = self.cells[cell_i]
-        expr_all = self.X[cell_id]
-
-        if hasattr(expr_all, "toarray"):
-            expr_all = expr_all.toarray().astype("float32").squeeze()     # (16300,)
-        expr_all_np = np.asarray(expr_all, dtype=np.float32).ravel()
+        target_all_np = self.get_target_row(cell_id)
+        target_value_np = self.get_target_value_row(cell_id)
+        expr_all_np = self.get_expression_row(cell_id)
         
         target_idx = self.promoter2expr_idx[pro_i]
-        y_value = float(expr_all_np[target_idx])
+        y_value = float(target_all_np[target_idx])
+        y_model_value = float(target_value_np[target_idx])
         expr_input_np = self.make_masked_expression_input(expr_all_np, int(target_idx))
         expr_input = torch.from_numpy(expr_input_np).float()
-        y = torch.tensor(y_value, dtype=torch.float32)
+        y = torch.tensor(y_model_value, dtype=torch.float32)
 
-        if self.log1p_cpm_target:
-            lib_size = max(float(expr_all_np.sum() - y_value), 1.0)
-            cpm = y / max(float(lib_size), 1.0) * 1e6
+        if self.log1p_cpm_target and self.target_value_X is None:
+            lib_size = max(float(target_all_np.sum() - y_value), 1.0)
+            cpm = torch.tensor(y_value, dtype=torch.float32) / max(float(lib_size), 1.0) * 1e6
             y = torch.log1p(cpm)
 
         return promoter, expr_input, y

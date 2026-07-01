@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-column", type=str, default=None, help="Promoter CSV sequence column. Default: config value or sequence.")
     parser.add_argument("--sequence-length", type=int, default=None, help="Sequence length. Default: config value or 400.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional fixed input gene panel file. Default: config value.")
+    parser.add_argument("--expression-layer", type=str, default=None, help="AnnData layer for expression input. Default: config value or auto.")
+    parser.add_argument("--expression-transform", type=str, default=None, help="Expression transform: auto, none, or log1p. Default: config value or auto.")
+    parser.add_argument("--target-count-layer", type=str, default=None, help="AnnData layer for UMI count targets. Default: config value or auto.")
+    parser.add_argument("--target-value-layer", type=str, default=None, help="AnnData layer for precomputed scalar targets. Default: config value or auto.")
+    parser.add_argument("--target-transform", type=str, default=None, help="Target transform: auto, none, or log1p_cpm. Default: config value or auto.")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -134,6 +139,12 @@ def predict_model_values(model: torch.nn.Module, promoters: torch.Tensor, exprs:
 
 
 def compute_target_values(dataset: MyDataset, cell_rows: np.ndarray, gene_idx: int, values: np.ndarray, totals: np.ndarray) -> np.ndarray:
+    target_value_X = getattr(dataset, "target_value_X", None)
+    if target_value_X is not None:
+        target_values = target_value_X[cell_rows, gene_idx]
+        if hasattr(target_values, "toarray"):
+            target_values = target_values.toarray()
+        return np.asarray(target_values, dtype=np.float64).ravel()
     if dataset.log1p_cpm_target:
         denom = np.maximum(totals[cell_rows] - values, 1.0)
         return np.log1p(values / denom * 1e6)
@@ -228,12 +239,9 @@ def select_top_expressed_pairs(
 
 
 def build_masked_expression(dataset: MyDataset, cell_row: int, target_idx: int) -> tuple[torch.Tensor, float]:
-    expr = dataset.X[cell_row]
-    if hasattr(expr, "toarray"):
-        expr_arr = expr.toarray().astype("float32").squeeze()
-    else:
-        expr_arr = np.asarray(expr, dtype=np.float32).squeeze()
-    y_raw = float(expr_arr[target_idx])
+    target_arr = dataset.get_target_row(cell_row)
+    expr_arr = dataset.get_expression_row(cell_row)
+    y_raw = float(target_arr[target_idx])
     expr_input = dataset.make_masked_expression_input(expr_arr, target_idx)
     return torch.from_numpy(expr_input).float(), y_raw
 
@@ -1303,6 +1311,64 @@ def _resolve_optional_path(base_dir: Path, path_value: str | None) -> Path | Non
     return path
 
 
+def _resolve_layer_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "" or value.lower() in {"x", "none"}:
+        return None
+    return value
+
+
+def resolve_eval_expression_data_config(args: argparse.Namespace, cfg: dict[str, Any], loss_type: str) -> dict[str, Any]:
+    use_vae = bool(cfg.get("use_vae", cfg.get("vae_encoder_path") is not None))
+    loss_type = str(loss_type).lower()
+
+    expression_layer_raw = args.expression_layer if getattr(args, "expression_layer", None) is not None else cfg.get("expression_layer", "auto")
+    if str(expression_layer_raw).lower() == "auto":
+        expression_layer = "counts" if use_vae or loss_type == "zinb" else "logcpm"
+    else:
+        expression_layer = _resolve_layer_arg(expression_layer_raw)
+
+    expression_transform_raw = args.expression_transform if getattr(args, "expression_transform", None) is not None else cfg.get("expression_transform", "auto")
+    if str(expression_transform_raw).lower() == "auto":
+        expression_transform = "none"
+    else:
+        expression_transform = str(expression_transform_raw).lower()
+
+    target_count_layer_raw = args.target_count_layer if getattr(args, "target_count_layer", None) is not None else cfg.get("target_count_layer", "auto")
+    if str(target_count_layer_raw).lower() == "auto":
+        target_count_layer = "counts"
+    else:
+        target_count_layer = _resolve_layer_arg(target_count_layer_raw)
+
+    target_value_layer_raw = args.target_value_layer if getattr(args, "target_value_layer", None) is not None else cfg.get("target_value_layer", "auto")
+    if str(target_value_layer_raw).lower() == "auto":
+        target_value_layer = None if loss_type == "zinb" else "logcpm"
+    else:
+        target_value_layer = _resolve_layer_arg(target_value_layer_raw)
+
+    target_transform_raw = args.target_transform if getattr(args, "target_transform", None) is not None else cfg.get("target_transform", "auto")
+    if str(target_transform_raw).lower() == "auto":
+        target_transform = "none"
+    else:
+        target_transform = str(target_transform_raw).lower()
+
+    if expression_transform not in {"none", "log1p"}:
+        raise ValueError("--expression-transform must be one of auto, none, log1p")
+    if target_transform not in {"none", "log1p_cpm"}:
+        raise ValueError("--target-transform must be one of auto, none, log1p_cpm")
+
+    return {
+        "expression_layer": expression_layer,
+        "expression_transform": expression_transform,
+        "target_count_layer": target_count_layer,
+        "target_value_layer": target_value_layer,
+        "target_transform": target_transform,
+        "log1p_cpm_target": target_transform == "log1p_cpm",
+    }
+
+
 def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
     base_dir = PROJECT_ROOT
     run_dir = base_dir / "outputs" / args.exp_name
@@ -1328,7 +1394,16 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         base_dir,
         args.input_gene_panel_file or cfg.get("input_gene_panel_file"),
     )
-    is_umi = (data_dir.name.startswith("umi_") or scrna_file.parent.name.startswith("umi_")) and loss_type != "zinb"
+    data_config = resolve_eval_expression_data_config(args, cfg, loss_type)
+    print(
+        "[DataConfig] "
+        f"use_vae={bool(cfg.get('use_vae', cfg.get('vae_encoder_path') is not None))} loss={loss_type} "
+        f"expression_layer={data_config['expression_layer'] or 'X'} "
+        f"expression_transform={data_config['expression_transform']} "
+        f"target_count_layer={data_config['target_count_layer'] or 'X'} "
+        f"target_value_layer={data_config['target_value_layer'] or 'disabled'} "
+        f"target_transform={data_config['target_transform']}"
+    )
     test_cell_ids = None
     cell_split_dir = None
     if args.use_cell_split:
@@ -1341,10 +1416,14 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         cell_ids_subset=test_cell_ids,
         mode="test",
         seed=args.seed,
-        log1p_cpm_target=is_umi,
+        log1p_cpm_target=data_config["log1p_cpm_target"],
         preencode_promoters=args.preencode_promoters,
         sequence_column=sequence_column,
         sequence_length=sequence_length,
+        expression_layer=data_config["expression_layer"],
+        expression_transform=data_config["expression_transform"],
+        target_count_layer=data_config["target_count_layer"],
+        target_value_layer=data_config["target_value_layer"],
         input_gene_panel_file=input_gene_panel_file,
     )
     loader = DataLoader(
@@ -1380,6 +1459,11 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
             "sequence_column": sequence_column,
             "sequence_length": sequence_length,
             "input_gene_panel_file": str(input_gene_panel_file) if input_gene_panel_file is not None else None,
+            "expression_layer": data_config["expression_layer"],
+            "expression_transform": data_config["expression_transform"],
+            "target_count_layer": data_config["target_count_layer"],
+            "target_value_layer": data_config["target_value_layer"],
+            "target_transform": data_config["target_transform"],
             "max_samples": int(args.max_samples),
             "use_cell_split": bool(args.use_cell_split),
             "cell_split_dir": str(cell_split_dir) if cell_split_dir is not None else None,
@@ -1394,14 +1478,14 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         utils.plot_per_promoter_scatter(
             model,
             dataset,
-            is_umi=is_umi,
+            is_umi=data_config["log1p_cpm_target"],
             n_promoters=3,
             save_path=test_dir / "per_promoter_scatter.png",
         )
         utils.plot_per_cell_scatter(
             model,
             dataset,
-            is_umi=is_umi,
+            is_umi=data_config["log1p_cpm_target"],
             n_cells=3,
             save_path=test_dir / "per_cell_scatter.png",
         )

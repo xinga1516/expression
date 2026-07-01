@@ -2,6 +2,49 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## Runtime Environment
+
+Use WSL for this project. The default runtime is the WSL conda environment named `promodel_wsl`.
+
+First, running "wsl" in windows powershell.
+
+Before running Python project commands, activate the environment in WSL:
+
+```bash
+conda activate promodel_wsl
+```
+
+Do not use Windows-side Python, Spyder Python, or Windows conda environments for `scanpy`, `anndata`, `.h5ad`, training, evaluation, mutation tests, or data-building commands. Windows-side tools may be used only for lightweight text/config inspection when WSL is unavailable.
+
+If WSL or `promodel_wsl` is not visible from the current session, report that explicitly and avoid silently substituting another Python environment for biology/data/model checks. This prevents repeated confusion around `.h5ad` contents, AnnData layers, UMI counts, CPM/logCPM transforms, and GPU/training behavior.
+
+## AnnData Expression Layers
+
+For E-MTAB / UMI h5ad files, code should treat expression matrices by semantic role, not by directory name:
+
+- `adata.layers["counts"]`: raw UMI counts. Use this for VAE/scVI input, ZINB targets, zero/non-zero sampler pools, and library-size denominators.
+- precomputed logCPM layer: preferred name `logcpm`. The code also accepts `log_cpm`, `logCPM`, `log1p_cpm`, and, for backward compatibility, `cpm` as a precomputed logCPM layer. Do not apply another `log1p` transform to this layer.
+- `adata.X`: fallback only when explicitly requested with `X`/`none`; do not rely on `adata.X` implicitly for current E-MTAB training.
+
+Default training/evaluation behavior:
+
+- `--vae-encoder ...` or `--loss zinb`: expression input uses UMI counts.
+- no VAE with scalar losses (`mse`, `pearson`, `combined`): expression input uses precomputed logCPM.
+- scalar targets use the precomputed logCPM target layer by default.
+- ZINB targets remain raw UMI counts.
+
+Relevant CLI controls:
+
+```bash
+--expression-layer auto|counts|logcpm|cpm|X
+--expression-transform auto|none|log1p
+--target-count-layer auto|counts|X
+--target-value-layer auto|logcpm|cpm|none
+--target-transform auto|none|log1p_cpm
+```
+
+Use `--target-transform log1p_cpm --target-value-layer none` only for legacy experiments that must recompute logCPM from counts at runtime.
+
 ## Commands
 
 ```bash
@@ -43,6 +86,27 @@ sbatch hpc/command.sh
 ```
 
 ## Project Structure
+
+## Project Memory and Change Records
+
+Maintain these repository-level project memory files:
+
+- `TODO.md`: current task list. Update it when tasks are added, completed, blocked, or reprioritized.
+- `CHANGELOG.md`: human-readable change record. Every code, data-processing, configuration, experiment-script, or documentation change should add an entry describing what changed and why.
+- `LOG.md`: Codex operation log. Record meaningful Codex actions such as files inspected, files changed, commands/tests run, generated artifacts, and known follow-up work.
+- `project_overview.md`: concise project overview and current workflow. Update it periodically, especially after changes to data flow, training/evaluation workflow, model architecture, or major experiment conventions.
+- `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`: project guide and source of truth for intended biological/modeling assumptions, parameter choices, and workflow requirements.
+
+Before making changes, compare the planned change against `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md` and call out any conflict, missing requirement, or parameter mismatch. If a requested change intentionally deviates from the guide, record the deviation in `CHANGELOG.md` and `LOG.md`.
+
+For every completed repository change:
+
+- Update `CHANGELOG.md` with a dated entry.
+- Update `LOG.md` with a short operation record, including tests or commands run.
+- Update `TODO.md` if task status changed.
+- Update `project_overview.md` when the change affects project workflow, data/model assumptions, or recommended commands.
+
+These requirements are project-level standing instructions. They should be followed automatically in this repository; the user should not need to repeat them in each prompt.
 
 Gene expression prediction from promoter sequences and scRNA-seq data. The model takes a one-hot encoded promoter sequence (400bp × 5 channels ACGTN) and a cell's full expression profile (all genes except the target), then predicts the target gene's expression level.
 

@@ -72,18 +72,21 @@ class GpuCachedPairLoader:
 
         expr_indices = self.dataset.input_expr_indices
         if expr_indices is None:
-            expr_indices = np.arange(self.dataset.X.shape[1], dtype=np.int64)
+            expr_indices = np.arange(self.dataset.expression_X.shape[1], dtype=np.int64)
         else:
             expr_indices = np.asarray(expr_indices, dtype=np.int64)
 
         cell_rows = np.asarray(self.dataset.cells, dtype=np.int64)
-        expr_source = self.dataset.X[cell_rows, :]
-        expr_panel = _to_dense_float32(expr_source[:, expr_indices])
-        target_matrix = _to_dense_float32(expr_source[:, self.dataset.promoter2expr_idx])
-        if sparse.issparse(expr_source):
-            cell_totals = np.asarray(expr_source.sum(axis=1), dtype=np.float32).ravel()
+        expr_source = self.dataset.expression_X[cell_rows, :]
+        target_source = self.dataset.X[cell_rows, :]
+        target_value_source = self.dataset.target_value_X[cell_rows, :] if self.dataset.target_value_X is not None else target_source
+        expr_panel = self.dataset._apply_expression_transform(_to_dense_float32(expr_source[:, expr_indices]))
+        target_matrix = _to_dense_float32(target_value_source[:, self.dataset.promoter2expr_idx])
+        raw_target_matrix = _to_dense_float32(target_source[:, self.dataset.promoter2expr_idx])
+        if sparse.issparse(target_source):
+            cell_totals = np.asarray(target_source.sum(axis=1), dtype=np.float32).ravel()
         else:
-            cell_totals = np.asarray(expr_source, dtype=np.float32).sum(axis=1)
+            cell_totals = np.asarray(target_source, dtype=np.float32).sum(axis=1)
 
         target_input_positions = np.full(self.P, -1, dtype=np.int64)
         if self.dataset.input_expr_indices is None:
@@ -96,6 +99,7 @@ class GpuCachedPairLoader:
 
         self.expr_panel_device = torch.as_tensor(expr_panel, dtype=torch.float32, device=self.device)
         self.target_matrix_device = torch.as_tensor(target_matrix, dtype=torch.float32, device=self.device)
+        self.raw_target_matrix_device = torch.as_tensor(raw_target_matrix, dtype=torch.float32, device=self.device)
         self.cell_totals_device = torch.as_tensor(cell_totals, dtype=torch.float32, device=self.device)
         self.target_input_positions_device = torch.as_tensor(
             target_input_positions, dtype=torch.long, device=self.device
@@ -105,6 +109,7 @@ class GpuCachedPairLoader:
             self.promoters_device.numel()
             + self.expr_panel_device.numel()
             + self.target_matrix_device.numel()
+            + self.raw_target_matrix_device.numel()
             + self.cell_totals_device.numel()
             + self.target_input_positions_device.numel()
         ) * 4 / (1024 ** 2)
@@ -173,6 +178,7 @@ class GpuCachedPairLoader:
         promoters = self.promoters_device.index_select(0, promoter_idx)
         exprs = self.expr_panel_device.index_select(0, cell_idx).clone()
         ys = self.target_matrix_device[cell_idx, promoter_idx]
+        raw_ys = self.raw_target_matrix_device[cell_idx, promoter_idx]
 
         target_pos = self.target_input_positions_device.index_select(0, promoter_idx)
         valid = target_pos >= 0
@@ -180,8 +186,8 @@ class GpuCachedPairLoader:
             row_idx = torch.arange(exprs.shape[0], device=self.device, dtype=torch.long)
             exprs[row_idx[valid], target_pos[valid]] = 0.0
 
-        if self.dataset.log1p_cpm_target:
-            lib_size = torch.clamp(self.cell_totals_device.index_select(0, cell_idx) - ys, min=1.0)
-            ys = torch.log1p(ys / lib_size * 1e6)
+        if self.dataset.log1p_cpm_target and self.dataset.target_value_X is None:
+            lib_size = torch.clamp(self.cell_totals_device.index_select(0, cell_idx) - raw_ys, min=1.0)
+            ys = torch.log1p(raw_ys / lib_size * 1e6)
 
         return promoters, exprs, ys.float()

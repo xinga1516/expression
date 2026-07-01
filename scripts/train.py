@@ -66,6 +66,65 @@ def read_cell_split(cell_split_dir: Path, split: str) -> np.ndarray:
     return np.asarray(cells, dtype=object)
 
 
+def _resolve_layer_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "" or value.lower() in {"x", "none"}:
+        return None
+    return value
+
+
+def resolve_expression_data_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve expression/target matrix sources without relying on data-directory names."""
+    use_vae = args.vae_encoder is not None
+    loss_type = str(args.loss).lower()
+
+    requested_expression_layer = str(args.expression_layer).lower()
+    if requested_expression_layer == "auto":
+        expression_layer = "counts" if use_vae or loss_type == "zinb" else "logcpm"
+    else:
+        expression_layer = _resolve_layer_arg(args.expression_layer)
+
+    requested_expression_transform = str(args.expression_transform).lower()
+    if requested_expression_transform == "auto":
+        expression_transform = "none"
+    else:
+        expression_transform = requested_expression_transform
+
+    requested_target_count_layer = str(args.target_count_layer).lower()
+    if requested_target_count_layer == "auto":
+        target_count_layer = "counts"
+    else:
+        target_count_layer = _resolve_layer_arg(args.target_count_layer)
+
+    requested_target_value_layer = str(args.target_value_layer).lower()
+    if requested_target_value_layer == "auto":
+        target_value_layer = None if loss_type == "zinb" else "logcpm"
+    else:
+        target_value_layer = _resolve_layer_arg(args.target_value_layer)
+
+    requested_target_transform = str(args.target_transform).lower()
+    if requested_target_transform == "auto":
+        target_transform = "none"
+    else:
+        target_transform = requested_target_transform
+
+    if expression_transform not in {"none", "log1p"}:
+        raise ValueError("--expression-transform must be one of auto, none, log1p")
+    if target_transform not in {"none", "log1p_cpm"}:
+        raise ValueError("--target-transform must be one of auto, none, log1p_cpm")
+
+    return {
+        "expression_layer": expression_layer,
+        "expression_transform": expression_transform,
+        "target_count_layer": target_count_layer,
+        "target_value_layer": target_value_layer,
+        "target_transform": target_transform,
+        "log1p_cpm_target": target_transform == "log1p_cpm",
+    }
+
+
 def count_model_parameters(model: nn.Module) -> tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -891,6 +950,11 @@ def main():
     parser.add_argument("--sequence-column", type=str, default="sequence", help="Promoter CSV sequence column to encode, e.g. sequence or control_sequence.")
     parser.add_argument("--sequence-length", type=int, default=400, help="Sequence length used by the one-hot encoder and model.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional file listing fixed input gene IDs for expression branch.")
+    parser.add_argument("--expression-layer", type=str, default="auto", help="AnnData layer for expression input. auto: counts for VAE/ZINB, precomputed logCPM for no-VAE scalar losses. Use X/none for adata.X.")
+    parser.add_argument("--expression-transform", type=str, default="auto", choices=["auto", "none", "log1p"], help="Transform applied to expression input after layer selection. auto currently uses none because logCPM is precomputed.")
+    parser.add_argument("--target-count-layer", type=str, default="auto", help="AnnData layer containing UMI counts used for target values and CPM denominators. auto uses counts. Use X/none for adata.X.")
+    parser.add_argument("--target-value-layer", type=str, default="auto", help="AnnData layer containing precomputed scalar targets. auto: logCPM layer for scalar losses, disabled for ZINB.")
+    parser.add_argument("--target-transform", type=str, default="auto", choices=["auto", "none", "log1p_cpm"], help="Target transform. auto reads precomputed logCPM for scalar losses and raw counts for ZINB; log1p_cpm recomputes from counts.")
     parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse", "val_pearson", "val_spearman"], help="Metric monitored by early stopping and best_model saving.")
     parser.add_argument("--run-test-after-train", action="store_true", default=False, help="Run scripts.model_test standard test after training finishes.")
     parser.add_argument("--test-max-samples", type=int, default=0, help="Max test samples for --run-test-after-train. 0 means all.")
@@ -957,16 +1021,34 @@ def main():
             f"train_cells={len(train_cell_ids)} val_cells={len(val_cell_ids)}"
         )
 
-    use_log1p = (args.data.startswith("umi_") or scrna_file.parent.name.startswith("umi_")) and args.loss != "zinb"
+    data_config = resolve_expression_data_config(args)
+    args.expression_layer_resolved = data_config["expression_layer"]
+    args.expression_transform_resolved = data_config["expression_transform"]
+    args.target_count_layer_resolved = data_config["target_count_layer"]
+    args.target_value_layer_resolved = data_config["target_value_layer"]
+    args.target_transform_resolved = data_config["target_transform"]
+    print(
+        "[DataConfig] "
+        f"use_vae={args.vae_encoder is not None} loss={args.loss} "
+        f"expression_layer={args.expression_layer_resolved or 'X'} "
+        f"expression_transform={args.expression_transform_resolved} "
+        f"target_count_layer={args.target_count_layer_resolved or 'X'} "
+        f"target_value_layer={args.target_value_layer_resolved or 'disabled'} "
+        f"target_transform={args.target_transform_resolved}"
+    )
     train_dataset = MyDataset(
         promoter_file=data_dir / "promoter_train.csv",
         scrna_file=scrna_file,
         cell_ids_subset=train_cell_ids,
         cell_ratio=args.cell_ratio,
-        log1p_cpm_target=use_log1p,
+        log1p_cpm_target=data_config["log1p_cpm_target"],
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
         sequence_length=args.sequence_length,
+        expression_layer=data_config["expression_layer"],
+        expression_transform=data_config["expression_transform"],
+        target_count_layer=data_config["target_count_layer"],
+        target_value_layer=data_config["target_value_layer"],
         input_gene_panel_file=input_gene_panel_file,
         return_indices=args.contrastive_weight > 0.0,
     )
@@ -977,10 +1059,14 @@ def main():
         seed=args.seed,
         cell_ids_subset=val_cell_ids,
         cell_ratio=args.val_cell_ratio,
-        log1p_cpm_target=use_log1p,
+        log1p_cpm_target=data_config["log1p_cpm_target"],
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
         sequence_length=args.sequence_length,
+        expression_layer=data_config["expression_layer"],
+        expression_transform=data_config["expression_transform"],
+        target_count_layer=data_config["target_count_layer"],
+        target_value_layer=data_config["target_value_layer"],
         input_gene_panel_file=input_gene_panel_file,
         return_indices=False,
     )
@@ -1221,9 +1307,9 @@ def main():
                 print(f"Loaded best model for scatter plot: {best_model_path}")
 
             utils.count_zero_nonzero(val_loader)
-            utils.plot_pred_scatter(model, val_loader, is_umi=use_log1p, epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
-            utils.plot_per_promoter_scatter(model, val_dataset, is_umi=use_log1p, n_promoters=3, save_path=plots_dir / "per_promoter_scatter.png")
-            utils.plot_per_cell_scatter(model, val_dataset, is_umi=use_log1p, n_cells=3, save_path=plots_dir / "per_cell_scatter.png")
+            utils.plot_pred_scatter(model, val_loader, is_umi=data_config["log1p_cpm_target"], epoch=1, save_path=plots_dir / "pred_vs_true_scatter.png")
+            utils.plot_per_promoter_scatter(model, val_dataset, is_umi=data_config["log1p_cpm_target"], n_promoters=3, save_path=plots_dir / "per_promoter_scatter.png")
+            utils.plot_per_cell_scatter(model, val_dataset, is_umi=data_config["log1p_cpm_target"], n_cells=3, save_path=plots_dir / "per_cell_scatter.png")
         else:
             print(f"Log file not found for plotting: {log_file}")
 
@@ -1238,6 +1324,11 @@ def main():
             sequence_column=args.sequence_column,
             sequence_length=args.sequence_length,
             input_gene_panel_file=args.input_gene_panel_file,
+            expression_layer=args.expression_layer_resolved,
+            expression_transform=args.expression_transform_resolved,
+            target_count_layer=args.target_count_layer_resolved,
+            target_value_layer=args.target_value_layer_resolved,
+            target_transform=args.target_transform_resolved,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             seed=args.seed,

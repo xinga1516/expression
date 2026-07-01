@@ -49,7 +49,14 @@ def tiny_adata() -> ad.AnnData:
         },
         index=[f"g{i}" for i in range(x.shape[1])],
     )
-    return ad.AnnData(X=x, obs=obs, var=var)
+    adata = ad.AnnData(X=x, obs=obs, var=var)
+    adata.layers["counts"] = x.copy()
+    dense = x.toarray().astype(np.float32)
+    totals = np.maximum(dense.sum(axis=1, keepdims=True), 1.0)
+    log_cpm = np.log1p(dense / totals * 1e6).astype(np.float32)
+    adata.layers["cpm"] = sparse.csr_matrix(log_cpm)
+    adata.layers["logcpm"] = sparse.csr_matrix(log_cpm)
+    return adata
 
 
 @pytest.fixture

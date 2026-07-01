@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from argparse import Namespace
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -11,6 +12,7 @@ from scripts.train import (
     count_model_parameters,
     dataloader_worker_kwargs,
     estimate_batch_input_mib,
+    resolve_expression_data_config,
     set_vae_trainable,
 )
 from src.utils import (
@@ -48,6 +50,58 @@ def test_resource_summary_helpers_return_expected_values() -> None:
     assert total > 0
     assert trainable == total
     assert input_mib == pytest.approx(2 * (400 * 5 + 5) * 4 / (1024 ** 2))
+
+
+def test_resolve_expression_data_config_defaults_for_vae_and_no_vae() -> None:
+    no_vae = resolve_expression_data_config(
+        Namespace(
+            vae_encoder=None,
+            loss="mse",
+            expression_layer="auto",
+            expression_transform="auto",
+            target_count_layer="auto",
+            target_value_layer="auto",
+            target_transform="auto",
+        )
+    )
+    with_vae = resolve_expression_data_config(
+        Namespace(
+            vae_encoder="outputs/scvi",
+            loss="mse",
+            expression_layer="auto",
+            expression_transform="auto",
+            target_count_layer="auto",
+            target_value_layer="auto",
+            target_transform="auto",
+        )
+    )
+    zinb = resolve_expression_data_config(
+        Namespace(
+            vae_encoder=None,
+            loss="zinb",
+            expression_layer="auto",
+            expression_transform="auto",
+            target_count_layer="auto",
+            target_value_layer="auto",
+            target_transform="auto",
+        )
+    )
+
+    assert no_vae == {
+        "expression_layer": "logcpm",
+        "expression_transform": "none",
+        "target_count_layer": "counts",
+        "target_value_layer": "logcpm",
+        "target_transform": "none",
+        "log1p_cpm_target": False,
+    }
+    assert with_vae["expression_layer"] == "counts"
+    assert with_vae["expression_transform"] == "none"
+    assert with_vae["target_value_layer"] == "logcpm"
+    assert with_vae["target_transform"] == "none"
+    assert zinb["expression_layer"] == "counts"
+    assert zinb["target_value_layer"] is None
+    assert zinb["target_transform"] == "none"
 
 
 class DummyVAEModel(nn.Module):

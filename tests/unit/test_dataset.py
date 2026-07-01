@@ -55,6 +55,26 @@ def test_dataset_log1p_cpm_target_uses_masked_library_size(tiny_data_dir) -> Non
     assert y.item() == pytest.approx(expected)
 
 
+def test_dataset_can_use_precomputed_logcpm_expression_and_target_layers(tiny_data_dir) -> None:
+    dataset = MyDataset(
+        promoter_file=tiny_data_dir / "promoter_train.csv",
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        expression_layer="logcpm",
+        expression_transform="none",
+        target_count_layer="counts",
+        target_value_layer="logcpm",
+    )
+
+    _promoter, expr, y = dataset.in_getitem(pro_i=0, cell_i=0)
+    target_idx = int(dataset.promoter2expr_idx[0])
+    raw = np.array([10.0, 0.0, 5.0, 0.0, 1.0], dtype=np.float32)
+    log_cpm = np.log1p(raw / raw.sum() * 1e6)
+
+    assert y.item() == pytest.approx(float(log_cpm[0]))
+    assert expr[target_idx].item() == 0.0
+    assert expr[2].item() == pytest.approx(float(log_cpm[2]))
+
+
 def test_dynamic_and_preencoded_promoter_tensors_match(tiny_data_dir) -> None:
     dynamic = MyDataset(
         promoter_file=tiny_data_dir / "promoter_train.csv",
