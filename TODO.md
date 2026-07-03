@@ -4,6 +4,9 @@ Current project task list.
 
 ## Active
 
+- [x] Re-run promoter Stage 1 v2 nine-model comparison after 420 bp asset update.
+- [x] Record Stage 1 shift420 nine-run metrics in summary, registry, and result documents.
+- [x] Use `--sequence-length 400 --promoter-shift-max 20` so train-time random crop uses the new 420 bp windows while val/test use centered crops.
 - [ ] Re-run the E-MTAB workflow after deleting old `outputs/` results:
   - Pretrain VAE on `umi_E-MTAB-10519-hqcells` using only `cell_train.txt`.
   - Train `umi_E-MTAB-10519-hqcells` with cell split and delayed VAE fine-tune at epoch 60.

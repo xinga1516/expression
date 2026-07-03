@@ -354,6 +354,182 @@ def select_checkpoint_monitor(
     raise ValueError(f"Unsupported checkpoint_metric: {checkpoint_metric}")
 
 
+
+
+def evaluate_validation_metrics(
+    model: nn.Module,
+    val_loader: Any,
+    device: torch.device,
+    loss_type: str,
+    nonzero_loss_weight: float,
+    pearson_lambda: float,
+    zinb_loss_fn: nn.Module | None,
+    amp_enabled: bool,
+    zero_acc_threshold: float,
+) -> dict[str, float]:
+    """Run a validation pass and return scalar metrics for epoch or step logging."""
+    model.eval()
+    val_loss_num = 0.0
+    val_loss_den = 0.0
+    val_nz_sum = 0.0
+    val_nz_count = 0
+    val_zero_sum = 0.0
+    val_zero_count = 0
+    lstm_var_sum = 0.0
+    lstm_var_count = 0
+    expr_var_sum = 0.0
+    expr_var_count = 0
+    all_nz_true: list[np.ndarray] = []
+    all_nz_pred: list[np.ndarray] = []
+    all_zero_pred: list[np.ndarray] = []
+    all_val_true: list[np.ndarray] = []
+    all_val_pred: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            promoters, exprs, ys, _pro_indices, _cell_indices = unpack_training_batch(batch)
+            promoters = promoters.to(device, non_blocking=True)
+            exprs = exprs.to(device, non_blocking=True)
+            ys = ys.to(device, non_blocking=True).float()
+
+            if loss_type == "zinb":
+                if zinb_loss_fn is None:
+                    raise ValueError("zinb_loss_fn is required for ZINB validation.")
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    mu_ratio, theta, pi = model(promoters, exprs)
+                mu_ratio = mu_ratio.squeeze(1).float()
+                theta = theta.squeeze(1).float()
+                pi = pi.squeeze(1).float()
+                lib_size = exprs.sum(dim=1) + ys
+                mu = mu_ratio * lib_size
+                val_loss = zinb_loss_fn(ys, mu, theta, pi)
+                val_loss_num += val_loss.item() * ys.numel()
+                val_loss_den += ys.numel()
+                y_pred = torch.log(mu_ratio * 1e6 + 1)
+                y_true = torch.log1p(ys / torch.clamp(lib_size, min=1.0) * 1e6)
+            else:
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    y_pred = model(promoters, exprs).squeeze(1)
+                y_pred = y_pred.float()
+                y_true = ys
+
+            sq = (y_pred - y_true) ** 2
+            zero_mask = ys == 0
+            nz_mask = ~zero_mask
+            all_val_true.append(y_true.cpu().numpy())
+            all_val_pred.append(y_pred.cpu().numpy())
+
+            if hasattr(model, "last_lstm_out"):
+                lstm_var_sum += model.last_lstm_out.var(dim=0).mean().item()
+                lstm_var_count += 1
+            if hasattr(model, "last_expr_out"):
+                expr_var_sum += model.last_expr_out.var(dim=0).mean().item()
+                expr_var_count += 1
+
+            if loss_type != "zinb":
+                w = torch.where(
+                    ys != 0,
+                    torch.tensor(nonzero_loss_weight, device=ys.device, dtype=ys.dtype),
+                    torch.ones_like(ys),
+                )
+                val_loss_num += (w * sq).sum().item()
+                val_loss_den += w.sum().item()
+
+            nz_cnt = int(nz_mask.sum().item())
+            if nz_cnt > 0:
+                val_nz_sum += sq[nz_mask].sum().item()
+                val_nz_count += nz_cnt
+                all_nz_true.append(y_true[nz_mask].cpu().numpy())
+                all_nz_pred.append(y_pred[nz_mask].cpu().numpy())
+
+            zero_cnt = int(zero_mask.sum().item())
+            if zero_cnt > 0:
+                val_zero_sum += sq[zero_mask].sum().item()
+                val_zero_count += zero_cnt
+                all_zero_pred.append(y_pred[zero_mask].cpu().numpy())
+
+    val_loss = val_loss_num / max(val_loss_den, 1e-12)
+    val_pearson_all = float("nan")
+    val_spearman_all = float("nan")
+    if all_val_true:
+        val_true_all = np.concatenate(all_val_true)
+        val_pred_all = np.concatenate(all_val_pred)
+        val_pearson_all = safe_pearson_corr(val_true_all, val_pred_all)
+        val_spearman_all = safe_spearman_corr(val_true_all, val_pred_all)
+        if not math.isnan(val_pearson_all) and loss_type in ("pearson", "combined"):
+            val_loss = 1.0 - val_pearson_all if loss_type == "pearson" else val_loss + pearson_lambda * (1.0 - val_pearson_all)
+        elif loss_type == "pearson":
+            val_loss = 1.0
+    elif loss_type == "pearson":
+        val_loss = 1.0
+
+    val_sq_count = val_zero_count + val_nz_count
+    val_rmse = float(math.sqrt((val_zero_sum + val_nz_sum) / val_sq_count)) if val_sq_count > 0 else float("nan")
+    val_pearson_nonzero = float("nan")
+    if all_nz_true:
+        val_pearson_nonzero = safe_pearson_corr(np.concatenate(all_nz_true), np.concatenate(all_nz_pred))
+    val_zero_accuracy = float("nan")
+    if all_zero_pred:
+        val_zero_accuracy = float((np.abs(np.concatenate(all_zero_pred)) < zero_acc_threshold).mean())
+
+    return {
+        "val_loss": float(val_loss),
+        "val_rmse": val_rmse,
+        "val_pearson_all": val_pearson_all,
+        "val_spearman_all": val_spearman_all,
+        "val_pearson_nonzero": val_pearson_nonzero,
+        "val_zero_accuracy": val_zero_accuracy,
+        "val_loss_zero": val_zero_sum / max(val_zero_count, 1),
+        "val_loss_nonzero": val_nz_sum / max(val_nz_count, 1),
+        "lstm_var": lstm_var_sum / max(lstm_var_count, 1) if lstm_var_count > 0 else float("nan"),
+        "expr_var": expr_var_sum / max(expr_var_count, 1) if expr_var_count > 0 else float("nan"),
+    }
+
+
+def append_step_eval_log(
+    log_file: Path,
+    global_step: int,
+    epoch: int,
+    metrics: dict[str, float],
+    checkpoint_metric: str,
+    checkpoint_monitor: float,
+    lr: float,
+) -> None:
+    """Append step-level validation metrics to CSV."""
+    fieldnames = [
+        "global_step",
+        "epoch",
+        "val_loss",
+        "val_rmse",
+        "val_pearson_all",
+        "val_spearman_all",
+        "val_pearson_nonzero",
+        "val_zero_accuracy",
+        "val_loss_zero",
+        "val_loss_nonzero",
+        "lstm_var",
+        "expr_var",
+        "checkpoint_metric",
+        "checkpoint_monitor",
+        "lr",
+    ]
+    exists = log_file.exists()
+    with open(log_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        row: dict[str, Any] = {
+            "global_step": global_step,
+            "epoch": epoch,
+            "checkpoint_metric": checkpoint_metric,
+            "checkpoint_monitor": checkpoint_monitor,
+            "lr": lr,
+        }
+        for key in fieldnames:
+            if key in metrics:
+                row[key] = metrics[key]
+        writer.writerow(row)
+
 def train_model(
     model,
     train_loader,
@@ -380,6 +556,7 @@ def train_model(
     contrastive_positive_column: str = "positive_sequence",
     contrastive_negative_column: str = "control_sequence",
     contrastive_normalize: bool = True,
+    eval_every_steps: int = 0,
 ):
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
@@ -464,6 +641,10 @@ def train_model(
     _, ckpt_dir, _, log_dir = utils._prepare_output_dirs(base_dir, exp_name)
     log_file = log_dir / "train_log.csv"
     step_log_file = log_dir / "step_train_loss.csv"
+    step_eval_log_file = log_dir / "step_eval_log.csv"
+    eval_every_steps = max(0, int(eval_every_steps))
+    if eval_every_steps > 0:
+        print(f"[StepEval] enabled every {eval_every_steps} optimizer steps.")
     global_step = 0
     if step_log_file.exists():
         global_step = pd.read_csv(step_log_file)["global_step"].max() + 1
@@ -513,6 +694,7 @@ def train_model(
         "val_pearson": -float("inf"),
         "val_spearman": -float("inf"),
     }
+    best_checkpoint_monitor = float("inf")
 
     # Training loop — validate first (captures initial loss at epoch 0), then train
     for epoch in range(start_epoch, epochs):
@@ -738,6 +920,7 @@ def train_model(
         )
         earlystopping(checkpoint_monitor)
         if should_save_best_model(checkpoint_monitor, earlystopping.best_score):
+            best_checkpoint_monitor = min(best_checkpoint_monitor, float(checkpoint_monitor))
             utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
         diagnostic_metrics = {
             "val_rmse": epoch_val_rmse,
@@ -911,6 +1094,47 @@ def train_model(
                 torch.cuda.synchronize()
 
             epoch_step_losses.append(loss.item())
+            current_global_step = global_step + len(epoch_step_losses)
+            if eval_every_steps > 0 and val_loader is not None and current_global_step % eval_every_steps == 0:
+                step_metrics = evaluate_validation_metrics(
+                    model=model,
+                    val_loader=val_loader,
+                    device=device,
+                    loss_type=loss_type,
+                    nonzero_loss_weight=nonzero_loss_weight,
+                    pearson_lambda=pearson_lambda,
+                    zinb_loss_fn=zinb_loss_fn,
+                    amp_enabled=amp_enabled,
+                    zero_acc_threshold=zero_acc_threshold,
+                )
+                step_monitor = select_checkpoint_monitor(
+                    checkpoint_metric=checkpoint_metric,
+                    val_loss=step_metrics["val_loss"],
+                    val_loss_ema=step_metrics["val_loss"],
+                    val_rmse=step_metrics["val_rmse"],
+                    val_pearson=step_metrics["val_pearson_all"],
+                    val_spearman=step_metrics["val_spearman_all"],
+                )
+                append_step_eval_log(
+                    log_file=step_eval_log_file,
+                    global_step=current_global_step,
+                    epoch=epoch,
+                    metrics=step_metrics,
+                    checkpoint_metric=checkpoint_metric,
+                    checkpoint_monitor=step_monitor,
+                    lr=optimizer.param_groups[0]["lr"],
+                )
+                print(
+                    f"Step {current_global_step}: Val={step_metrics['val_loss']:.6f} "
+                    f"ValRMSE={step_metrics['val_rmse']:.6f} "
+                    f"Pearson(All)={step_metrics['val_pearson_all']:.4f} "
+                    f"Spearman(All)={step_metrics['val_spearman_all']:.4f}"
+                )
+                if step_monitor < best_checkpoint_monitor:
+                    best_checkpoint_monitor = float(step_monitor)
+                    utils.robust_save_model(model, ckpt_dir / "best_step_model.safetensors")
+                    utils.robust_save_model(model, ckpt_dir / "best_model.safetensors")
+                model.train()
 
         scheduler.step()
 
@@ -946,9 +1170,10 @@ def main():
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Dataloader prefetch factor used when num_workers > 0")
     parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode all promoter sequences in memory. Faster, but uses much more RAM.")
     parser.add_argument("--gpu-cache-dataset", action="store_true", default=False, help="Cache fixed promoter/expression/target tensors on GPU and gather batches on-device. Requires CUDA and cell ratios of 1.0.")
-    parser.add_argument("--gpu-sampler", type=str, default="balanced", choices=["balanced", "random"], help="GPU-side pair sampler used by --gpu-cache-dataset.")
+    parser.add_argument("--gpu-sampler", type=str, default="balanced", choices=["balanced", "random", "sequential"], help="GPU-side pair sampler used by --gpu-cache-dataset.")
     parser.add_argument("--sequence-column", type=str, default="sequence", help="Promoter CSV sequence column to encode, e.g. sequence or control_sequence.")
     parser.add_argument("--sequence-length", type=int, default=400, help="Sequence length used by the one-hot encoder and model.")
+    parser.add_argument("--promoter-shift-max", type=int, default=20, help="Train-time random crop shift in bp when promoter sequences are wider than --sequence-length. Validation/test use centered crop.")
     parser.add_argument("--input-gene-panel-file", type=str, default=None, help="Optional file listing fixed input gene IDs for expression branch.")
     parser.add_argument("--expression-layer", type=str, default="auto", help="AnnData layer for expression input. auto: counts for VAE/ZINB, precomputed logCPM for no-VAE scalar losses. Use X/none for adata.X.")
     parser.add_argument("--expression-transform", type=str, default="auto", choices=["auto", "none", "log1p"], help="Transform applied to expression input after layer selection. auto currently uses none because logCPM is precomputed.")
@@ -957,6 +1182,7 @@ def main():
     parser.add_argument("--target-transform", type=str, default="auto", choices=["auto", "none", "log1p_cpm"], help="Target transform. auto reads precomputed logCPM for scalar losses and raw counts for ZINB; log1p_cpm recomputes from counts.")
     parser.add_argument("--checkpoint-metric", type=str, default="val_loss_ema", choices=["val_loss_ema", "val_loss", "val_rmse", "val_pearson", "val_spearman"], help="Metric monitored by early stopping and best_model saving.")
     parser.add_argument("--run-test-after-train", action="store_true", default=False, help="Run scripts.model_test standard test after training finishes.")
+    parser.add_argument("--eval-every-steps", type=int, default=512, help="Run validation/checkpointing every N optimizer steps. 0 disables step-level eval.")
     parser.add_argument("--test-max-samples", type=int, default=0, help="Max test samples for --run-test-after-train. 0 means all.")
     parser.add_argument("--test-spearman-samples", type=int, default=1_000_000, help="Spearman reservoir size for --run-test-after-train. 0 means all.")
     parser.add_argument("--amp", action="store_true", default=False, help="Use CUDA automatic mixed precision for model forward/backward.")
@@ -1045,6 +1271,7 @@ def main():
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
         sequence_length=args.sequence_length,
+        promoter_shift_max=args.promoter_shift_max,
         expression_layer=data_config["expression_layer"],
         expression_transform=data_config["expression_transform"],
         target_count_layer=data_config["target_count_layer"],
@@ -1063,6 +1290,7 @@ def main():
         preencode_promoters=args.preencode_promoters,
         sequence_column=args.sequence_column,
         sequence_length=args.sequence_length,
+        promoter_shift_max=0,
         expression_layer=data_config["expression_layer"],
         expression_transform=data_config["expression_transform"],
         target_count_layer=data_config["target_count_layer"],
@@ -1290,6 +1518,7 @@ def main():
         contrastive_positive_column=args.contrastive_positive_column,
         contrastive_negative_column=args.contrastive_negative_column,
         contrastive_normalize=not args.no_contrastive_normalize,
+        eval_every_steps=args.eval_every_steps,
     )
  
     if args.plot_loss:

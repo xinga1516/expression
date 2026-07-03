@@ -6,6 +6,7 @@ import json
 import re
 import sys
 from collections import defaultdict
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,64 @@ def reverse_complement(seq: str) -> str:
     return seq.translate(table)[::-1].upper()
 
 
+def extract_oriented_sequence(
+    chrom_seq: str,
+    start0: int,
+    end0: int,
+    strand: str,
+) -> str:
+    seq = chrom_seq[int(start0):int(end0)].upper()
+    if str(strand) == "-":
+        seq = reverse_complement(seq)
+    return seq
+
+
+def widen_promoter_windows(
+    promoters: pd.DataFrame,
+    genome_fasta: Path,
+    target_length: int,
+) -> pd.DataFrame:
+    """Re-extract promoter sequences at target_length while preserving current window centers."""
+    target_length = int(target_length)
+    if target_length <= 0:
+        raise ValueError("target_length must be positive.")
+    promoters = promoters.copy()
+    current_lengths = (promoters["end"].astype(int) - promoters["start"].astype(int)).to_numpy()
+    if np.all(current_lengths == target_length) and promoters["sequence"].astype(str).str.len().eq(target_length).all():
+        promoters["length"] = target_length
+        return promoters
+
+    genome = SeqIO.to_dict(SeqIO.parse(str(genome_fasta), "fasta"))
+    updated_rows: list[dict[str, Any]] = []
+    for row in promoters.itertuples(index=False):
+        chrom = str(row.chrom)
+        if chrom not in genome:
+            raise ValueError(f"Cannot widen promoter for {row.gene_id}: contig {chrom!r} not found in genome FASTA.")
+        old_start = int(row.start)
+        old_end = int(row.end)
+        old_len = old_end - old_start
+        delta = target_length - old_len
+        left_extra = delta // 2
+        right_extra = delta - left_extra
+        new_start = old_start - left_extra
+        new_end = old_end + right_extra
+        chrom_seq = str(genome[chrom].seq).upper()
+        if new_start < 0 or new_end > len(chrom_seq):
+            raise ValueError(
+                f"Cannot widen promoter for {row.gene_id}: requested {chrom}:{new_start}-{new_end} "
+                f"outside contig length {len(chrom_seq)}."
+            )
+        seq = extract_oriented_sequence(chrom_seq, new_start, new_end, str(row.strand))
+        if len(seq) != target_length:
+            raise ValueError(f"Cannot widen promoter for {row.gene_id}: got sequence length {len(seq)}, expected {target_length}.")
+        updated_rows.append({"start": new_start, "end": new_end, "sequence": seq, "length": target_length})
+
+    updates = pd.DataFrame(updated_rows, index=promoters.index)
+    for col in ("start", "end", "sequence", "length"):
+        promoters[col] = updates[col]
+    return promoters
+
+
 def extract_shifted_sequence(
     chrom_seq: str,
     start0: int,
@@ -273,30 +332,41 @@ def add_positive_shifted_promoters(
     return pd.concat([promoters.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
 
 
-def build_interval_index(gtf_genes: pd.DataFrame, promoters: pd.DataFrame) -> dict[str, list[Interval]]:
-    index: dict[str, list[Interval]] = defaultdict(list)
+def build_interval_index(gtf_genes: pd.DataFrame, promoters: pd.DataFrame) -> dict[str, dict[str, np.ndarray]]:
+    raw_index: dict[str, list[Interval]] = defaultdict(list)
     for row in gtf_genes.itertuples(index=False):
-        index[str(row.contig)].append(Interval(int(row.start0), int(row.end0)))
+        raw_index[str(row.contig)].append(Interval(int(row.start0), int(row.end0)))
     for row in promoters.itertuples(index=False):
-        index[str(row.chrom)].append(Interval(int(row.start), int(row.end)))
-    for contig in index:
-        index[contig].sort(key=lambda item: item.start0)
+        raw_index[str(row.chrom)].append(Interval(int(row.start), int(row.end)))
+
+    index: dict[str, dict[str, np.ndarray]] = {}
+    for contig, intervals in raw_index.items():
+        intervals.sort(key=lambda item: item.start0)
+        starts = np.asarray([item.start0 for item in intervals], dtype=np.int64)
+        ends = np.asarray([item.end0 for item in intervals], dtype=np.int64)
+        prefix_max_end = np.maximum.accumulate(ends) if len(ends) else ends
+        index[contig] = {
+            "starts": starts,
+            "prefix_max_end": prefix_max_end,
+        }
     return index
 
 
-def overlaps_any(intervals: list[Interval], start0: int, end0: int) -> bool:
-    for interval in intervals:
-        if interval.start0 >= end0:
-            return False
-        if interval.end0 > start0 and interval.start0 < end0:
-            return True
-    return False
+def overlaps_any(intervals: dict[str, np.ndarray], start0: int, end0: int) -> bool:
+    starts = intervals.get("starts")
+    prefix_max_end = intervals.get("prefix_max_end")
+    if starts is None or prefix_max_end is None or len(starts) == 0:
+        return False
+    last_candidate = bisect_left(starts, int(end0)) - 1
+    if last_candidate < 0:
+        return False
+    return bool(prefix_max_end[last_candidate] > int(start0))
 
 
 def find_intergenic_control(
     promoter_row: pd.Series,
     genome: dict[str, Any],
-    intervals_by_contig: dict[str, list[Interval]],
+    intervals_by_contig: dict[str, dict[str, np.ndarray]],
     rng: np.random.Generator,
     attempts: int,
 ) -> dict[str, Any]:
@@ -309,7 +379,7 @@ def find_intergenic_control(
         return {"match_status": "contig_too_short"}
 
     target_gc = gc_fraction(str(promoter_row["sequence"]))
-    intervals = intervals_by_contig.get(contig, [])
+    intervals = intervals_by_contig.get(contig, {})
     best: dict[str, Any] | None = None
     for _ in range(attempts):
         start0 = int(rng.integers(0, len(chrom_seq) - length + 1))
@@ -511,6 +581,11 @@ def build_assets(args: argparse.Namespace) -> None:
     adata = sc.read_h5ad(scrna_file)
     gtf_genes = read_gtf_gene_table(gtf_path)
     source_promoters = read_source_promoters(source_data_dir)
+    source_promoters = widen_promoter_windows(
+        source_promoters,
+        genome_fasta=genome_fasta,
+        target_length=args.promoter_window_length,
+    )
 
     var_gene_ids = set(adata.var["gene_id"].astype(str))
     promoter_gene_ids = set(source_promoters["gene_id"].astype(str))
@@ -611,6 +686,7 @@ def build_assets(args: argparse.Namespace) -> None:
         "included_gene_class_counts": final_split_genes["gene_class"].value_counts().to_dict(),
         "split_counts": final_split_genes["split"].value_counts().to_dict(),
         "control_match_counts": promoters["match_status"].value_counts().to_dict(),
+        "promoter_window_length": int(getattr(args, "promoter_window_length", 400)),
         "positive_shift_bp": int(getattr(args, "positive_shift_bp", 20)),
         "positive_status_counts": promoters["positive_status"].value_counts().to_dict(),
         "input_gene_panel_method": args.input_gene_panel_method,
@@ -637,7 +713,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-gene-panel-method", choices=["hvg", "variance"], default="hvg")
     parser.add_argument("--hvg-flavor", type=str, default="cell_ranger")
     parser.add_argument("--max-eval-cells", type=int, default=2048)
-    parser.add_argument("--control-attempts", type=int, default=2000)
+    parser.add_argument("--control-attempts", type=int, default=200)
+    parser.add_argument("--promoter-window-length", type=int, default=400)
     parser.add_argument("--positive-shift-bp", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()

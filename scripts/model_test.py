@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dataset import MyDataset
+from src.gpu_cache import GpuCachedPairLoader
 from src.model import build_model
 import src.utils as utils
 
@@ -1426,16 +1427,28 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         target_value_layer=data_config["target_value_layer"],
         input_gene_panel_file=input_gene_panel_file,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        test_samples = int(args.max_samples) if int(args.max_samples) > 0 else len(dataset)
+        loader = GpuCachedPairLoader(
+            dataset,
+            batch_size=args.batch_size,
+            device=device,
+            samples_per_epoch=test_samples,
+            seed=args.seed,
+            sampler_mode="sequential",
+            drop_last=False,
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
+
     expr_dim = int(cfg.get("expr_dim", dataset.expr_dim))
     model = build_test_model(cfg, expr_dim=expr_dim, checkpoint=checkpoint, device=device)
     metrics: dict[str, Any] = {}

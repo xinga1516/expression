@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from scipy import sparse
 
-from src.dataset import MyDataset
+from src.dataset import MyDataset, PromoterOneHotEncoder
 
 
 def _to_dense_float32(matrix: Any) -> np.ndarray:
@@ -46,8 +46,8 @@ class GpuCachedPairLoader:
             raise ValueError("batch_size must be positive.")
         if self.samples_per_epoch < 0:
             raise ValueError("samples_per_epoch must be non-negative.")
-        if self.sampler_mode not in {"balanced", "random"}:
-            raise ValueError("sampler_mode must be 'balanced' or 'random'.")
+        if self.sampler_mode not in {"balanced", "random", "sequential"}:
+            raise ValueError("sampler_mode must be 'balanced', 'random', or 'sequential'.")
 
         self.P = int(dataset.P)
         self.C = int(dataset.C)
@@ -55,7 +55,7 @@ class GpuCachedPairLoader:
         if self.total_len <= 0:
             raise ValueError("Dataset is empty.")
         if self.samples_per_epoch == 0:
-            self.samples_per_epoch = min(128_000, self.total_len)
+            self.samples_per_epoch = self.total_len if self.sampler_mode == "sequential" else min(128_000, self.total_len)
         else:
             self.samples_per_epoch = min(self.samples_per_epoch, self.total_len)
         self._cache_dataset_tensors()
@@ -67,8 +67,12 @@ class GpuCachedPairLoader:
         )
 
         pro_indices = np.arange(self.P, dtype=np.int64)
-        promoter_tensor = self.dataset.get_promoter_tensors(pro_indices).to(torch.float32)
-        self.promoters_device = promoter_tensor.to(self.device, non_blocking=False)
+        self.promoters_device = self._encode_full_sequence_cache(pro_indices).to(self.device, non_blocking=False)
+        self.cached_sequence_length = int(self.promoters_device.shape[1])
+        self.model_sequence_length = int(self.dataset.sequence_length)
+        self.runtime_sequence_shift = bool(
+            hasattr(self.dataset, "uses_runtime_sequence_shift") and self.dataset.uses_runtime_sequence_shift()
+        )
 
         expr_indices = self.dataset.input_expr_indices
         if expr_indices is None:
@@ -114,6 +118,54 @@ class GpuCachedPairLoader:
             + self.target_input_positions_device.numel()
         ) * 4 / (1024 ** 2)
         print(f"[GPUCache] cached tensors occupy approximately {cached_mib:.1f} MiB.")
+        if self.cached_sequence_length > self.model_sequence_length:
+            crop_mode = "random" if self.runtime_sequence_shift else "center"
+            print(
+                f"[GPUCache] sequence crop enabled: cached={self.cached_sequence_length} "
+                f"model={self.model_sequence_length} mode={crop_mode}"
+            )
+
+    def _encode_full_sequence_cache(self, pro_indices: np.ndarray) -> torch.Tensor:
+        sequences = self.dataset.promoters[self.dataset.sequence_column].astype(str)
+        source_length = max(int(sequences.str.len().max()), int(self.dataset.sequence_length))
+        encoder = PromoterOneHotEncoder(length=source_length)
+        tensors = [encoder(str(sequences.iloc[int(pro_i)])) for pro_i in pro_indices]
+        return torch.stack(tensors, dim=0).to(torch.float32)
+
+    def _crop_promoters_for_model(
+        self,
+        promoters: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        source_len = int(promoters.shape[1])
+        target_len = int(self.model_sequence_length)
+        if source_len == target_len:
+            return promoters
+        if source_len < target_len:
+            raise ValueError(f"Cached promoter length {source_len} is shorter than model sequence length {target_len}.")
+        max_start = source_len - target_len
+        center_start = max_start // 2
+        if self.runtime_sequence_shift:
+            shift = min(int(self.dataset.promoter_shift_max), center_start, max_start - center_start)
+            if shift > 0:
+                low = center_start - shift
+                high = center_start + shift + 1
+                starts = torch.randint(
+                    low,
+                    high,
+                    (promoters.shape[0],),
+                    generator=generator,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                starts = torch.full((promoters.shape[0],), center_start, device=self.device, dtype=torch.long)
+        else:
+            starts = torch.full((promoters.shape[0],), center_start, device=self.device, dtype=torch.long)
+        offsets = torch.arange(target_len, device=self.device, dtype=torch.long)
+        positions = starts[:, None] + offsets[None, :]
+        gather_index = positions[:, :, None].expand(-1, -1, promoters.shape[2])
+        return promoters.gather(dim=1, index=gather_index)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -140,13 +192,19 @@ class GpuCachedPairLoader:
 
         for start in range(0, n_samples, self.batch_size):
             end = start + self.batch_size
-            yield self._make_batch_from_pair_indices(promoter_idx[start:end], cell_idx[start:end])
+            yield self._make_batch_from_pair_indices(promoter_idx[start:end], cell_idx[start:end], generator=generator)
 
     def _sample_pair_indices(
         self,
         n_samples: int,
         generator: torch.Generator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.sampler_mode == "sequential":
+            flat_idx = torch.arange(n_samples, dtype=torch.long, device=self.device)
+            promoter_idx = torch.div(flat_idx, self.C, rounding_mode="floor")
+            cell_idx = flat_idx.remainder(self.C)
+            return promoter_idx, cell_idx
+
         if self.sampler_mode == "random":
             promoter_idx = torch.randint(0, self.P, (n_samples,), generator=generator, device=self.device)
             cell_idx = torch.randint(0, self.C, (n_samples,), generator=generator, device=self.device)
@@ -174,8 +232,12 @@ class GpuCachedPairLoader:
         self,
         promoter_idx: torch.Tensor,
         cell_idx: torch.Tensor,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        promoters = self.promoters_device.index_select(0, promoter_idx)
+        promoters = self._crop_promoters_for_model(
+            self.promoters_device.index_select(0, promoter_idx),
+            generator=generator,
+        )
         exprs = self.expr_panel_device.index_select(0, cell_idx).clone()
         ys = self.target_matrix_device[cell_idx, promoter_idx]
         raw_ys = self.raw_target_matrix_device[cell_idx, promoter_idx]

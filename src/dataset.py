@@ -58,6 +58,7 @@ class MyDataset(Dataset):
         preencode_promoters: bool = False,
         sequence_column: str = "sequence",
         sequence_length: int = 400,
+        promoter_shift_max: int = 0,
         expression_layer: Optional[str] = None,
         expression_transform: str = "none",
         target_count_layer: Optional[str] = None,
@@ -71,6 +72,10 @@ class MyDataset(Dataset):
         self.promoters = pd.read_csv(promoter_file)
         self.sequence_column = sequence_column
         self.sequence_length = int(sequence_length)
+        self.promoter_shift_max = max(0, int(promoter_shift_max))
+        self._sequence_rng = np.random.default_rng(seed)
+        self.mode = mode
+        self.seed = seed
         self.return_indices = bool(return_indices)
         if self.sequence_column not in self.promoters.columns:
             raise ValueError(
@@ -96,6 +101,11 @@ class MyDataset(Dataset):
         self.promoter_encoder = PromoterOneHotEncoder(length=self.sequence_length)
         self.preencode_promoters = preencode_promoters
         self.promoter_tensor: torch.Tensor | None = None
+        if self.preencode_promoters and self.uses_runtime_sequence_shift():
+            raise ValueError(
+                "--preencode-promoters is incompatible with active runtime promoter shift. "
+                "Disable pre-encoding or set --promoter-shift-max 0."
+            )
         if self.preencode_promoters:
             print("Pre-encoding promoter sequences...")
             self.promoter_tensor = self._preencode_promoters()
@@ -157,8 +167,6 @@ class MyDataset(Dataset):
 
         self.P = len(self.promoters)
         self.C = len(self.cells)
-        self.mode = mode
-        self.seed = seed
         self.log1p_cpm_target = log1p_cpm_target
         self.expr_dim = len(self.input_expr_indices) if self.input_expr_indices is not None else self.expression_X.shape[1]
 
@@ -228,6 +236,31 @@ class MyDataset(Dataset):
     def get_expression_row(self, cell_row: int) -> np.ndarray:
         return self._apply_expression_transform(self._dense_row(self.expression_X, int(cell_row)))
 
+
+    def _crop_sequence_for_model(self, seq: str, crop_start: int | None = None) -> str:
+        seq = str(seq).upper()
+        if len(seq) <= self.sequence_length:
+            return seq
+        max_start = len(seq) - self.sequence_length
+        center_start = max_start // 2
+        if crop_start is None:
+            if self.mode == "train" and self.promoter_shift_max > 0:
+                shift = min(self.promoter_shift_max, center_start, max_start - center_start)
+                if shift > 0:
+                    crop_start = int(self._sequence_rng.integers(center_start - shift, center_start + shift + 1))
+                else:
+                    crop_start = center_start
+            else:
+                crop_start = center_start
+        crop_start = max(0, min(int(crop_start), max_start))
+        return seq[crop_start:crop_start + self.sequence_length]
+
+    def uses_runtime_sequence_shift(self) -> bool:
+        if self.mode != "train" or self.promoter_shift_max <= 0:
+            return False
+        lengths = self.promoters[self.sequence_column].astype(str).str.len()
+        return bool((lengths > self.sequence_length).any())
+
     def _resolve_input_gene_ids(
         self,
         input_gene_ids: Optional[Sequence[str]],
@@ -272,7 +305,7 @@ class MyDataset(Dataset):
         )
 
         for i, seq in enumerate(sequences):
-            promoter_tensor[i] = self.promoter_encoder(seq)
+            promoter_tensor[i] = self.promoter_encoder(self._crop_sequence_for_model(str(seq)))
 
             if i % 1000 == 0:
                 print(f"  encoded {i}/{n}")
@@ -294,7 +327,7 @@ class MyDataset(Dataset):
             )
         if self.promoter_tensor is not None and sequence_column == self.sequence_column:
             return self.promoter_tensor[pro_i]
-        seq = str(self.promoters[sequence_column].iloc[pro_i])
+        seq = self._crop_sequence_for_model(str(self.promoters[sequence_column].iloc[pro_i]))
         return self.promoter_encoder(seq)
 
     def get_promoter_tensor(self, pro_i: int) -> torch.Tensor:

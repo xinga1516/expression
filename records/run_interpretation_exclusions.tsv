@@ -1,1 +1,5 @@
 run_id	reason
+fulltest-EMTAB	not part of current Stage 1 shift420 leaderboard; E-MTAB workflow output under different experiment protocol
+fulltest-EMTAB_aug15	not part of current Stage 1 shift420 leaderboard; E-MTAB aug15 workflow output under different experiment protocol
+fulltest-EMTAB-aug15	not part of current Stage 1 shift420 leaderboard; E-MTAB aug15 workflow output under different experiment protocol
+E-MTAB10519_VAE	VAE artifact, not a supervised Stage 1 promoter/intergenic/expression-matched full-test run
