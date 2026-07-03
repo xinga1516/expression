@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from typing import Any, Iterator, Optional
 from datetime import datetime
 import json
@@ -100,7 +100,7 @@ class ZeroNonZeroSampler(Sampler):
         self.max_duplication = max_duplication
         self.epoch = 0
         self.P = int(dataset.P)
-        # 0 or None → auto-select after pool sizes are known
+        # 0 or None 鈫?auto-select after pool sizes are known
         self._auto_samples = (samples_per_epoch is None or int(samples_per_epoch) == 0)
         if not self._auto_samples:
             self.samples_per_epoch = int(samples_per_epoch)
@@ -186,7 +186,7 @@ class ZeroNonZeroSampler(Sampler):
                         f"samples_per_epoch / nonzero_ratio."
                     )
                 print(f"[ZeroNonZeroSampler] WARNING: n_nz({n_nz}) > "
-                      f"pool({len(self.nz_indices)}), sampling with replacement — "
+                      f"pool({len(self.nz_indices)}), sampling with replacement 鈥?"
                       f"{n_nz - len(self.nz_indices)} duplicates guaranteed.")
             nz_sample = rng.choice(self.nz_indices, size=n_nz, replace=self.replace)
             indices.append(nz_sample)
@@ -213,7 +213,7 @@ class ZeroNonZeroSampler(Sampler):
 
 def get_git_hash() -> str:
     try:
-        # 执行 git 命令获取当前的 commit id
+        # 鎵ц git 鍛戒护鑾峰彇褰撳墠鐨?commit id
         return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
     except:
         return "Not a git repository"
@@ -474,7 +474,7 @@ def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, lear
     promoters, exprs, ys = batch[:3]  # (batch, 400, 5), (batch, 16300), (batch,)
     print(promoters.shape, exprs.shape, ys.shape)
     ys = ys.float()
-    #记录一个 LSTM 参数训练前的值
+    # Snapshot parameters before the dry run.
     params_before = {
         name: p.detach().clone()
         for name, p in model.named_parameters()
@@ -506,7 +506,7 @@ def dryrun_cpu(model: nn.Module, train_loader: DataLoader, steps: int = 50, lear
         grad_norm = p.grad.norm().item() if p.grad is not None else 0.0
         print(f"{name:30s} param_diff = {diff:.6e}")
         print(name, p.grad is None, grad_norm)
-    # loss 曲线
+    # loss 鏇茬嚎
     plt.figure()
     plt.plot(losses)
     plt.xlabel("Step")
@@ -604,7 +604,7 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, is_umi: bool = 
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
-    # Left: all points — use hexbin for density-aware coloring
+    # Left: all points 鈥?use hexbin for density-aware coloring
     hb1 = ax1.hexbin(y_true, y_pred, gridsize=80, cmap="viridis", mincnt=1,
                      bins="log", linewidths=0)
     diag_min = float(max(np.min(y_true), np.min(y_pred)))
@@ -613,9 +613,9 @@ def plot_pred_scatter(model: nn.Module, data_loader: DataLoader, is_umi: bool = 
     ax1.set_xlabel("True")
     ax1.set_ylabel("Predicted")
     ax1.set_title(f"All samples (Pearson={pearson:.4f}, Spearman={spearman:.4f})")
-    plt.colorbar(hb1, ax=ax1, label="log₁₀(count)")
+    plt.colorbar(hb1, ax=ax1, label="log鈧佲個(count)")
 
-    # Right: non-zero samples only — density-colored scatter
+    # Right: non-zero samples only 鈥?density-colored scatter
     if nz_mask.any():
         nz_true = y_true[nz_mask]
         nz_pred = y_pred[nz_mask]
@@ -957,7 +957,7 @@ def plot_loss_curves_from_logfile(log_file: Path, save_path: Path | None = None,
             endpoints = endpoints[:-1]  # drop last point if last epoch is incomplete
 
         if has_initial_val:
-            # Epoch 0 val is the initial loss before any training — plot at first step
+            # Epoch 0 val is the initial loss before any training 鈥?plot at first step
             endpoints = np.insert(endpoints, 0, df_step["global_step"].iloc[0])
             first_step = df_step["global_step"].iloc[0]
             val_arr = df_epoch["val_loss"].values
@@ -1064,41 +1064,86 @@ def plot_zero_nonzero_loss_curves(log_file: Path, save_path: Path | None = None)
 
 
 def plot_val_metrics(log_file: Path, save_path: Path | None = None) -> None:
-    '''Plot validation Pearson (non-zero) and accuracy (zero) over epochs.'''
+    '''Plot all available validation correlations, errors, losses, and zero diagnostics.'''
     df = pd.read_csv(log_file)
-
-    has_pearson = "val_pearson_nonzero" in df.columns
-    has_acc = "val_zero_accuracy" in df.columns
-
-    if not has_pearson and not has_acc:
-        print("  Skipping metrics plot: no val_pearson_nonzero or val_zero_accuracy columns.")
+    if "epoch" not in df.columns:
+        print("  Skipping metrics plot: no epoch column.")
         return
 
-    n_plots = (has_pearson + has_acc)
-    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 4))
-    if n_plots == 1:
-        axes = [axes]
+    epoch = pd.to_numeric(df["epoch"], errors="coerce")
+    panel_specs = [
+        ("Validation Correlations", "Correlation r", [
+            ("val_pearson_all", "Global Pearson", "#1f77b4", "max"),
+            ("val_spearman_all", "Global Spearman", "#2ca02c", "max"),
+            ("val_pearson_nonzero", "Non-zero Pearson", "#ff7f0e", "max"),
+        ], True),
+        ("Validation RMSE", "RMSE", [
+            ("val_rmse", "Global RMSE", "#d62728", "min"),
+        ], False),
+        ("Validation Loss", "Loss", [
+            ("val_loss", "Raw weighted loss", "#9467bd", "min"),
+            ("val_loss_ema", "Loss EMA", "#8c564b", "min"),
+        ], False),
+        ("Validation Loss Components", "MSE", [
+            ("val_loss_nonzero", "Non-zero MSE", "#e377c2", "min"),
+            ("val_loss_zero", "Zero MSE", "#7f7f7f", "min"),
+        ], False),
+        ("Zero Prediction Accuracy", "Accuracy", [
+            ("val_zero_accuracy", "Zero accuracy", "#17becf", "max"),
+        ], False),
+    ]
+    available_panels = [
+        spec for spec in panel_specs if any(column in df.columns for column, *_rest in spec[2])
+    ]
+    if not available_panels:
+        print("  Skipping metrics plot: no supported validation metric columns.")
+        return
 
-    plot_idx = 0
-    if has_pearson:
-        axes[plot_idx].plot(df["epoch"], df["val_pearson_nonzero"], "o-", markersize=4, label="Pearson")
-        axes[plot_idx].axhline(0, color="gray", linestyle="--", linewidth=0.5)
-        add_vae_fine_tune_epoch_marker(axes[plot_idx], df)
-        axes[plot_idx].set_xlabel("Epoch")
-        axes[plot_idx].set_ylabel("Pearson r")
-        axes[plot_idx].set_title("Non-Zero Sample Pearson Correlation")
-        axes[plot_idx].legend()
-        plot_idx += 1
+    ncols = 2
+    nrows = int(np.ceil(len(available_panels) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(13, 4.2 * nrows), squeeze=False)
+    flat_axes = axes.ravel()
 
-    if has_acc:
-        axes[plot_idx].plot(df["epoch"], df["val_zero_accuracy"], "s-", markersize=4, label="Zero accuracy")
-        add_vae_fine_tune_epoch_marker(axes[plot_idx], df)
-        axes[plot_idx].set_xlabel("Epoch")
-        axes[plot_idx].set_ylabel("Accuracy")
-        axes[plot_idx].set_ylim(0, 1)
-        axes[plot_idx].set_title("Zero Sample Accuracy ($|\\hat{y}| < \\epsilon$)")
-        axes[plot_idx].legend()
-        plot_idx += 1
+    for ax, (title, ylabel, series_specs, zero_line) in zip(flat_axes, available_panels):
+        for column, label, color, optimum in series_specs:
+            if column not in df.columns:
+                continue
+            values = pd.to_numeric(df[column], errors="coerce")
+            valid = epoch.notna() & values.notna()
+            if not valid.any():
+                continue
+            ax.plot(
+                epoch[valid],
+                values[valid],
+                marker="o",
+                markersize=3,
+                linewidth=1.5,
+                color=color,
+                label=label,
+            )
+            best_idx = values[valid].idxmax() if optimum == "max" else values[valid].idxmin()
+            ax.scatter(
+                epoch.loc[best_idx],
+                values.loc[best_idx],
+                s=45,
+                color=color,
+                edgecolor="black",
+                linewidth=0.5,
+                zorder=4,
+            )
+        if zero_line:
+            ax.axhline(0, color="gray", linestyle="--", linewidth=0.7)
+        if title == "Zero Prediction Accuracy":
+            ax.set_ylim(0, 1)
+        add_vae_fine_tune_epoch_marker(ax, df)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize=8)
+
+    for ax in flat_axes[len(available_panels):]:
+        ax.set_visible(False)
 
     plt.tight_layout()
     if save_path is not None:
