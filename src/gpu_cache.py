@@ -101,6 +101,8 @@ class GpuCachedPairLoader:
                 if pos is not None:
                     target_input_positions[pro_i] = int(pos)
 
+        self.has_target_input_positions = bool(np.any(target_input_positions >= 0))
+
         self.expr_panel_device = torch.as_tensor(expr_panel, dtype=torch.float32, device=self.device)
         self.target_matrix_device = torch.as_tensor(target_matrix, dtype=torch.float32, device=self.device)
         self.raw_target_matrix_device = torch.as_tensor(raw_target_matrix, dtype=torch.float32, device=self.device)
@@ -242,9 +244,9 @@ class GpuCachedPairLoader:
         ys = self.target_matrix_device[cell_idx, promoter_idx]
         raw_ys = self.raw_target_matrix_device[cell_idx, promoter_idx]
 
-        target_pos = self.target_input_positions_device.index_select(0, promoter_idx)
-        valid = target_pos >= 0
-        if bool(valid.any().item()):
+        if self.has_target_input_positions:
+            target_pos = self.target_input_positions_device.index_select(0, promoter_idx)
+            valid = target_pos >= 0
             row_idx = torch.arange(exprs.shape[0], device=self.device, dtype=torch.long)
             exprs[row_idx[valid], target_pos[valid]] = 0.0
 

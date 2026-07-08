@@ -4,19 +4,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Runtime Environment
 
-Use WSL for this project. The default runtime is the WSL conda environment named `promodel_wsl`.
-
-First, running "wsl" in windows powershell.
-
-Before running Python project commands, activate the environment in WSL:
-
 ```bash
-conda activate promodel_wsl
+conda activate promodel
 ```
-
-Do not use Windows-side Python, Spyder Python, or Windows conda environments for `scanpy`, `anndata`, `.h5ad`, training, evaluation, mutation tests, or data-building commands. Windows-side tools may be used only for lightweight text/config inspection when WSL is unavailable.
-
-If WSL or `promodel_wsl` is not visible from the current session, report that explicitly and avoid silently substituting another Python environment for biology/data/model checks. This prevents repeated confusion around `.h5ad` contents, AnnData layers, UMI counts, CPM/logCPM transforms, and GPU/training behavior.
 
 ## AnnData Expression Layers
 

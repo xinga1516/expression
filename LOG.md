@@ -1,5 +1,51 @@
 # LOG
 
+## 2026-07-08
+
+- Compared the requested Stage 1 interaction diagnostic with
+  `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it implements the guide's
+  matched real/control-sequence comparison on unseen genes and frozen test
+  cells, with no intentional protocol deviation.
+- Added `scripts/summary_stage1.py` and `tests/unit/test_summary_stage1.py`.
+  The script validates matched run provenance, applies the same promoter model
+  to real promoter and `control_sequence`, applies the separate expression-only
+  model for residuals, and writes per-gene interaction variance and residual
+  correlation.
+- Confirmed that `promodel_wsl` is not visible in the current session (available
+  environments are `base`, `codex`, `genome`, and `promodel`). Per repository
+  policy, no Python tests, AnnData loading, or full model inference were run.
+- Ran `git diff --check` for the new Python files; it passed.
+
+## 2026-07-06
+
+- User requested replacing the `ema_alpha=0.9` fixed-LR output directory with an EMA-matched `ema_alpha=0.9999` rerun under the same experiment name; the prior full-test metrics remain recorded below for provenance.
+- Deleted `outputs/stage1_shift420_combined_fixedlr_seed7`, changed `configs/config.json` to `ema_alpha=0.9999`, and completed the same-name fixed-LR retraining in `promodel`; early stopping occurred at epoch 62.
+- EMA-matched validation comparison: fixed LR minimum RMSE 1.844529, maximum Pearson 0.267607, maximum Spearman 0.250772; cosine minimum RMSE 1.839322, maximum Pearson 0.267689, maximum Spearman 0.252792.
+- The automatic full test failed at its first GPU-cached batch with `CUDA error: unspecified launch failure`. A clean-process retry found CUDA unavailable and was stopped to avoid a full CPU evaluation; `nvidia-smi` then reported GPU0 `Unknown Error`. Full test remains pending a GPU/driver reset or host restart.
+- Compared the requested LR schedule with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; fixed LR `5e-4` matches the promoter starting default and introduces no guide conflict.
+- Replaced the five-epoch-warmup-plus-cosine scheduler with a five-epoch linear warmup followed by constant LR, exposed the warmup duration as `--warmup-epochs`, and added `tests/unit/test_lr_scheduler.py`.
+- Kept `ema_alpha=0.9` as explicitly requested and assigned the independent experiment name `stage1_shift420_combined_fixedlr_seed7` so the existing cosine run is not resumed or overwritten.
+- Ran `conda run --no-capture-output -n promodel pytest -q tests/unit/test_lr_scheduler.py tests/smoke/test_cli_help.py`: 8 tests passed.
+- Ran `conda run --no-capture-output -n promodel python scripts/train.py --exp_name stage1_shift420_combined_fixedlr_seed7 --prior_config configs/config.json`; training stopped normally at epoch 38 after 32 non-improving epochs, and LR stayed at `5e-4` from epoch 5 onward.
+- Completed the frozen full test on 2,048 cells x 2,707 genes (5,543,936 pairs): MSE 5.088862, RMSE 2.255851, Pearson 0.289195, Spearman 0.294108, nonzero RMSE 3.261428, zero RMSE 1.770706.
+- Added the fixed-LR run to `records/registry.tsv` and `docs/RUN_RESULTS_SUMMARY.md`.
+- Ran the prior `stage1_shift420_combined_seed7` checkpoint through the same frozen full-test protocol in `promodel`: 5,543,936 pairs, RMSE 2.297328, Pearson 0.313015, Spearman 0.308607, nonzero RMSE 3.056439, zero RMSE 1.961314.
+- Compared with the prior combined/cosine run, fixed LR reduced overall RMSE by 0.041478 and zero-target RMSE by 0.190608, but reduced Pearson by 0.023820 and Spearman by 0.014500 while increasing nonzero RMSE by 0.204989. Because EMA differs (`0.9999` prior vs `0.9` fixed-LR), this is not an isolated scheduler ablation.
+
+## 2026-07-05
+
+- Compared the requested prior configuration with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md` and `outputs/stage1_shift420_promoter_seed7/config.json`.
+- Found that the previous `configs/config.json` mixed saved-run keys with argparse keys (`loss_type` instead of `loss`, `vae_encoder_path` instead of `vae_encoder`) and set `data` to the old E-MTAB promoter directory; `train.py` ignores saved `train_promoter_file`/`val_promoter_file` fields and derives promoter CSV paths from `data`.
+- Rewrote `configs/config.json` as a valid combined-loss prior config for `data/promoter_stage1_v1`, aligned key training/evaluation parameters with the shift420 seed-7 MSE run, and set epochs to 80.
+- Validated the JSON against every argparse destination in `scripts/train.py`; no unknown keys were found. Confirmed the h5ad, train/val/test promoter CSVs, cell split directory, and input gene panel all exist. No training was started.
+
+## 2026-07-03
+
+- Compared the requested local environment setup with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`, `hpc/server_env.yml`, and `hpc/install_promodel.sh`; the biological/model guide has no conflicting environment requirement, while the repository runtime note names `promodel_wsl` and the HPC files name `promodel`.
+- Created the HPC-defined conda environment at the explicit prefix `/home/jovyan/.conda/envs/promodel` using `hpc/server_env.yml`; stopped and removed an initial `/opt/conda/envs/promodel` attempt after detecting the default-prefix mismatch.
+- Set the environment `LD_LIBRARY_PATH`, installed `torch==2.11.0+cu128` from the CUDA 12.8 PyTorch wheel index, and verified Python 3.10.20, Scanpy 1.11.5, AnnData 0.11.4, CUDA availability, and a 2048 x 2048 GPU matrix multiplication on the NVIDIA GeForce RTX 5090 D v2.
+- Ran `pytest -q tests/smoke/test_imports.py tests/smoke/test_cli_help.py` in the new environment: 7 tests passed.
+
 ## 2026-07-02
 
 - Read `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md` before recording the Stage 1 shift420 results; no guide conflict was found for the summary/registry update.

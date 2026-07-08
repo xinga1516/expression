@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 2026-07-08
+
+- Added `scripts/summary_stage1.py` to apply one promoter checkpoint to both
+  real promoter and matched `control_sequence` inputs on frozen test cells;
+  only the expression-only residual uses a separate checkpoint.
+- Added per-gene real-minus-control sequence-effect variance and correlation
+  with expression-only residuals, matched-protocol validation, streaming
+  statistics, GPU cached inference, CSV/JSON outputs, a diagnostic plot, and
+  unit coverage for the statistical calculations.
+
+## 2026-07-06
+
+- Replaced the post-warmup cosine decay in `scripts/train.py` with a constant learning rate: five linear warmup epochs from 10% of the configured rate, followed by the configured rate unchanged.
+- Added `--warmup-epochs` (default 5), scheduler unit coverage, and a separate Stage 1 promoter experiment configuration named `stage1_shift420_combined_fixedlr_seed7` with LR `5e-4` and `ema_alpha=0.9`.
+- Recorded `warmup_epochs` in run-local configs and completed the fixed-LR seed-7 promoter run plus full 5,543,936-pair test (RMSE 2.255851, Pearson 0.289195, Spearman 0.294108).
+- Added a same-protocol full test for the prior `stage1_shift420_combined_seed7` cosine run (RMSE 2.297328, Pearson 0.313015, Spearman 0.308607) to support direct outcome comparison.
+- Replaced the `ema_alpha=0.9` fixed-LR output directory with an `ema_alpha=0.9999` rerun under the same experiment name. Training completed at epoch 62; full testing is pending because the GPU entered an unrecoverable CUDA launch/driver error state after training.
+
+## 2026-07-05
+
+- Replaced `configs/config.json` with a `train.py --prior_config`-compatible Stage 1 combined-loss configuration using `data/promoter_stage1_v1`, 420 bp shift-compatible assets, a 400 bp model crop, shift20 augmentation, seed 7, EMA 0.9999, nonzero weight 2, and the historical shift420 checkpoint/evaluation settings.
+- Set the matched combined-loss run to 80 epochs as requested. This is an intentional deviation from the guide's preference for no hard epoch cap; early stopping remains enabled with patience 32 for comparability with the shift420 screening runs.
+
+## 2026-07-03
+
+- Recorded creation and GPU validation of the HPC-defined `promodel` conda environment at `/home/jovyan/.conda/envs/promodel`; no project code, data, model assumptions, or experiment configuration changed.
+
 ## 2026-07-02
 
 - Refreshed `outputs/stage1_shift420_summary.csv` directly from nine run-local `config.json` and `test_metrics.json` files, including sample counts, test-cell/gene counts, checkpoint metric, and zero/nonzero RMSE fields.

@@ -1,5 +1,26 @@
 # Run Results Summary
 
+## Stage 1 fixed-LR promoter run, 2026-07-06
+
+The original `stage1_shift420_combined_fixedlr_seed7` used five linear warmup epochs followed by constant LR `5e-4`, combined loss with `pearson_lambda=5`, and `ema_alpha=0.9`. It stopped at epoch 38 and completed the frozen 2,048-cell x 2,707-gene test (5,543,936 pairs). These results are historical: the output directory was subsequently replaced by an EMA-matched `ema_alpha=0.9999` run at the user's request.
+
+| RMSE | Pearson | Spearman | Nonzero RMSE | Zero RMSE |
+|---:|---:|---:|---:|---:|
+| 2.255851 | 0.289195 | 0.294108 | 3.261428 | 1.770706 |
+
+The prior `stage1_shift420_combined_seed7` checkpoint was subsequently evaluated on the identical full-test panel:
+
+| Run | Post-warmup schedule | EMA alpha | Stop epoch | RMSE | Pearson | Spearman | Nonzero RMSE | Zero RMSE |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `stage1_shift420_combined_seed7` | cosine decay | 0.9999 | 62 | 2.297328 | 0.313015 | 0.308607 | 3.056439 | 1.961314 |
+| `stage1_shift420_combined_fixedlr_seed7` | fixed `5e-4` | 0.9 | 38 | 2.255851 | 0.289195 | 0.294108 | 3.261428 | 1.770706 |
+
+Fixed LR reduced overall RMSE by 0.041478 and zero-target RMSE by 0.190608, but Pearson decreased by 0.023820, Spearman by 0.014500, and nonzero RMSE worsened by 0.204989. The fixed-LR run also stopped 24 epochs earlier. The result suggests a stronger fit to the dominant zero targets but weaker expressed-gene ranking. It is not an isolated scheduler result because EMA also changed from 0.9999 to 0.9; a strict scheduler comparison requires rerunning one schedule with matched EMA.
+
+The replacement fixed-LR run matched `ema_alpha=0.9999` and stopped at epoch 62. Its validation result is close to, but slightly below, cosine: minimum RMSE 1.844529 vs 1.839322, maximum Pearson 0.267607 vs 0.267689, and maximum Spearman 0.250772 vs 0.252792. Its automatic full test failed after training due a CUDA launch failure, and a clean retry confirmed the GPU driver was unavailable (`nvidia-smi`: GPU0 Unknown Error). The full-test scheduler comparison remains pending GPU/driver reset.
+
+Relative to the existing seed-7 MSE promoter run, fixed-LR combined loss improved RMSE by 0.001174, Pearson by 0.002961, and Spearman by 0.007866. This second comparison is also not isolated because the loss functions differ.
+
 ## Stage 1 shift420 gate, 2026-07-02
 
 Source table: `outputs/stage1_shift420_summary.csv`. Each row was regenerated from the run-local `config.json` and `test/test_metrics.json` files, not copied from training logs.

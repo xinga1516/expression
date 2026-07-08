@@ -47,6 +47,22 @@ def dataloader_worker_kwargs(num_workers: int, prefetch_factor: int) -> dict[str
     return kwargs
 
 
+def build_warmup_constant_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_epochs: int = 5,
+    start_factor: float = 0.1,
+) -> torch.optim.lr_scheduler.LinearLR:
+    """Warm up linearly to the optimizer LR, then keep that LR constant."""
+    if warmup_epochs < 1:
+        raise ValueError("warmup_epochs must be at least 1")
+    return torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=start_factor,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+
+
 def resolve_cell_split_dir(base_dir: Path, data_name: str, cell_split_dir: str | None) -> Path:
     if cell_split_dir is None:
         return base_dir / "data" / data_name
@@ -537,6 +553,7 @@ def train_model(
     exp_name,
     epochs=30,
     learning_rate=1e-4,
+    warmup_epochs: int = 5,
     nonzero_loss_weight=2.0,
     seed=42,
     patience=5,
@@ -610,30 +627,11 @@ def train_model(
             f"normalize={contrastive_normalize}"
         )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,weight_decay=1e-2)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer,
-    #     T_max=max(1, epochs),
-    #     eta_min=learning_rate * 0.01,
-    # )
-    # 1. 定义前 5 个 Epoch 的 Warmup 调度器 (从 0.001 * 0.1 线性增长到 0.001)
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, 
-        start_factor=0.1, 
-        end_factor=1.0, 
-        total_iters=5 # warm up 5 epochs
-    )
-    # 2. 定义后面余弦退火的调度器 (退火步数 = 总步数 - 预热步数)
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=(epochs - 5), 
-        eta_min=1e-6
-    )
-    # 3. 使用 SequentialLR 将两者串联，milestones 传入切换的节点步数
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, 
-        schedulers=[warmup_scheduler, cosine_scheduler], 
-        milestones=[5]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
+    scheduler = build_warmup_constant_scheduler(optimizer, warmup_epochs=warmup_epochs)
+    print(
+        f"[LR] linear warmup for {warmup_epochs} epochs from "
+        f"{learning_rate * 0.1:.6g} to {learning_rate:.6g}; constant thereafter."
     )
     earlystopping = EarlyStopping(patience=patience, min_delta=min_delta)
 
@@ -1156,6 +1154,7 @@ def train_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Train a gene expression model.")
+    parser.add_argument("--prior_config", type=str, default=None, help="The set parameter for training.")
     parser.add_argument("--exp_name", type=str, required=True, default='default', help="Name of the experiment (used for organizing outputs)")
     parser.add_argument("--config", type=str, default=None, help="Path to hyperparameter config.json")
     parser.add_argument("--model", type=str, default="LSTMmodel", choices=sorted(MODEL_REGISTRY.keys()), help="Model architecture to use")
@@ -1191,6 +1190,7 @@ def main():
     parser.add_argument("--max-duplication", type=float, default=1.0, help="Max duplication factor for auto samples_per_epoch (1.0 = no duplication, 2.0 = up to 2x)")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--learning-rate", type=float, default=0.001, help="Learning rate for optimizer")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="Linear warmup epochs before holding the learning rate constant")
     parser.add_argument("--nonzero-loss-weight", type=float, default=2.0, help="Weight multiplier for non-zero labels in MSE loss")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum loss improvement to reset patience")
@@ -1215,6 +1215,11 @@ def main():
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
     parser.add_argument("--vae-fine-tune-start-epoch", type=int, default=-1, help="Epoch to start fine-tuning the VAE encoder. -1 keeps current freeze/unfreeze behavior.")
     args = parser.parse_args()
+    if args.prior_config:
+        with open(args.prior_config, "r") as f:
+            config_data = json.load(f)
+
+        vars(args).update(config_data)
 
     # # 允许 cuDNN 自动寻找最适合当前配置的算法（提高速度）
     # torch.backends.cudnn.benchmark = True 
@@ -1499,6 +1504,7 @@ def main():
         exp_name=args.exp_name,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
+        warmup_epochs=args.warmup_epochs,
         nonzero_loss_weight=args.nonzero_loss_weight,
         seed=args.seed,
         patience=args.patience,
@@ -1589,5 +1595,4 @@ if __name__ == "__main__":
     main()
 
 # %%
-
 

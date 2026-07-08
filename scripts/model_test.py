@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=0, help="0 means evaluate all test samples.")
     parser.add_argument("--spearman-samples", type=int, default=1_000_000, help="Reservoir sample size for Spearman. 0 means store all samples.")
     parser.add_argument("--preencode-promoters", action="store_true", default=False, help="Pre-encode test promoters in memory.")
+    parser.add_argument(
+        "--no-gpu-cache-dataset",
+        action="store_true",
+        default=False,
+        help="Use a CPU DataLoader even when the model runs on CUDA. Useful after long training runs or for CUDA stability diagnostics.",
+    )
     parser.add_argument("--use-cell-split", action="store_true", default=False, help="Use cell_test.txt to restrict evaluated test cells.")
     parser.add_argument("--cell-split-dir", type=str, default=None, help="Directory containing cell_test.txt. Default: resolved data directory.")
     parser.add_argument("--skip-standard-test", action="store_true", default=False, help="Skip metrics/scatter and only run requested extra analyses.")
@@ -1428,7 +1434,8 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
         input_gene_panel_file=input_gene_panel_file,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
+    use_gpu_cache = device.type == "cuda" and not getattr(args, "no_gpu_cache_dataset", False)
+    if use_gpu_cache:
         test_samples = int(args.max_samples) if int(args.max_samples) > 0 else len(dataset)
         loader = GpuCachedPairLoader(
             dataset,
@@ -1440,12 +1447,14 @@ def run_model_test(args: argparse.Namespace) -> dict[str, Any]:
             drop_last=False,
         )
     else:
+        if device.type == "cuda":
+            print("[ModelTest] using CPU DataLoader with CUDA model; GPU dataset cache is disabled.")
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=device.type == "cuda",
             drop_last=False,
         )
 
