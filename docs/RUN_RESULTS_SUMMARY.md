@@ -70,3 +70,20 @@ Best single-run Pearson by group:
 - Expression matched: `stage1_shift420_exprmatched_seed1` Pearson 0.133493.
 - Real promoter: `stage1_shift420_promoter_seed7` Pearson 0.286233.
 - Matched intergenic: `stage1_shift420_intergenic_seed7` Pearson 0.194263.
+
+
+## Stage 1 seed 7 训练策略消融，2026-07-06
+
+比较对象为同一 CNNFlattenPromoterModel、同一 gene/cell split、同一 420 bp promoter 资产和 400 bp 随机 crop 设置：
+
+| 策略 | 训练日志 epochs | Test RMSE | Pearson | Spearman |
+|---|---:|---:|---:|---:|
+| MSE | 30 | 2.257024 | 0.286233 | 0.286241 |
+| Combined (Pearson lambda=5) | 63 | 2.297328 | 0.313015 | 0.308607 |
+| Combined + fixed LR | 63 | 2.245754 | 0.320310 | 0.315785 |
+
+严格按相同 cell_id/gene_id 配对后，combined 相对 MSE 的 Pearson mean delta 为 per-cell +0.024373，95% CI [0.023682, 0.025048]；per-gene +0.030655，[0.026570, 0.034860]。fixed LR 相对 MSE 为 per-cell +0.034788，[0.034046, 0.035542]；per-gene +0.023898，[0.019101, 0.028843]。
+
+fixed LR 相对普通 combined 的 per-cell Pearson 提升 +0.010415，[0.009850, 0.010968]，但 per-gene mean delta 为 -0.006758，[-0.010280, -0.003177]。因此 fixed LR 当前是全局相关性、全局 RMSE 和 per-cell Pearson 最好的 seed 7 策略，但不能宣称其 per-gene 表现优于普通 combined。
+
+这是单 seed 训练策略消融，不替代三 seed Stage 1 正式比较。MSE run 仅训练 30 epochs，而 combined runs 配置为 80 epochs 并记录到 63 epochs，因此 combined 与 MSE 的差异同时包含 loss 和训练预算效应。详细 CSV、配对 bootstrap 和图位于 outputs/stage1/summary/stage1_training_ablation_*。

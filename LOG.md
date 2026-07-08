@@ -2,6 +2,13 @@
 
 ## 2026-07-08
 
+- Compared the remote-server documentation change with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it changes infrastructure guidance only and does not conflict with the guide's gene-split, masking, baseline, or evaluation requirements.
+- Updated `AGENTS.md` with the required `sulab7g-zxy` connection, `/PROJ5/liangn_zxy/` directory layout, `rsync` usage, explicit `CUDA_VISIBLE_DEVICES`, and prohibited operations.
+- Updated `project_overview.md` with the remote execution layout.
+- No server connection or tests were run; this was a documentation-only change.
+
+## 2026-07-08
+
 - Compared the requested Stage 1 interaction diagnostic with
   `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it implements the guide's
   matched real/control-sequence comparison on unseen genes and frozen test
@@ -65,6 +72,19 @@
 - Validated all split files: every `sequence`, `positive_sequence`, and `control_sequence` is 420 bp; train/val/test genes remain mutually exclusive; `input_gene_panel_train.txt` remains train-gene-only; `sequence == positive_sequence` and `sequence == control_sequence` fractions are both 0.0 in all splits.
 
 Codex operation log for meaningful repository work.
+
+## 2026-07-06
+
+- Compared stage1_shift420_promoter_seed7, stage1_shift420_combined_seed7, and stage1_shift420_combined_fixedlr_seed7 on the same frozen 5,543,936 test pairs.
+- Generated outputs/stage1/summary/stage1_training_ablation_seed7.csv, paired deltas/bootstrap CSVs, PNG/SVG summary, and a Chinese README using 10,000 bootstrap repeats.
+- Fixed LR achieved the best global test RMSE/Pearson/Spearman (2.245754/0.320310/0.315785); versus ordinary combined it improved per-cell Pearson by 0.010415 but reduced per-gene Pearson by 0.006758.
+- Ran the focused Stage 1 summary tests in WSL promodel_wsl: 4 passed.
+
+- Generated `outputs/stage1/summary/paired_bootstrap_summary.png`, a two-panel forest plot of per-cell/per-gene promoter Pearson deltas with individual seed estimates and hierarchical 95% CIs.
+- Added and ran the Stage 1 paired Pearson bootstrap summary with 10,000 repeats, 95% percentile intervals, and random seed 42.
+- Wrote 23,557 valid paired records plus per-seed and hierarchical three-seed summaries to `outputs/stage1/summary/`.
+- Promoter vs intergenic hierarchical deltas were positive with intervals excluding zero: per-cell `0.1093 [0.0960, 0.1187]`; per-gene `0.0259 [0.0194, 0.0346]`.
+- Ran `pytest tests/unit/test_stage1_bootstrap_summary.py -q` in WSL `promodel_wsl`: 2 passed.
 
 ## 2026-07-01
 

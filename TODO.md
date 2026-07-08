@@ -4,6 +4,8 @@ Current project task list.
 
 ## Active
 
+- [x] Compare seed-7 MSE, combined loss, and combined fixed-LR promoter runs and add global plus paired per-cell/per-gene results to the Stage 1 summary.
+
 - [x] Re-run promoter Stage 1 v2 nine-model comparison after 420 bp asset update.
 - [x] Record Stage 1 shift420 nine-run metrics in summary, registry, and result documents.
 - [x] Use `--sequence-length 400 --promoter-shift-max 20` so train-time random crop uses the new 420 bp windows while val/test use centered crops.

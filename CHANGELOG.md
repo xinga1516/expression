@@ -2,6 +2,11 @@
 
 ## 2026-07-08
 
+- Added remote server operating rules to `AGENTS.md` for the `sulab7g-zxy` SSH target, including approved `/PROJ5/liangn_zxy/` directory purposes, transfer conventions, explicit GPU selection, and account/filesystem safety boundaries.
+- Added the remote training infrastructure layout to `project_overview.md`.
+
+## 2026-07-08
+
 - Added `scripts/summary_stage1.py` to apply one promoter checkpoint to both
   real promoter and matched `control_sequence` inputs on frozen test cells;
   only the expression-only residual uses a separate checkpoint.
@@ -42,6 +47,15 @@
 - Updated `data/promoter_stage1_v1` promoter split files in place to 420 bp `sequence`, `positive_sequence`, and `control_sequence` windows while preserving existing gene split, cell split, input gene panel, and matched control identities.
 
 Human-readable record of repository changes.
+
+## 2026-07-06
+
+- Integrated the seed-7 MSE/combined/fixed-learning-rate ablation into the Stage 1 summary pipeline, including global metrics, training-trajectory metadata, paired per-cell/per-gene Pearson bootstrap intervals, and a four-panel figure.
+- Added a Chinese ablation interpretation record and a unit test for strict ID-paired delta construction.
+
+- Added `scripts/summarize_stage1_bootstrap.py` for paired promoter-vs-baseline Pearson bootstrap analysis at per-cell and per-gene levels.
+- Added deterministic per-seed and hierarchical three-seed confidence intervals with raw paired delta records under `outputs/stage1/summary/`.
+- Added unit tests for paired and hierarchical bootstrap helpers.
 
 ## 2026-07-01
 

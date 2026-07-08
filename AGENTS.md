@@ -97,6 +97,54 @@ For every completed repository change:
 - Update `project_overview.md` when the change affects project workflow, data/model assumptions, or recommended commands.
 
 These requirements are project-level standing instructions. They should be followed automatically in this repository; the user should not need to repeat them in each prompt.
+## Remote Server Operations
+
+When remote compute is requested, connect only through the configured SSH alias:
+
+```powershell
+wsl
+ssh sulab7g-zxy
+```
+
+Use these server directories by purpose:
+
+```text
+/PROJ5/liangn_zxy/work/     code and small inputs
+/PROJ5/liangn_zxy/envs/     conda/venv environments
+/PROJ5/liangn_zxy/runs/     outputs and checkpoints
+/PROJ5/liangn_zxy/cache/    model/package caches
+/PROJ5/liangn_zxy/scratch/  temporary files
+```
+
+Do not write project data, environments, models, checkpoints, caches, or outputs under `/home`.
+
+Use `rsync` with the SSH alias for transfers. Upload only code or small inputs to `work/`, and download results from `runs/`:
+
+```bash
+wsl
+rsync -av --progress ./my_project/ sulab7g-zxy:/PROJ5/liangn_zxy/work/my_project/
+rsync -av --progress sulab7g-zxy:/PROJ5/liangn_zxy/runs/run_001/ ./run_001/
+```
+
+Before GPU work, inspect availability with `nvidia-smi`. Explicitly expose only the required GPU devices:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+python train.py
+
+export CUDA_VISIBLE_DEVICES=0,1
+torchrun --nproc_per_node=2 train.py
+```
+
+Remote-operation boundaries:
+
+- Use only `sulab7g` through the `sulab7g-zxy` SSH alias.
+- Do not use root, `liangn`, another account, `sudo`, Docker, or system services.
+- Do not read, move, delete, or rename another user's files or directories.
+- Do not reserve or occupy all eight GPUs by default; expose only the GPUs required for the task.
+- Use `/ssd` only after an administrator explicitly authorizes it as temporary scratch space.
+- Prefer non-interactive SSH commands and `tmux`, `screen`, or the configured scheduler for long-running jobs.
+- Before destructive remote actions or overwriting runs, obtain explicit user approval and verify the target is under `/PROJ5/liangn_zxy/`.
 
 Gene expression prediction from promoter sequences and scRNA-seq data. The model takes a one-hot encoded promoter sequence (400bp × 5 channels ACGTN) and a cell's full expression profile (all genes except the target), then predicts the target gene's expression level.
 
