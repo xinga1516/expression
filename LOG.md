@@ -1,6 +1,12 @@
 # LOG
 
 ## 2026-07-08
+- Installed micromamba 2.8.1 at `/PROJ5/liangn_zxy/envs/bin/micromamba` and created the remote project environment at `/PROJ5/liangn_zxy/envs/promodel`; package caches and temporary files remain under the approved `/PROJ5/liangn_zxy/` paths.
+- Installed PyTorch `2.5.1+cu121` instead of the repository install script's CUDA 12.8 wheel because sulab7g uses NVIDIA driver 535.113.01/CUDA 12.2. Validated CUDA on GPU 0 (RTX 3090), Scanpy 1.11.5, and AnnData 0.11.4.
+- Tested Stage 1 seed-7 promoter mutagenesis. The full promoter candidate scan remained CPU-bound after 10 minutes and was stopped; `top_n` limits selected pairs but not the preliminary promoter/cell scan.
+- Completed a mutation smoke test using 10 formal test promoters, all 2,048 frozen test cells, the 4,096-gene input panel, and the formal seed-7 best checkpoint. It selected two pairs from two genes with cap=1 and generated all expected mutation/motif outputs under `/PROJ5/liangn_zxy/runs/stage1_mutation_smoke_small_seed7/`.
+
+- Successfully tested read-only SSH access through `sulab7g-zxy`. Confirmed user `liangn_zxy`, host `sulab7g`, project directory `/PROJ5/liangn_zxy/work/expression`, and a clean `main...origin/main` git status. No remote files were changed and no GPU task was started.
 
 - Compared the remote-server documentation change with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it changes infrastructure guidance only and does not conflict with the guide's gene-split, masking, baseline, or evaluation requirements.
 - Updated `AGENTS.md` with the required `sulab7g-zxy` connection, `/PROJ5/liangn_zxy/` directory layout, `rsync` usage, explicit `CUDA_VISIBLE_DEVICES`, and prohibited operations.
@@ -8,6 +14,12 @@
 - No server connection or tests were run; this was a documentation-only change.
 
 ## 2026-07-08
+- Installed micromamba 2.8.1 at `/PROJ5/liangn_zxy/envs/bin/micromamba` and created the remote project environment at `/PROJ5/liangn_zxy/envs/promodel`; package caches and temporary files remain under the approved `/PROJ5/liangn_zxy/` paths.
+- Installed PyTorch `2.5.1+cu121` instead of the repository install script's CUDA 12.8 wheel because sulab7g uses NVIDIA driver 535.113.01/CUDA 12.2. Validated CUDA on GPU 0 (RTX 3090), Scanpy 1.11.5, and AnnData 0.11.4.
+- Tested Stage 1 seed-7 promoter mutagenesis. The full promoter candidate scan remained CPU-bound after 10 minutes and was stopped; `top_n` limits selected pairs but not the preliminary promoter/cell scan.
+- Completed a mutation smoke test using 10 formal test promoters, all 2,048 frozen test cells, the 4,096-gene input panel, and the formal seed-7 best checkpoint. It selected two pairs from two genes with cap=1 and generated all expected mutation/motif outputs under `/PROJ5/liangn_zxy/runs/stage1_mutation_smoke_small_seed7/`.
+
+- Successfully tested read-only SSH access through `sulab7g-zxy`. Confirmed user `liangn_zxy`, host `sulab7g`, project directory `/PROJ5/liangn_zxy/work/expression`, and a clean `main...origin/main` git status. No remote files were changed and no GPU task was started.
 
 - Compared the requested Stage 1 interaction diagnostic with
   `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it implements the guide's

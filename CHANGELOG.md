@@ -1,11 +1,15 @@
 # CHANGELOG
 
 ## 2026-07-08
+- Configured the remote `promodel` environment under `/PROJ5/liangn_zxy/envs/promodel` with Python 3.10 and PyTorch 2.5.1 CUDA 12.1, and validated GPU execution on sulab7g.
+- Completed a Stage 1 promoter mutation smoke test and documented that full top-pair selection is currently CPU-bound because `top_n` does not limit the preliminary candidate scan.
 
 - Added remote server operating rules to `AGENTS.md` for the `sulab7g-zxy` SSH target, including approved `/PROJ5/liangn_zxy/` directory purposes, transfer conventions, explicit GPU selection, and account/filesystem safety boundaries.
 - Added the remote training infrastructure layout to `project_overview.md`.
 
 ## 2026-07-08
+- Configured the remote `promodel` environment under `/PROJ5/liangn_zxy/envs/promodel` with Python 3.10 and PyTorch 2.5.1 CUDA 12.1, and validated GPU execution on sulab7g.
+- Completed a Stage 1 promoter mutation smoke test and documented that full top-pair selection is currently CPU-bound because `top_n` does not limit the preliminary candidate scan.
 
 - Added `scripts/summary_stage1.py` to apply one promoter checkpoint to both
   real promoter and matched `control_sequence` inputs on frozen test cells;

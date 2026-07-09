@@ -33,6 +33,7 @@ This repository develops models for predicting Drosophila gene expression from p
 - Project data, environments, models, and outputs must not be written under `/home`.
 - GPU jobs must explicitly set `CUDA_VISIBLE_DEVICES` and should not occupy all eight GPUs by default.
 - `/ssd` is unavailable unless an administrator explicitly authorizes its use.
+- Remote environment: `/PROJ5/liangn_zxy/envs/promodel`, created with micromamba 2.8.1 and currently using Python 3.10 plus PyTorch 2.5.1 CUDA 12.1 for compatibility with the NVIDIA 535 driver.
 ## Standing Project Guide
 
 Before changing data processing, split logic, training parameters, model architecture, or evaluation workflow, compare the proposed change with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`.
