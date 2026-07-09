@@ -242,3 +242,24 @@ def test_dataset_supports_custom_sequence_length(tiny_data_dir) -> None:
 
     assert promoter.shape == (801, 5)
     assert torch.all(promoter[:, 0] == 1.0)
+
+def test_get_sequence_tensors_can_random_crop_contrastive_negatives(tiny_data_dir) -> None:
+    promoter_path = tiny_data_dir / "promoter_train.csv"
+    promoters = pd.read_csv(promoter_path)
+    promoters["control_sequence"] = ["A" * 3 + "C" * 400 + "G" * 3 for _ in range(len(promoters))]
+    promoters.to_csv(promoter_path, index=False)
+    dataset = MyDataset(
+        promoter_file=promoter_path,
+        scrna_file=tiny_data_dir / "integrated_data.h5ad",
+        mode="train",
+        sequence_length=400,
+        promoter_shift_max=0,
+        seed=123,
+    )
+
+    centered = dataset.get_sequence_tensors([0], column="control_sequence", shift_max=0)
+    random_crops = [dataset.get_sequence_tensors([0], column="control_sequence", shift_max=3) for _ in range(16)]
+
+    assert torch.all(centered[0, :, 1] == 1.0)
+    assert any(not torch.equal(crop, centered) for crop in random_crops)
+    assert all(crop.shape == (1, 400, 5) for crop in random_crops)

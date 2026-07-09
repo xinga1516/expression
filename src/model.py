@@ -266,6 +266,8 @@ class CNNFlattenPromoterModel(nn.Module):
         vae_encoder_path: Optional[str] = None,
         vae_fine_tune: bool = False,
         output_mode: str = "scalar",
+        contrastive_projection_dim: int = 0,
+        contrastive_projection_layers: int = 2,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -286,6 +288,21 @@ class CNNFlattenPromoterModel(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
+        contrastive_projection_dim = int(contrastive_projection_dim or 0)
+        contrastive_projection_layers = max(1, int(contrastive_projection_layers or 1))
+        self.contrastive_projection_dim = contrastive_projection_dim
+        if contrastive_projection_dim > 0:
+            if contrastive_projection_layers == 1:
+                self.contrastive_projection_head = nn.Linear(hidden_size, contrastive_projection_dim)
+            else:
+                self.contrastive_projection_head = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                    nn.GELU(),
+                    nn.Linear(hidden_size, contrastive_projection_dim),
+                )
+        else:
+            self.contrastive_projection_head = nn.Identity()
 
         self.use_vae = use_vae
         self.vae_fine_tune = vae_fine_tune
@@ -332,6 +349,14 @@ class CNNFlattenPromoterModel(nn.Module):
         x = self.promoter_conv(x)
         x = x.flatten(start_dim=1)
         return self.promoter_fc(x)
+
+    def encode_promoter_for_contrastive(
+        self,
+        promoter: torch.Tensor,
+        encoded: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        embedding = self.encode_promoter(promoter) if encoded is None else encoded
+        return self.contrastive_projection_head(embedding)
 
     def forward(self, promoter: torch.Tensor, expr: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         promoter_out = self.encode_promoter(promoter)
@@ -402,6 +427,8 @@ class MatchedExpressionBaseline(nn.Module):
         vae_encoder_path: Optional[str] = None,
         vae_fine_tune: bool = False,
         output_mode: str = "scalar",
+        contrastive_projection_dim: int = 0,
+        contrastive_projection_layers: int = 2,
         **kwargs: Any,
     ) -> None:
         super().__init__()

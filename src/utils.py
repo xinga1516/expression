@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 from typing import Any, Iterator, Optional
 from datetime import datetime
 import json
@@ -309,6 +309,9 @@ def save_run_config(config_path: Path, args: argparse.Namespace, base_dir: Path,
         "contrastive_margin": getattr(args, "contrastive_margin", 1.0),
         "contrastive_positive_column": getattr(args, "contrastive_positive_column", "positive_sequence"),
         "contrastive_negative_column": getattr(args, "contrastive_negative_column", "control_sequence"),
+        "contrastive_negative_shift_max": getattr(args, "contrastive_negative_shift_max", -1),
+        "contrastive_projection_dim": getattr(args, "contrastive_projection_dim", 0),
+        "contrastive_projection_layers": getattr(args, "contrastive_projection_layers", 2),
         "contrastive_normalize": not getattr(args, "no_contrastive_normalize", False),
     })
 

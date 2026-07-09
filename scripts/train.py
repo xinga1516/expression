@@ -307,14 +307,19 @@ def promoter_triplet_contrastive_loss(
     margin: float = 1.0,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Triplet loss over promoter embeddings: center crop, shifted crop, matched control."""
+    """Triplet loss over promoter embeddings: anchor, shifted positive, matched intergenic negative."""
     if not hasattr(model, "encode_promoter"):
         raise ValueError("Contrastive training requires a model with encode_promoter(), e.g. CNNFlattenPromoterModel.")
-    anchor = getattr(model, "last_lstm_out", None)
-    if anchor is None:
-        anchor = model.encode_promoter(promoters)
-    positive = model.encode_promoter(positive_promoters)
-    negative = model.encode_promoter(negative_promoters)
+
+    def contrastive_embedding(sequence: torch.Tensor, encoded: torch.Tensor | None = None) -> torch.Tensor:
+        if hasattr(model, "encode_promoter_for_contrastive"):
+            return model.encode_promoter_for_contrastive(sequence, encoded=encoded)
+        return encoded if encoded is not None else model.encode_promoter(sequence)
+
+    anchor_encoded = getattr(model, "last_lstm_out", None)
+    anchor = contrastive_embedding(promoters, encoded=anchor_encoded)
+    positive = contrastive_embedding(positive_promoters)
+    negative = contrastive_embedding(negative_promoters)
     if normalize:
         anchor = F.normalize(anchor, dim=1)
         positive = F.normalize(positive, dim=1)
@@ -573,6 +578,7 @@ def train_model(
     contrastive_positive_column: str = "positive_sequence",
     contrastive_negative_column: str = "control_sequence",
     contrastive_normalize: bool = True,
+    contrastive_negative_shift_max: int | None = None,
     eval_every_steps: int = 0,
 ):
     # Set random seeds for reproducibility
@@ -624,7 +630,7 @@ def train_model(
         print(
             f"[Contrastive] enabled: weight={contrastive_weight} margin={contrastive_margin} "
             f"positive_column={contrastive_positive_column} negative_column={contrastive_negative_column} "
-            f"normalize={contrastive_normalize}"
+            f"negative_shift_max={contrastive_negative_shift_max} normalize={contrastive_normalize}"
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
@@ -995,6 +1001,7 @@ def train_model(
                 negative_promoters = train_loader.dataset.get_sequence_tensors(
                     pro_indices_np,
                     column=contrastive_negative_column,
+                    shift_max=contrastive_negative_shift_max,
                 ).to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
@@ -1210,6 +1217,9 @@ def main():
     parser.add_argument("--contrastive-margin", type=float, default=1.0, help="Triplet margin for promoter vs matched intergenic contrastive loss.")
     parser.add_argument("--contrastive-positive-column", type=str, default="positive_sequence", help="Promoter CSV column used as shifted positive sequence for contrastive training.")
     parser.add_argument("--contrastive-negative-column", type=str, default="control_sequence", help="Promoter CSV column used as matched negative sequence for contrastive training.")
+    parser.add_argument("--contrastive-negative-shift-max", type=int, default=-1, help="Train-time random crop shift for contrastive intergenic negatives. -1 reuses --promoter-shift-max; 0 uses centered crop.")
+    parser.add_argument("--contrastive-projection-dim", type=int, default=0, help="Optional projection head dimension for contrastive embeddings. 0 applies triplet loss directly to promoter embedding.")
+    parser.add_argument("--contrastive-projection-layers", type=int, default=2, help="Number of layers in the optional contrastive projection head.")
     parser.add_argument("--no-contrastive-normalize", action="store_true", default=False, help="Disable L2 normalization before triplet contrastive loss.")
     parser.add_argument("--vae-encoder", type=str, default=None, help="Path to scVI output dir (e.g., outputs/scvi_10/) containing encoder.pt and config.json")
     parser.add_argument("--vae-fine-tune", action="store_true", default=False, help="Unfreeze scVI encoder weights during training")
@@ -1449,6 +1459,8 @@ def main():
         vae_fine_tune=args.vae_fine_tune,
         output_mode=output_mode,
         fusion=args.fusion,
+        contrastive_projection_dim=args.contrastive_projection_dim,
+        contrastive_projection_layers=args.contrastive_projection_layers,
     )
     print_training_resource_summary(
         model=model,
@@ -1476,7 +1488,9 @@ def main():
                             promoter_len=args.sequence_length,
                             use_vae=args.vae_encoder is not None, vae_encoder_path=args.vae_encoder,
                             vae_fine_tune=args.vae_fine_tune, output_mode=output_mode,
-                            fusion=args.fusion)
+                            fusion=args.fusion,
+                            contrastive_projection_dim=args.contrastive_projection_dim,
+                            contrastive_projection_layers=args.contrastive_projection_layers)
 
     resume = args.resume
     if resume is None:
@@ -1524,6 +1538,7 @@ def main():
         contrastive_positive_column=args.contrastive_positive_column,
         contrastive_negative_column=args.contrastive_negative_column,
         contrastive_normalize=not args.no_contrastive_normalize,
+        contrastive_negative_shift_max=(args.promoter_shift_max if args.contrastive_negative_shift_max < 0 else args.contrastive_negative_shift_max),
         eval_every_steps=args.eval_every_steps,
     )
  

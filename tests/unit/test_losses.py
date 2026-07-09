@@ -83,3 +83,29 @@ def test_promoter_triplet_contrastive_loss_backpropagates() -> None:
 
     assert torch.isfinite(loss)
     assert model.promoter_conv[0].weight.grad is not None
+
+def test_promoter_triplet_contrastive_loss_uses_projection_head() -> None:
+    promoter = torch.zeros(2, 400, 5)
+    promoter[:, :, 0] = 1.0
+    positive = torch.zeros(2, 400, 5)
+    positive[:, :, 1] = 1.0
+    negative = torch.zeros(2, 400, 5)
+    negative[:, :, 3] = 1.0
+    expr = torch.rand(2, 5)
+    model = build_model(
+        "CNNFlattenPromoterModel",
+        expr_dim=5,
+        hidden_size=8,
+        output_mode="scalar",
+        contrastive_projection_dim=3,
+        contrastive_projection_layers=2,
+    )
+
+    _ = model(promoter, expr)
+    projected = model.encode_promoter_for_contrastive(promoter)
+    loss = promoter_triplet_contrastive_loss(model, promoter, positive, negative, margin=0.5)
+    loss.backward()
+
+    assert projected.shape == (2, 3)
+    assert torch.isfinite(loss)
+    assert model.contrastive_projection_head[-1].weight.grad is not None

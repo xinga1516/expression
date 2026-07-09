@@ -237,15 +237,21 @@ class MyDataset(Dataset):
         return self._apply_expression_transform(self._dense_row(self.expression_X, int(cell_row)))
 
 
-    def _crop_sequence_for_model(self, seq: str, crop_start: int | None = None) -> str:
+    def _crop_sequence_for_model(
+        self,
+        seq: str,
+        crop_start: int | None = None,
+        shift_max: int | None = None,
+    ) -> str:
         seq = str(seq).upper()
         if len(seq) <= self.sequence_length:
             return seq
         max_start = len(seq) - self.sequence_length
         center_start = max_start // 2
+        active_shift_max = self.promoter_shift_max if shift_max is None else max(0, int(shift_max))
         if crop_start is None:
-            if self.mode == "train" and self.promoter_shift_max > 0:
-                shift = min(self.promoter_shift_max, center_start, max_start - center_start)
+            if self.mode == "train" and active_shift_max > 0:
+                shift = min(active_shift_max, center_start, max_start - center_start)
                 if shift > 0:
                     crop_start = int(self._sequence_rng.integers(center_start - shift, center_start + shift + 1))
                 else:
@@ -318,26 +324,36 @@ class MyDataset(Dataset):
     def has_sequence_column(self, column: str) -> bool:
         return column in self.promoters.columns
 
-    def get_sequence_tensor(self, pro_i: int, column: str | None = None) -> torch.Tensor:
+    def get_sequence_tensor(
+        self,
+        pro_i: int,
+        column: str | None = None,
+        shift_max: int | None = None,
+    ) -> torch.Tensor:
         sequence_column = self.sequence_column if column is None else column
         if sequence_column not in self.promoters.columns:
             raise ValueError(
                 f"Sequence column {sequence_column!r} not found in {self.promoter_file}. "
                 f"Available columns: {sorted(self.promoters.columns)}"
             )
-        if self.promoter_tensor is not None and sequence_column == self.sequence_column:
+        if self.promoter_tensor is not None and sequence_column == self.sequence_column and shift_max is None:
             return self.promoter_tensor[pro_i]
-        seq = self._crop_sequence_for_model(str(self.promoters[sequence_column].iloc[pro_i]))
+        seq = self._crop_sequence_for_model(str(self.promoters[sequence_column].iloc[pro_i]), shift_max=shift_max)
         return self.promoter_encoder(seq)
 
     def get_promoter_tensor(self, pro_i: int) -> torch.Tensor:
         return self.get_sequence_tensor(pro_i, self.sequence_column)
 
-    def get_sequence_tensors(self, pro_indices: np.ndarray | list[int], column: str | None = None) -> torch.Tensor:
+    def get_sequence_tensors(
+        self,
+        pro_indices: np.ndarray | list[int],
+        column: str | None = None,
+        shift_max: int | None = None,
+    ) -> torch.Tensor:
         sequence_column = self.sequence_column if column is None else column
-        if self.promoter_tensor is not None and sequence_column == self.sequence_column:
+        if self.promoter_tensor is not None and sequence_column == self.sequence_column and shift_max is None:
             return self.promoter_tensor[pro_indices]
-        tensors = [self.get_sequence_tensor(int(pro_i), sequence_column) for pro_i in pro_indices]
+        tensors = [self.get_sequence_tensor(int(pro_i), sequence_column, shift_max=shift_max) for pro_i in pro_indices]
         return torch.stack(tensors, dim=0)
 
     def get_promoter_tensors(self, pro_indices: np.ndarray | list[int]) -> torch.Tensor:
