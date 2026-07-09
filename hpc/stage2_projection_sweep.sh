@@ -23,6 +23,8 @@ if [ -f /home/jchamper_pkuhpc/miniconda3/etc/profile.d/conda.sh ]; then
 elif [ -f /home/xinyue/miniconda3/etc/profile.d/conda.sh ]; then
     source /home/xinyue/miniconda3/etc/profile.d/conda.sh
     conda activate promodel_wsl
+elif [ -x /PROJ5/liangn_zxy/envs/promodel/bin/python ]; then
+    export PATH="/PROJ5/liangn_zxy/envs/promodel/bin:${PATH}"
 fi
 
 mkdir -p outputs/stage2/slurm
