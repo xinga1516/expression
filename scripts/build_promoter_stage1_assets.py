@@ -581,11 +581,13 @@ def build_assets(args: argparse.Namespace) -> None:
     adata = sc.read_h5ad(scrna_file)
     gtf_genes = read_gtf_gene_table(gtf_path)
     source_promoters = read_source_promoters(source_data_dir)
-    source_promoters = widen_promoter_windows(
-        source_promoters,
-        genome_fasta=genome_fasta,
-        target_length=args.promoter_window_length,
-    )
+    promoter_window_length = getattr(args, "promoter_window_length", None)
+    if promoter_window_length is not None:
+        source_promoters = widen_promoter_windows(
+            source_promoters,
+            genome_fasta=genome_fasta,
+            target_length=int(promoter_window_length),
+        )
 
     var_gene_ids = set(adata.var["gene_id"].astype(str))
     promoter_gene_ids = set(source_promoters["gene_id"].astype(str))
@@ -686,7 +688,11 @@ def build_assets(args: argparse.Namespace) -> None:
         "included_gene_class_counts": final_split_genes["gene_class"].value_counts().to_dict(),
         "split_counts": final_split_genes["split"].value_counts().to_dict(),
         "control_match_counts": promoters["match_status"].value_counts().to_dict(),
-        "promoter_window_length": int(getattr(args, "promoter_window_length", 400)),
+        "promoter_window_length": (
+            int(promoter_window_length)
+            if promoter_window_length is not None
+            else int(source_promoters["length"].iloc[0])
+        ),
         "positive_shift_bp": int(getattr(args, "positive_shift_bp", 20)),
         "positive_status_counts": promoters["positive_status"].value_counts().to_dict(),
         "input_gene_panel_method": args.input_gene_panel_method,

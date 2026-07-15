@@ -68,3 +68,22 @@ def test_summarize_violin_data_selects_both_extremes() -> None:
     assert int(stats.iloc[0]["n_extreme_points"]) == 4
     assert set(extremes["sample_id"]) == {"g0", "g1", "g4", "g5"}
     assert set(extremes["extreme_side"]) == {"low", "high"}
+
+
+def test_summarize_violin_data_keeps_fifty_extreme_points_per_distribution() -> None:
+    frame = pd.DataFrame(
+        {
+            "level": ["per_cell"] * 60,
+            "model_group": ["promoter"] * 60,
+            "model_label": ["Real promoter"] * 60,
+            "seed": [7] * 60,
+            "sample_id": [f"c{i}" for i in range(60)],
+            "pearson_r": np.linspace(-0.5, 0.8, 60),
+        }
+    )
+
+    stats, extremes = summarize_violin_data(frame, extreme_count=25)
+
+    assert int(stats.iloc[0]["n_extreme_points"]) == 50
+    assert len(extremes) == 50
+    assert set(extremes["extreme_side"]) == {"low", "high"}

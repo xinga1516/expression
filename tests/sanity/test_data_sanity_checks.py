@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.data_sanity import summarize_integrated_data
-from scripts.project_test import (
+from scripts.data_sanity import (
     check_gene_id_alignment,
     check_h5ad,
     check_promoter_csv,
     check_target_values,
     load_h5ad,
+    summarize_integrated_data,
 )
 
 
 pytestmark = pytest.mark.sanity
 
 
-def test_project_test_core_checks_on_tiny_data(tiny_data_dir) -> None:
+def test_data_sanity_core_checks_on_tiny_data(tiny_data_dir) -> None:
     adata = load_h5ad(tiny_data_dir / "integrated_data.h5ad")
     h5ad_info = check_h5ad(adata)
     promoter_info = check_promoter_csv(tiny_data_dir / "promoter_train.csv")

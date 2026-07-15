@@ -1,5 +1,25 @@
 # Run Results Summary
 
+## Stage 2 contrastive sweep, 2026-07-11
+
+The remote Stage 2 grid completed 15 runs on the same `promoter_stage2_v1` gene/cell/input-panel split and the same frozen test panel: 2,048 cells x 2,707 held-out genes = 5,543,936 pairs per run. All runs used the combined loss configuration from the remote `configs/config.json`, `CNNFlattenPromoterModel`, gated fusion, EMA `0.9`, train-time 440-to-400 random crops, and matched `control_sequence` negatives with `negative_shift_max=20`.
+
+The original 12-run contrastive grid had weights `0.05/0.10/0.20/0.40`; a matched three-seed `cw=0` baseline was then added because no clean contrastive control was present in the first grid. Group means from the remote `outputs/stage2/stage2_summary.csv` are:
+
+| Contrastive weight | MSE mean | Pearson mean | Spearman mean | Interpretation |
+|---:|---:|---:|---:|---|
+| 0.00 | 5.050813 | 0.322006 | 0.319676 | matched no-contrastive baseline |
+| 0.05 | 5.091621 | 0.320933 | 0.316587 | no independent gain |
+| 0.10 | 5.052150 | 0.322646 | 0.318900 | essentially tied with baseline |
+| 0.20 | 4.980238 | 0.323774 | 0.316547 | lower MSE, no Spearman gain |
+| 0.40 | 5.104766 | 0.334921 | 0.326970 | best correlation, higher MSE |
+
+Relative to the matched `cw=0` baseline, `cw=0.40` improves mean Pearson by `+0.012915` and mean Spearman by `+0.007294`, while increasing mean MSE by `+0.053953`. This supports a correlation-specific Stage 2 improvement, but not a uniform improvement across all metrics. The contrastive negative crop invariant is confirmed in each run config/audit (`negative_crop_ready=True`).
+
+Every run also completed top-1000 mutation testing with a 10% per-gene ratio and absolute cap of 100. The motif gate failed: maximum `support_genes=1` across the original 15 runs, so no de novo motif is accepted as cross-gene evidence. For example, a motif can have 98 supporting pairs while all 98 come from one gene. A three-seed projection-head fallback (`projection_dim=64`, two layers, `cw=0.40`) was then trained and retested after fixing checkpoint reconstruction. Its means were MSE `5.054070`, Pearson `0.317593`, and Spearman `0.315024`, below the matched `cw=0` correlations; its gene-balanced motif support was at most `2`. The Stage 2 result therefore supports a correlation-specific improvement for the non-projection `cw=0.40` model, but does not support a claim that the encoder learned a motif shared by at least five promoters.
+
+As a sensitivity check, `scripts/summarize_gene_balanced_motifs.py` was run on all 15 mutation effect tables. It retained at most one important window per gene before aggregation. The maximum gene-balanced support was still only `2`, with zero motifs passing the `support_genes >= 5` gate. This rules out single-gene pair multiplicity as the only explanation for the failed motif evidence.
+
 ## Stage 1 fixed-LR promoter run, 2026-07-06
 
 The original `stage1_shift420_combined_fixedlr_seed7` used five linear warmup epochs followed by constant LR `5e-4`, combined loss with `pearson_lambda=5`, and `ema_alpha=0.9`. It stopped at epoch 38 and completed the frozen 2,048-cell x 2,707-gene test (5,543,936 pairs). These results are historical: the output directory was subsequently replaced by an EMA-matched `ema_alpha=0.9999` run at the user's request.

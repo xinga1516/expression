@@ -65,7 +65,19 @@ python scripts/plot_results.py --exp_name my_run --data highquality
 # Plot loss curves and scatter plot after training
 python scripts/train.py --exp_name my_run --data highquality --plot-loss
 
-# Data processing pipeline
+# Sequence assets: full Stage 1 bundle, reused splits, or 3'UTR assets
+python scripts/build_sequence_assets.py full
+python scripts/build_sequence_assets.py reuse
+python scripts/build_sequence_assets.py utr
+
+# Model comparison: Stage 1 bootstrap/interaction or Stage 2 summary/ablation
+python scripts/model_compare.py stage1-bootstrap
+python scripts/model_compare.py stage1-ablation
+python scripts/model_compare.py stage1-sequence-interaction
+python scripts/model_compare.py stage2-summary
+python scripts/model_compare.py stage2-ablation
+
+# Legacy data processing pipeline
 python scripts/process_data.py
 
 # Check data sanity (sparsity, distributions)

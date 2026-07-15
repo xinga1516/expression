@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Created on Fri Mar 13 12:48:57 2026
 
@@ -289,12 +289,12 @@ def pearson_mse_loss(pred, target, nonzero_weight=2.0, pearson_lambda=1.0, eps=1
 
 
 def unpack_training_batch(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Support legacy 3-field batches and contrastive 5-field batches."""
+    """Support legacy 3-field batches, indexed 5-field batches, and cached contrastive 7-field batches."""
     if len(batch) == 3:
         promoters, exprs, ys = batch
         return promoters, exprs, ys, None, None
-    if len(batch) == 5:
-        promoters, exprs, ys, pro_indices, cell_indices = batch
+    if len(batch) in {5, 7}:
+        promoters, exprs, ys, pro_indices, cell_indices = batch[:5]
         return promoters, exprs, ys, pro_indices, cell_indices
     raise ValueError(f"Unexpected batch with {len(batch)} fields.")
 
@@ -700,7 +700,7 @@ def train_model(
     }
     best_checkpoint_monitor = float("inf")
 
-    # Training loop — validate first (captures initial loss at epoch 0), then train
+    # Training loop 鈥?validate first (captures initial loss at epoch 0), then train
     for epoch in range(start_epoch, epochs):
         epoch_vae_trainable = apply_vae_fine_tune_schedule(
             model,
@@ -725,7 +725,7 @@ def train_model(
                 if hasattr(train_loader.sampler, "rebuild"):
                     train_loader.sampler.rebuild(train_ds)
 
-        # ── Validation (runs before training so epoch 0 captures initial loss) ──
+        # 鈹€鈹€ Validation (runs before training so epoch 0 captures initial loss) 鈹€鈹€
         avg_val_loss = float("nan")
         epoch_val_rmse = float("nan")
         epoch_val_pearson = float("nan")
@@ -856,11 +856,11 @@ def train_model(
 
         val_losses.append(avg_val_loss)
 
-        # Branch output variances — monitor whether each branch learns diverse representations
+        # Branch output variances 鈥?monitor whether each branch learns diverse representations
         epoch_lstm_var = lstm_var_sum / max(lstm_var_count, 1) if lstm_var_count > 0 else float("nan")
         epoch_expr_var = expr_var_sum / max(expr_var_count, 1) if expr_var_count > 0 else float("nan")
 
-        # ── Post-validation: EMA, logging, early-stopping, checkpoint ──
+        # 鈹€鈹€ Post-validation: EMA, logging, early-stopping, checkpoint 鈹€鈹€
         prev_train = train_losses[-1] if train_losses else float("nan")
         monitor_loss = avg_val_loss if not math.isnan(avg_val_loss) else prev_train
         val_loss_ema = compute_val_loss_ema(val_loss_ema, monitor_loss, ema_alpha)
@@ -971,7 +971,7 @@ def train_model(
             )
             break
 
-        # ── Training ──
+        # 鈹€鈹€ Training 鈹€鈹€
         model.train()
         train_loss_num = 0.0
         train_loss_den = 0.0
@@ -988,21 +988,27 @@ def train_model(
             promoters = promoters.to(device, non_blocking=True)
             exprs = exprs.to(device, non_blocking=True)
             ys = ys.to(device, non_blocking=True).float()
+            cached_positive_promoters = batch[5] if contrastive_enabled and len(batch) >= 7 else None
+            cached_negative_promoters = batch[6] if contrastive_enabled and len(batch) >= 7 else None
             positive_promoters = None
             negative_promoters = None
             if contrastive_enabled:
                 if pro_indices is None:
                     raise ValueError("Contrastive training batch is missing promoter indices.")
-                pro_indices_np = pro_indices.detach().cpu().numpy().astype(np.int64)
-                positive_promoters = train_loader.dataset.get_sequence_tensors(
-                    pro_indices_np,
-                    column=contrastive_positive_column,
-                ).to(device, non_blocking=True)
-                negative_promoters = train_loader.dataset.get_sequence_tensors(
-                    pro_indices_np,
-                    column=contrastive_negative_column,
-                    shift_max=contrastive_negative_shift_max,
-                ).to(device, non_blocking=True)
+                if cached_positive_promoters is not None and cached_negative_promoters is not None:
+                    positive_promoters = cached_positive_promoters.to(device, non_blocking=True)
+                    negative_promoters = cached_negative_promoters.to(device, non_blocking=True)
+                else:
+                    pro_indices_np = pro_indices.detach().cpu().numpy().astype(np.int64)
+                    positive_promoters = train_loader.dataset.get_sequence_tensors(
+                        pro_indices_np,
+                        column=contrastive_positive_column,
+                    ).to(device, non_blocking=True)
+                    negative_promoters = train_loader.dataset.get_sequence_tensors(
+                        pro_indices_np,
+                        column=contrastive_negative_column,
+                        shift_max=contrastive_negative_shift_max,
+                    ).to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             if loss_type == "zinb":
@@ -1231,10 +1237,8 @@ def main():
 
         vars(args).update(config_data)
 
-    # # 允许 cuDNN 自动寻找最适合当前配置的算法（提高速度）
-    # torch.backends.cudnn.benchmark = True 
-    # # 强制 cuDNN 使用确定性算法（确保复现，但可能会稍微降低速度）
-    # torch.backends.cudnn.deterministic = True
+    # # 鍏佽 cuDNN 鑷姩瀵绘壘鏈€閫傚悎褰撳墠閰嶇疆鐨勭畻娉曪紙鎻愰珮閫熷害锛?    # torch.backends.cudnn.benchmark = True 
+    # # 寮哄埗 cuDNN 浣跨敤纭畾鎬х畻娉曪紙纭繚澶嶇幇锛屼絾鍙兘浼氱◢寰檷浣庨€熷害锛?    # torch.backends.cudnn.deterministic = True
 
     print("start")
     base_dir = Path(__file__).resolve().parent.parent
@@ -1434,6 +1438,11 @@ def main():
             seed=args.seed,
             sampler_mode=args.gpu_sampler,
             drop_last=True,
+            contrastive_positive_column=args.contrastive_positive_column if args.contrastive_weight > 0 else None,
+            contrastive_negative_column=args.contrastive_negative_column if args.contrastive_weight > 0 else None,
+            contrastive_negative_shift_max=(
+                args.promoter_shift_max if args.contrastive_negative_shift_max < 0 else args.contrastive_negative_shift_max
+            ),
         )
         val_loader = GpuCachedPairLoader(
             val_dataset,
@@ -1483,14 +1492,20 @@ def main():
 
     if args.dryrun:
         utils.dryrun_cpu(model, train_loader, steps=50, learning_rate=1e-4, save_path=plots_dir / "dryrun.png")
-        # dryrun会改参数，重新初始化模型再正式训练
-        model = build_model(args.model, expr_dim=expr_dim, hidden_size=args.hidden_size,
-                            promoter_len=args.sequence_length,
-                            use_vae=args.vae_encoder is not None, vae_encoder_path=args.vae_encoder,
-                            vae_fine_tune=args.vae_fine_tune, output_mode=output_mode,
-                            fusion=args.fusion,
-                            contrastive_projection_dim=args.contrastive_projection_dim,
-                            contrastive_projection_layers=args.contrastive_projection_layers)
+        # Reinitialize model after dryrun because the dryrun updates parameters.
+        model = build_model(
+            args.model,
+            expr_dim=expr_dim,
+            hidden_size=args.hidden_size,
+            promoter_len=args.sequence_length,
+            use_vae=args.vae_encoder is not None,
+            vae_encoder_path=args.vae_encoder,
+            vae_fine_tune=args.vae_fine_tune,
+            output_mode=output_mode,
+            fusion=args.fusion,
+            contrastive_projection_dim=args.contrastive_projection_dim,
+            contrastive_projection_layers=args.contrastive_projection_layers,
+        )
 
     resume = args.resume
     if resume is None:
@@ -1610,4 +1625,9 @@ if __name__ == "__main__":
     main()
 
 # %%
+
+
+
+
+
 

@@ -1,0 +1,100 @@
+{
+  "version": "1",
+  "stages": [
+    {
+      "id": "stage1",
+      "title": "Stage 1 promoter controls and training ablations",
+      "run_root": "outputs/stage1",
+      "summary_tables": [
+        {
+          "id": "stage1_runs",
+          "title": "Stage 1 full-test runs",
+          "path": "outputs/stage1/summary/stage1_shift420_summary.csv",
+          "required_columns": ["group", "seed", "mse", "rmse", "pearson_r", "spearman_r", "checkpoint_metric"]
+        },
+        {
+          "id": "stage1_training",
+          "title": "Stage 1 seed-7 training-strategy ablation",
+          "path": "outputs/stage1/summary/stage1_training_ablation_seed7.csv",
+          "required_columns": ["strategy", "run_name", "test_mse", "test_pearson_r", "test_spearman_r"]
+        }
+      ],
+      "paired_statistics": [
+        {
+          "id": "stage1_by_seed",
+          "path": "outputs/stage1/summary/paired_bootstrap_by_seed.csv",
+          "required_columns": ["comparison", "level", "seed", "n_pairs", "mean_delta", "mean_ci_low", "mean_ci_high", "win_fraction"]
+        },
+        {
+          "id": "stage1_across_seeds",
+          "path": "outputs/stage1/summary/paired_bootstrap_across_seeds.csv",
+          "required_columns": ["comparison", "level", "seed_count", "mean_ci_low", "mean_ci_high"]
+        },
+        {
+          "id": "stage1_training_ablation",
+          "path": "outputs/stage1/summary/stage1_training_ablation_paired_bootstrap.csv",
+          "required_columns": ["comparison", "level", "n_pairs", "mean_delta", "mean_ci_low", "mean_ci_high", "win_fraction"]
+        }
+      ],
+      "figures": [
+        {"id": "stage1_bootstrap", "title": "Stage 1 paired bootstrap", "path": "outputs/stage1/summary/paired_bootstrap_summary.png"},
+        {"id": "stage1_gene_violin", "title": "Stage 1 per-gene Pearson", "path": "outputs/stage1/summary/stage1_per_gene_pearson_violin_compare.png"},
+        {"id": "stage1_cell_violin", "title": "Stage 1 per-cell Pearson", "path": "outputs/stage1/summary/stage1_per_cell_pearson_violin_compare.png"},
+        {"id": "stage1_training_ablation", "title": "Stage 1 training ablation", "path": "outputs/stage1/summary/stage1_training_ablation_seed7.png"}
+      ]
+    },
+    {
+      "id": "stage2",
+      "title": "Stage 2 contrastive promoter ablation",
+      "run_root": "outputs/stage2/stage2",
+      "summary_tables": [
+        {
+          "id": "stage2_runs",
+          "title": "Stage 2 full-test and motif-gate summary",
+          "path": "outputs/stage2/stage2/stage2_summary.csv",
+          "required_columns": ["run", "seed", "contrastive_weight", "mse", "rmse", "pearson_r", "spearman_r", "max_support_genes"]
+        },
+        {
+          "id": "stage2_gene_balanced_motifs",
+          "title": "Stage 2 gene-balanced motif sensitivity",
+          "path": "outputs/stage2/stage2/stage2_gene_balanced_motif_summary.csv",
+          "required_columns": ["run", "max_support_genes"]
+        }
+      ],
+      "paired_statistics": [
+        {
+          "id": "stage2_cw040_vs_cw000",
+          "path": "outputs/stage2/stage2/summary/stage2_cw040_vs_cw000_seed7_ablation/paired_bootstrap.csv",
+          "required_columns": ["comparison", "level", "n_pairs", "mean_delta", "mean_ci_low", "mean_ci_high", "win_fraction"]
+        }
+      ],
+      "figures": [
+        {"id": "stage2_ablation", "title": "Stage 2 contrastive ablation", "path": "outputs/stage2/stage2/summary/stage2_cw040_vs_cw000_seed7_ablation/ablation_summary.png"},
+        {"id": "stage2_gene_violin", "title": "Stage 2 per-gene Pearson", "path": "outputs/stage2/stage2/summary/stage2_cw040_vs_cw000_seed7_ablation/stage2_per_gene_pearson_violin_compare.png"},
+        {"id": "stage2_cell_violin", "title": "Stage 2 per-cell Pearson", "path": "outputs/stage2/stage2/summary/stage2_cw040_vs_cw000_seed7_ablation/stage2_per_cell_pearson_violin_compare.png"}
+      ]
+    }
+  ],
+  "refresh": [
+    {"workflow": "stage1-bootstrap", "args": ["--stage1-dir", "outputs/stage1"]},
+    {"workflow": "stage2-summary", "args": ["--outputs-root", "outputs/stage2/stage2"]},
+    {
+      "workflow": "stage2-gene-balanced-motifs",
+      "args": [
+        "--outputs-root", "outputs/stage2/stage2",
+        "--promoter-file", "data/promoter_stage2_v1/promoter_train.csv"
+      ]
+    },
+    {
+      "workflow": "stage2-ablation",
+      "args": [
+        "--outputs-root", "outputs/stage2/stage2",
+        "--baseline-run", "stage2_cw000_cw000_seed7",
+        "--treatment-run", "stage2_cw040_seed7",
+        "--comparison", "cw040_vs_cw000",
+        "--run-seed", "7",
+        "--violin-extreme-count", "25"
+      ]
+    }
+  ]
+}

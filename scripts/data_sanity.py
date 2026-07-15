@@ -1,566 +1,247 @@
-import json
-import pathlib
-from typing import Optional
+from __future__ import annotations
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from typing import Any
+import argparse
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import scanpy as sc
 from scipy import sparse
 
 
-project_root = pathlib.Path(__file__).resolve().parent.parent
-data_dir = project_root / "data" / "E-MTAB-10519-hqcells"#"log_processed"#"highquality"
-out_dir = data_dir#project_root / "outputs"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _summary_stats(arr: np.ndarray) -> dict[str, Optional[float]]:
-    if arr.size == 0:
-        return {
-            "mean": None,
-            "std": None,
-            "min": None,
-            "p01": None,
-            "p05": None,
-            "p50": None,
-            "p95": None,
-            "p99": None,
-            "max": None,
-        }
-
-    return {
-        "mean": float(np.mean(arr)),
-        "std": float(np.std(arr)),
-        "min": float(np.min(arr)),
-        "p01": float(np.percentile(arr, 1)),
-        "p05": float(np.percentile(arr, 5)),
-        "p50": float(np.percentile(arr, 50)),
-        "p95": float(np.percentile(arr, 95)),
-        "p99": float(np.percentile(arr, 99)),
-        "max": float(np.max(arr)),
-    }
+def _clean_gene_ids(values: pd.Series) -> pd.Series:
+    return pd.Series(values, dtype="string").str.strip()
 
 
-def summarize_integrated_data(h5ad_path: pathlib.Path) -> dict:
-    adata = sc.read_h5ad(h5ad_path)
+def load_h5ad(h5ad_file: Path) -> Any:
+    if not h5ad_file.exists():
+        raise FileNotFoundError(f"h5ad file not found: {h5ad_file}")
+    return sc.read_h5ad(h5ad_file)
+
+
+def summarize_integrated_data(h5ad_path: Path) -> dict[str, dict[str, float | int]]:
+    """Return sparse-safe matrix size and density statistics for a sanity report."""
+    adata = load_h5ad(h5ad_path)
     X = adata.X
-
     if sparse.issparse(X):
-        X_csr = X.tocsr()
+        nnz = int(X.nnz)
     else:
-        X_csr = sparse.csr_matrix(X)
-
-    n_cells, n_genes = X_csr.shape
-    total_entries = n_cells * n_genes
-    nnz = int(X_csr.nnz)
-    density = float(nnz / total_entries) if total_entries > 0 else 0.0
-    sparsity_ratio = 1.0 - density
-
-    # Non-zero values distribution
-    nz_values = np.asarray(X_csr.data)
-
-    # Per-cell distributions
-    cell_total_counts = np.asarray(X_csr.sum(axis=1)).ravel()
-    cell_nnz = np.diff(X_csr.indptr)
-
-    # Per-gene distributions
-    gene_total_counts = np.asarray(X_csr.sum(axis=0)).ravel()
-    X_csc = X_csr.tocsc()
-    gene_nnz = np.diff(X_csc.indptr)
-    gene_detection_rate = gene_nnz / max(n_cells, 1)
-
-    summary = {
+        nnz = int(np.count_nonzero(X))
+    total = int(adata.n_obs * adata.n_vars)
+    density = float(nnz / total) if total else 0.0
+    return {
         "matrix": {
-            "n_cells": int(n_cells),
-            "n_genes": int(n_genes),
+            "n_cells": int(adata.n_obs),
+            "n_genes": int(adata.n_vars),
             "nnz": nnz,
             "density": density,
-            "sparsity": sparsity_ratio,
-        },
-        "nonzero_values": _summary_stats(nz_values),
-        "cell_total_counts": _summary_stats(cell_total_counts),
-        "cell_nonzero_genes": _summary_stats(cell_nnz.astype(np.float64)),
-        "gene_total_counts": _summary_stats(gene_total_counts),
-        "gene_nonzero_cells": _summary_stats(gene_nnz.astype(np.float64)),
-        "gene_detection_rate": _summary_stats(gene_detection_rate.astype(np.float64)),
+        }
     }
-    return summary
 
 
-def plot_gene_variance_vs_median(
-    h5ad_path: pathlib.Path,
-    save_path: pathlib.Path | None = None,
-    n_label: int = 100,
-) -> None:
-    """Scatter plot: per-gene variance (x) vs median (y) across cells.
+def check_h5ad(adata: Any, gene_col: str = "gene_id") -> dict:
+    print(f"[h5ad] shape={adata.shape}")
 
-    Uses the processed dataset. Annotates the n_label genes with smallest
-    and largest variance with their gene_symbol.
-    """
-    adata = sc.read_h5ad(h5ad_path)
     X = adata.X
     if sparse.issparse(X):
-        X_csc = X.tocsc()
+        print(f"[h5ad] X sparse format={X.getformat()} nnz={X.nnz}")
     else:
-        X_csc = sparse.csc_matrix(X)
+        print(f"[h5ad] X dense dtype={getattr(X, 'dtype', 'unknown')}")
 
-    n_cells, n_genes = X_csc.shape
-    gene_names = adata.var["gene_symbol"].values
+    if gene_col not in adata.var.columns:
+        raise ValueError(f"[h5ad] missing adata.var['{gene_col}']")
 
-    variances = np.empty(n_genes, dtype=np.float64)
-    medians = np.empty(n_genes, dtype=np.float64)
-    #means = np.empty(n_genes, dtype=np.float64)
+    gene_ids = _clean_gene_ids(adata.var[gene_col])
+    missing = gene_ids.isna() | (gene_ids == "")
+    duplicated = gene_ids[~missing].duplicated(keep=False)
 
-    print(f"Computing per-gene variance & median for {n_genes} genes...")
-    for i in range(n_genes):
-        col = X_csc[:, i].toarray().ravel()
-        variances[i] = float(np.var(col))
-        medians[i] = float(np.mean(col))
-
-    # Sort by variance to find extremes
-    order = np.argsort(variances)
-    n_label = min(n_label, n_genes // 2)
-    low_idx = order[:1]   # lowest variance
-    high_idx = order[-n_label:]  # highest variance
-
-    # sort by median to find extremes
-    order_median = np.argsort(medians)
-    low_idx_median = order_median[:1]   # lowest median
-    high_idx_median = order_median[-n_label:]  # highest median
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.scatter(variances, medians, s=1, alpha=0.3, color="steelblue", rasterized=True)
-
-    # Highlight known Drosophila housekeeping genes (low variance, high median)
-    hk_genes = [
-        "Act5C",                                # actins
-        "RpL32", "RpL13A", "RpS18", "RpL11",    # ribosomal proteins
-        "Gapdh1", "Gapdh2",                      # GAPDH
-        "alphaTub84B", "betaTub56D",             # tubulins
-        "eEF1alpha1",                            # elongation factors
-        "14-3-3epsilon",                          # signaling
-        "8SrRNA",
-    ]
-    # 合并hk_genes和模糊匹配得到的基因列表（名字中包含 "18SrRNA" 的基因，比如 18SrRNA, 28SrRNA 等）
-    srrna = np.array(["18SrRNA" in str(g) for g in gene_names], dtype=bool)
-    print(f"Found {srrna.sum()} genes matching '18SrRNA' pattern for housekeeping annotation.")
-    hk_mask = np.isin(gene_names, hk_genes) | srrna
-    if hk_mask.any():
-        hk_idx = np.where(hk_mask)[0]
-        ax.scatter(variances[hk_idx], medians[hk_idx], s=60, color="red",
-                   edgecolors="darkred", linewidths=1.0, zorder=5,
-                   label=f"Housekeeping ({len(hk_idx)} genes)")
-        for idx in hk_idx:
-            ax.annotate(str(gene_names[idx]), (variances[idx], medians[idx]),
-                        fontsize=7, color="darkred", fontweight="bold", rotation=25,
-                        ha="left", va="bottom")
-    
-
-    # Annotate extremes
-    for idx in np.concatenate([low_idx, high_idx, low_idx_median, high_idx_median]):
-        ax.annotate(gene_names[idx], (variances[idx], medians[idx]),
-                    fontsize=5, alpha=0.8, rotation=25,
-                    ha="left", va="bottom",
-                    arrowprops=dict(arrowstyle="-", color="gray", alpha=0.4, linewidth=0.5))
-
-    # ax.set_xscale("log")
-    # ax.set_yscale("log")
-    ax.set_xlabel("Variance across cells")
-    ax.set_ylabel("Mean expression across cells")
-    ax.set_title(f"Gene variability ({n_genes} genes)\n"
-                 f"Annotated: {n_label} lowest + {n_label} highest variance genes")
-    plt.tight_layout()
-
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"Gene variance plot saved to: {save_path}")
-    plt.close()
-
-
-def plot_fca_gene_variance_vs_median(
-    csv_path: pathlib.Path,
-    save_path: pathlib.Path | None = None,
-    n_label: int = 100,
-) -> None:
-    """Plot per-gene variance vs median using Fly Cell Atlas logCPM data.
-
-    Reads the FCA_expression_logCPM.csv file. Each point is a gene, x-axis is
-    variance across 259 cell types, y-axis is median expression. Annotates
-    variance extremes and Drosophila housekeeping genes in red.
-    """
-    df = pd.read_csv(csv_path)
-    meta_cols = ["flybase_id", "entrez_id", "gene_symbol", "gene_name"]
-    expr_cols = [c for c in df.columns if c not in meta_cols]
-    expr_mat = df[expr_cols].values
-
-    n_genes, n_types = expr_mat.shape
-    gene_names = df["gene_symbol"].values
-
-    variances = expr_mat.var(axis=1)
-    medians = np.median(expr_mat, axis=1)
-
-    # Variance extremes
-    order = np.argsort(variances)
-    n_label = min(n_label, n_genes // 2)
-    low_idx = order[:n_label]
-    high_idx = order[-n_label:]
-
-    # Median extremes
-    order_median = np.argsort(medians)
-    low_idx_median = order_median[:1]
-    high_idx_median = order_median[-n_label:]
-
-    # Drosophila housekeeping genes
-    hk_genes = [
-        "Act5C", 
-        "RpL32", "RpL13A", "RpS18", "RpL11",
-        "Gapdh1", "Gapdh2",
-        "alphaTub84B", "betaTub56D",
-        "eEF1alpha1", 
-        "14-3-3epsilon",
-    ]
-    # 精确匹配 hk_genes，或模糊匹配含有 "8SrRNA" 字符串的基因
-    hk_mask = np.isin(gene_names, hk_genes) | np.array(["8SrRNA" in str(g) for g in gene_names], dtype=bool)
-
-    fig, ax = plt.subplots(figsize=(14, 9))
-    ax.scatter(variances, medians, s=1, alpha=0.25, color="steelblue", rasterized=True)
-
-    # HK genes in red
-    if hk_mask.any():
-        hk_idx = np.where(hk_mask)[0]
-        ax.scatter(variances[hk_idx], medians[hk_idx], s=60, color="red",
-                   edgecolors="darkred", linewidths=1.0, zorder=5,
-                   label=f"Housekeeping ({len(hk_idx)} genes)")
-        for idx in hk_idx:
-            ax.annotate(str(gene_names[idx]), (variances[idx], medians[idx]),
-                        fontsize=7, color="darkred", fontweight="bold", rotation=25,
-                        ha="left", va="bottom")
-
-    # Annotate variance extremes
-    for idx in np.concatenate([low_idx, high_idx, low_idx_median, high_idx_median]):
-        ax.annotate(str(gene_names[idx]), (variances[idx], medians[idx]),
-                    fontsize=4, alpha=0.7, rotation=25,
-                    ha="left", va="bottom",
-                    arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3, linewidth=0.3))
-
-    ax.set_xlabel("Variance across cell types (log2 CPM)")
-    ax.set_ylabel("Median expression across cell types (log2 CPM)")
-    ax.set_title(f"FCA Gene variability — {n_genes} genes x {n_types} cell types\n"
-                 f"Red: Drosophila housekeeping genes  |  "
-                 f"Annotated: {n_label} lowest + {n_label} highest variance")
-    ax.legend(fontsize=9, loc="upper left")
-    plt.tight_layout()
-
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"FCA gene variance plot saved to: {save_path}")
-    plt.close()
-
-
-def plot_loom_gene_variance_vs_median(
-    loom_path: pathlib.Path,
-    save_path: pathlib.Path | None = None,
-    n_label: int = 100,
-    normalize: bool = True,
-    chunk_size: int = 10000,
-) -> None:
-    """Scatter plot of per-gene variance vs mean from raw loom UMI counts.
-
-    Parameters
-    ----------
-    normalize : bool
-        If True (default), apply CPM normalization + log1p before computing
-        variance / mean, which stabilizes the mean-variance relationship and
-        reveals biological variability.  If False, use raw UMI counts.
-    chunk_size : int
-        Number of cells to read per chunk (memory/speed trade-off).
-    """
-    import h5py
-
-    f = h5py.File(str(loom_path), "r")
-    X = f["matrix"]           # shape (n_genes, n_cells)
-    gene_names = f["row_attrs"]["Gene"][:].astype(str)
-    n_genes, n_cells = X.shape
-    print(f"Loom matrix: {n_genes} genes × {n_cells} cells")
-
-    if normalize:
-        # ── Pass 1: per-cell library sizes ──
-        print("Pass 1: computing per-cell library sizes ...")
-        lib_sizes = np.zeros(n_cells, dtype=np.float64)
-        for start in range(0, n_cells, chunk_size):
-            end = min(start + chunk_size, n_cells)
-            block = X[:, start:end].astype(np.float64)
-            lib_sizes[start:end] = block.sum(axis=0)
-            if (start // chunk_size) % 20 == 0:
-                print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
-        # Replace zeros with 1 to avoid division by zero
-        lib_sizes = np.maximum(lib_sizes, 1.0)
-
-        # ── Pass 2: CPM + log1p then accumulate per-gene stats ──
-        print("Pass 2: CPM + log1p, accumulating per-gene sum / sum² ...")
-        sum_x = np.zeros(n_genes, dtype=np.float64)
-        sum_x2 = np.zeros(n_genes, dtype=np.float64)
-        for start in range(0, n_cells, chunk_size):
-            end = min(start + chunk_size, n_cells)
-            block = X[:, start:end].astype(np.float64)          # (genes, chunk)
-            block = block / lib_sizes[np.newaxis, start:end] * 1e6  # CPM
-            block = np.log1p(block)                              # log1p
-            sum_x += block.sum(axis=1)
-            sum_x2 += (block * block).sum(axis=1)
-            if (start // chunk_size) % 20 == 0:
-                print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
-
-        norm_label = "log1p(CPM)"
-    else:
-        # ── Single pass: accumulate raw UMI stats ──
-        print(f"Scanning cells in chunks of {chunk_size} (raw UMI counts) ...")
-        sum_x = np.zeros(n_genes, dtype=np.float64)
-        sum_x2 = np.zeros(n_genes, dtype=np.float64)
-        for start in range(0, n_cells, chunk_size):
-            end = min(start + chunk_size, n_cells)
-            block = X[:, start:end].astype(np.float64)
-            sum_x += block.sum(axis=1)
-            sum_x2 += (block * block).sum(axis=1)
-            if (start // chunk_size) % 20 == 0:
-                print(f"  processed {end}/{n_cells} cells ({100*end/n_cells:.0f}%)")
-
-        norm_label = "raw UMI counts"
-
-    f.close()
-
-    means = sum_x / n_cells
-    variances = (sum_x2 / n_cells) - (means * means)
-    variances = np.maximum(variances, 0.0)  # clip numeric noise
-
-    gene_names_arr = np.asarray([str(g) for g in gene_names])
-
-    # --- plot ---
-    n_label = min(n_label, n_genes // 2)
-    order = np.argsort(variances)
-    low_idx = order[:1]
-    high_idx = order[-n_label:]
-    order_median = np.argsort(means)
-    low_idx_median = order_median[:1]
-    high_idx_median = order_median[-n_label:]
-
-    fig, ax = plt.subplots(figsize=(14, 9))
-    ax.scatter(variances, means, s=1, alpha=0.25, color="steelblue", rasterized=True)
-
-    # Housekeeping genes
-    hk_genes = [
-        "Act5C",
-        "RpL32", "RpL13A", "RpS18", "RpL11",
-        "Gapdh1", "Gapdh2",
-        "alphaTub84B", "betaTub56D",
-        "eEF1alpha1",
-        "14-3-3epsilon",
-    ]
-    hk_mask = np.isin(gene_names_arr, hk_genes) | np.array(
-        ["18SrRNA" in g for g in gene_names_arr], dtype=bool
+    print(
+        "[h5ad] gene_id "
+        f"total={len(gene_ids)} unique={gene_ids[~missing].nunique()} "
+        f"missing={int(missing.sum())} duplicated_rows={int(duplicated.sum())}"
     )
-    if hk_mask.any():
-        hk_idx = np.where(hk_mask)[0]
-        ax.scatter(variances[hk_idx], means[hk_idx], s=70, color="red",
-                   edgecolors="darkred", linewidths=1.2, zorder=5,
-                   label=f"Housekeeping ({len(hk_idx)} genes)")
-        for idx in hk_idx:
-            ax.annotate(str(gene_names_arr[idx]), (variances[idx], means[idx]),
-                        fontsize=7, color="darkred", fontweight="bold", rotation=25,
-                        ha="left", va="bottom")
 
-    # Annotate variance extremes
-    for idx in np.concatenate([low_idx, high_idx, low_idx_median, high_idx_median]):
-        ax.annotate(str(gene_names_arr[idx]), (variances[idx], means[idx]),
-                    fontsize=4.5, alpha=0.7, rotation=25,
-                    ha="left", va="bottom",
-                    arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3, linewidth=0.3))
+    if duplicated.any():
+        examples = gene_ids[duplicated].drop_duplicates().head(10).tolist()
+        print(f"[h5ad][WARN] duplicated gene_id examples: {examples}")
 
-    # ax.set_xscale("log")
-    # ax.set_yscale("log")
-    ax.set_xlabel(f"Variance across cells ({norm_label})")
-    ax.set_ylabel(f"Mean expression across cells ({norm_label})")
-    ax.set_title(f"Loom gene variability ({norm_label}) — {n_genes} genes × {n_cells} cells\n"
-                 f"Red: Drosophila housekeeping genes  |  "
-                 f"Annotated: {n_label} lowest + {n_label} highest variance genes")
-    ax.legend(fontsize=9, loc="upper left")
-    plt.tight_layout()
-
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"Loom gene variance vs mean plot saved to: {save_path}")
-    plt.close()
+    return {
+        "gene_ids": gene_ids,
+        "missing_count": int(missing.sum()),
+        "duplicated_count": int(duplicated.sum()),
+    }
 
 
-def plot_emtab_gene_variance_vs_median(
-    mtx_dir: pathlib.Path,
-    save_path: pathlib.Path | None = None,
-    n_label: int = 50,
-) -> None:
-    """Per-gene variance vs median for E-MTAB-10519 sparse MTX data.
+def check_promoter_csv(promoter_file: Path, gene_col: str = "gene_id") -> dict:
+    if not promoter_file.exists():
+        raise FileNotFoundError(f"promoter CSV not found: {promoter_file}")
 
-    Reads the aggregated filtered normalised counts (CPM) from Matrix Market
-    format, log2(CPM+1) transforms, then computes per-gene variance and median
-    across 527k cells.  All operations are sparse-safe.
-    """
-    from scipy.io import mmread
-    from scipy import sparse
+    df = pd.read_csv(promoter_file)
+    print(f"[csv] {promoter_file.name} rows={len(df)} cols={list(df.columns)}")
 
-    mtx_path = mtx_dir / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx"
-    rows_path = mtx_dir / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx_rows"
+    if gene_col not in df.columns:
+        raise ValueError(f"[csv] {promoter_file} missing column '{gene_col}'")
 
-    print("Reading MTX ...")
-    X = mmread(str(mtx_path))
-    n_genes, n_cells = X.shape
-    print(f"  {n_genes} genes x {n_cells} cells  |  {X.nnz:,} non-zeros  |  "
-          f"{X.nnz/(n_genes*n_cells)*100:.1f}% dense")
+    gene_ids = _clean_gene_ids(df[gene_col])
+    missing = gene_ids.isna() | (gene_ids == "")
+    duplicated_rows = gene_ids[~missing].duplicated(keep=False)
 
-    # # ── log2(CPM + 1) transform ──
-    # print("log2(CPM + 1) transform ...")
-    # X.data = np.log2(X.data + 1.0)
+    print(
+        f"[csv] {promoter_file.name} gene_id "
+        f"unique={gene_ids[~missing].nunique()} missing={int(missing.sum())} "
+        f"duplicated_rows={int(duplicated_rows.sum())}"
+    )
 
-    # ── Per-gene mean & variance (sparse CSR, one pass) ──
-    print("Computing per-gene stats ...")
-    X_csr = X.tocsr()
-    ones_cells = np.ones(n_cells, dtype=np.float64)
+    required_cols = {"gene_id", "sequence"}
+    missing_cols = sorted(required_cols - set(df.columns))
+    if missing_cols:
+        print(f"[csv][WARN] {promoter_file.name} missing expected columns: {missing_cols}")
 
-    row_sums = X_csr.dot(ones_cells)                           # sum of log2(cpm+1)
-    row_sq_sums = X_csr.power(2).dot(ones_cells)               # sum of squares
-    means = row_sums / n_cells
-    variances = (row_sq_sums / n_cells) - (means * means)
-    variances = np.maximum(variances, 0.0)
+    if "sequence" in df.columns:
+        seq_len = df["sequence"].astype("string").str.len()
+        print(
+            f"[csv] {promoter_file.name} sequence length "
+            f"min={int(seq_len.min())} max={int(seq_len.max())} "
+            f"bad_length_rows={int((seq_len != 400).sum())}"
+        )
 
-    # ── Per-gene median ──
-    # For genes detected in <50% cells, median = 0 (the log2(0+1) = 0).
-    # For the few highly detected genes, compute actual median of non-zeros.
-    gene_nz = np.diff(X_csr.indptr)
-    medians = np.zeros(n_genes, dtype=np.float64)
-    dense_mask = gene_nz > (n_cells // 2)
-    n_dense = int(dense_mask.sum())
-    print(f"  {n_dense} genes detected in >50% cells — computing exact median ...")
-    for i in np.where(dense_mask)[0]:
-        nz_vals = X_csr.data[X_csr.indptr[i]:X_csr.indptr[i + 1]]
-        n_zeros = n_cells - len(nz_vals)
-        medians[i] = float(np.median(np.concatenate([np.zeros(n_zeros, dtype=nz_vals.dtype), nz_vals])))
+    return {
+        "df": df,
+        "gene_ids": gene_ids,
+        "missing_count": int(missing.sum()),
+        "duplicated_rows": int(duplicated_rows.sum()),
+    }
 
-    # ── Gene IDs → symbols ──
-    with open(rows_path) as f:
-        fb_ids = [line.strip().split('\t')[0] for line in f]
-    # Try to map FlyBase → symbol via FCA CSV, fall back to FBgn ID
-    fca_csv = mtx_dir.parent / "FCA_expression_logCPM.csv"
-    id2sym: dict[str, str] = {}
-    if fca_csv.exists():
-        fca = pd.read_csv(fca_csv, usecols=["flybase_id", "gene_symbol"])
-        id2sym = dict(zip(fca["flybase_id"], fca["gene_symbol"]))
-    gene_names = np.array([id2sym.get(fb, fb) for fb in fb_ids])
 
-    # ── Plot ──
-    n_label = min(n_label, n_genes // 2)
-    order = np.argsort(variances)
-    low_idx = order[:n_label]
-    high_idx = order[-n_label:]
+def check_gene_id_alignment(h5ad_gene_ids: pd.Series, promoter_gene_ids: pd.Series, label: str) -> dict:
+    h5ad_valid = h5ad_gene_ids.dropna()
+    h5ad_valid = h5ad_valid[h5ad_valid != ""]
+    promoter_valid = promoter_gene_ids.dropna()
+    promoter_valid = promoter_valid[promoter_valid != ""]
 
-    hk_genes = [
-        "Act5C", "Act42A",
-        "RpL32", "RpL13A", "RpS18", "RpL11",
-        "Gapdh1", "Gapdh2",
-        "alphaTub84B", "betaTub56D",
-        "eEF1alpha1", "eEF1alpha2",
-        "14-3-3epsilon",
+    h5ad_set = set(h5ad_valid.tolist())
+    promoter_set = set(promoter_valid.tolist())
+    missing_from_h5ad = sorted(promoter_set - h5ad_set)
+    unused_in_promoter = sorted(h5ad_set - promoter_set)
+
+    h5ad_counts = h5ad_valid.value_counts()
+    ambiguous = sorted(g for g in promoter_set if h5ad_counts.get(g, 0) > 1)
+
+    print(
+        f"[align] {label} promoter_unique={len(promoter_set)} "
+        f"in_h5ad={len(promoter_set) - len(missing_from_h5ad)} "
+        f"missing_from_h5ad={len(missing_from_h5ad)} "
+        f"ambiguous_in_h5ad={len(ambiguous)}"
+    )
+
+    if missing_from_h5ad:
+        print(f"[align][FAIL] {label} missing examples: {missing_from_h5ad[:10]}")
+    if ambiguous:
+        print(f"[align][FAIL] {label} ambiguous examples: {ambiguous[:10]}")
+    if unused_in_promoter:
+        print(f"[align] {label} h5ad genes not used by promoter CSV: {len(unused_in_promoter)}")
+
+    return {
+        "missing_from_h5ad": missing_from_h5ad,
+        "ambiguous_in_h5ad": ambiguous,
+        "unused_in_promoter_count": len(unused_in_promoter),
+    }
+
+
+def check_target_values(adata: Any, promoter_gene_ids: pd.Series, n_cells: int = 200, seed: int = 42) -> None:
+    valid_promoter_gene_ids = promoter_gene_ids.dropna()
+    valid_promoter_gene_ids = valid_promoter_gene_ids[valid_promoter_gene_ids != ""].drop_duplicates()
+    gene_to_idx = {gene_id: i for i, gene_id in enumerate(_clean_gene_ids(adata.var["gene_id"]))}
+    gene_indices = [gene_to_idx[g] for g in valid_promoter_gene_ids if g in gene_to_idx]
+
+    if not gene_indices:
+        print("[target][SKIP] no promoter genes found in h5ad")
+        return
+
+    rng = np.random.default_rng(seed)
+    cell_count = min(n_cells, adata.n_obs)
+    cell_indices = rng.choice(adata.n_obs, size=cell_count, replace=False)
+    X_subset = adata.X[cell_indices][:, gene_indices]
+
+    if sparse.issparse(X_subset):
+        nnz = X_subset.nnz
+        total = X_subset.shape[0] * X_subset.shape[1]
+        data = X_subset.data
+    else:
+        nnz = int(np.count_nonzero(X_subset))
+        total = X_subset.size
+        data = np.asarray(X_subset)[np.asarray(X_subset) != 0]
+
+    frac_nonzero = nnz / max(total, 1)
+    if len(data) > 0:
+        print(
+            f"[target] sampled cells={cell_count} genes={len(gene_indices)} "
+            f"nonzero_frac={frac_nonzero:.6f} min_nz={data.min():.6f} max={data.max():.6f}"
+        )
+    else:
+        print(
+            f"[target][WARN] sampled cells={cell_count} genes={len(gene_indices)} "
+            "all sampled targets are zero"
+        )
+
+
+def resolve_promoter_files(data_dir: Path, promoter_files: list[str] | None) -> list[Path]:
+    if promoter_files:
+        return [Path(p) if Path(p).is_absolute() else data_dir / p for p in promoter_files]
+    return [
+        data_dir / "promoter_train.csv",
+        data_dir / "promoter_val.csv",
+        data_dir / "promoter_test.csv",
     ]
-    hk_mask = np.isin(gene_names, hk_genes)
-
-    fig, ax = plt.subplots(figsize=(14, 9))
-    ax.scatter(variances, medians, s=0.5, alpha=0.2, color="steelblue", rasterized=True)
-
-    if hk_mask.any():
-        hk_idx = np.where(hk_mask)[0]
-        ax.scatter(variances[hk_idx], medians[hk_idx], s=60, color="red",
-                   edgecolors="darkred", linewidths=1.0, zorder=5,
-                   label=f"Housekeeping ({len(hk_idx)} genes)")
-        for idx in hk_idx:
-            ax.annotate(str(gene_names[idx]), (variances[idx], medians[idx]),
-                        fontsize=7, color="darkred", fontweight="bold", rotation=25,
-                        ha="left", va="bottom")
-
-    for idx in np.concatenate([low_idx, high_idx]):
-        ax.annotate(str(gene_names[idx]), (variances[idx], medians[idx]),
-                    fontsize=4, alpha=0.7, rotation=25,
-                    ha="left", va="bottom",
-                    arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3, linewidth=0.3))
-
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Variance across cells (log2 CPM+1)")
-    ax.set_ylabel("Median expression across cells (log2 CPM+1)")
-    ax.set_title(f"E-MTAB-10519 — gene variability ({n_genes} genes × {n_cells:,} cells)\n"
-                 f"Red: Drosophila housekeeping genes  |  "
-                 f"Annotated: {n_label} lowest + {n_label} highest variance")
-    ax.legend(fontsize=9, loc="upper left")
-    plt.tight_layout()
-
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"E-MTAB-10519 gene variance plot saved to: {save_path}")
-    plt.close()
 
 
 def main() -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Basic sanity checks for h5ad and promoter CSV files.")
+    parser.add_argument("--data", default="processed", help="Data folder under data/, e.g. processed or highquality")
+    parser.add_argument("--h5ad", default=None, help="Path to integrated_data.h5ad")
+    parser.add_argument("--promoter", nargs="*", default=None, help="Promoter CSV filenames or paths")
+    parser.add_argument("--gene-col", default="gene_id", help="Gene id column name")
+    parser.add_argument("--sample-cells", type=int, default=200, help="Cells sampled for target non-zero check")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-    # # Gene variance vs mean plot from raw loom (normalized: log1p CPM)
-    # loom_path = project_root / "data" / "raw" / "s_fca_biohub_all_wo_blood_10x.loom"
-    # if loom_path.exists():
-    #     plot_loom_gene_variance_vs_median(
-    #         loom_path,
-    #         save_path=out_dir / "loom_gene_variance_vs_mean_log1p_cpm.png",
-    #         normalize=True,
-    #     )
-    #     plot_loom_gene_variance_vs_median(
-    #         loom_path,
-    #         save_path=out_dir / "loom_gene_variance_vs_mean_raw_umi.png",
-    #         normalize=False,
-    #     )
+    data_dir = PROJECT_ROOT / "data" / args.data
+    h5ad_file = Path(args.h5ad) if args.h5ad else data_dir / "integrated_data.h5ad"
+    promoter_files = resolve_promoter_files(data_dir, args.promoter)
 
-    h5ad_path = data_dir / "integrated_data.h5ad"
-    summary = summarize_integrated_data(h5ad_path)
-    print("=== 训练前数据分布摘要（integrated_data.h5ad）===")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    out_path = out_dir / "data_sanity_summary.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    print(f"\n摘要已保存到: {out_path}")
+    print(f"[path] data_dir={data_dir}")
+    print(f"[path] h5ad={h5ad_file}")
 
-    # # Gene variance vs median plot (scRNA-seq h5ad)
-    # data_h5ad = data_dir / "integrated_data.h5ad"
-    # if data_h5ad.exists():
-    #     plot_gene_variance_vs_median(
-    #         data_h5ad,
-    #         save_path=out_dir / "gene_variance_vs_mean.png",
-    #     )
+    adata = load_h5ad(h5ad_file)
+    h5ad_info = check_h5ad(adata, gene_col=args.gene_col)
 
+    has_failure = h5ad_info["missing_count"] > 0 or h5ad_info["duplicated_count"] > 0
+    all_promoter_gene_ids = []
 
-    # # FCA gene variance vs median plot (logCPM CSV from Fly Cell Atlas)
-    # fca_csv = project_root / "data" / "FCA_expression_logCPM.csv"
-    # if fca_csv.exists():
-    #     plot_fca_gene_variance_vs_median(
-    #         fca_csv,
-    #         save_path=project_root / "data" / "FCA_gene_variance_vs_median.png",
-    #     )
+    for promoter_file in promoter_files:
+        promoter_info = check_promoter_csv(promoter_file, gene_col=args.gene_col)
+        alignment = check_gene_id_alignment(
+            h5ad_info["gene_ids"],
+            promoter_info["gene_ids"],
+            label=promoter_file.name,
+        )
+        all_promoter_gene_ids.append(promoter_info["gene_ids"])
+        has_failure = has_failure or promoter_info["missing_count"] > 0
+        has_failure = has_failure or bool(alignment["missing_from_h5ad"])
+        has_failure = has_failure or bool(alignment["ambiguous_in_h5ad"])
 
-    # # E-MTAB-10519 gene variance vs median (sparse MTX, 527k cells)
-    # emtab_dir = project_root / "data" / "E-MTAB-10519-normalised-files"
-    # emtab_mtx = emtab_dir / "E-MTAB-10519.aggregated_filtered_normalised_counts.mtx"
-    # if emtab_mtx.exists():
-    #     plot_emtab_gene_variance_vs_median(
-    #         emtab_dir,
-    #         save_path=out_dir / "emtab_gene_variance_vs_median.png",
-    #     )
+    if all_promoter_gene_ids:
+        merged_gene_ids = pd.concat(all_promoter_gene_ids, ignore_index=True).drop_duplicates()
+        check_target_values(adata, merged_gene_ids, n_cells=args.sample_cells, seed=args.seed)
+
+    if has_failure:
+        raise SystemExit("[FAIL] data sanity checks found alignment problems")
+
+    print("[OK] data sanity checks passed")
 
 
 if __name__ == "__main__":

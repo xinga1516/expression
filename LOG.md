@@ -1,4 +1,26 @@
-# LOG
+﻿# LOG
+
+## 2026-07-12
+- Compared the two-layer reporting change with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it is reporting-only and preserves the guide's validation/test, matched-baseline, and frozen-panel requirements.
+- Added `configs/model_compare_report.json`, `scripts/model_compare_report.py`, and manifest-driven `model_compare.py report` / `report --refresh`. Existing stage-specific comparison commands remain intact.
+- Validated the current Stage 1/2 manifest collection locally: 29 completed runs, 11 strict seed-only configuration groups, 24 registered paired-statistic rows, and two stage payloads.
+- Rendered and reopened a local report check workbook: 9 expected sheets and 7 embedded Stage 1/2 PNG drawings were verified. The bundled local Python lacks pytest, so the focused pytest suite remains to be run in the project `promodel` environment.
+
+## 2026-07-11
+- Compared the reporting request with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`: the change is audit/reporting-only and preserves the guide's validation-on-unseen-genes, frozen test-panel, matched-baseline, and fair-comparison requirements.
+- Added the local `model_compare_workbook.mjs` artifact-tool exporter plus the `model_compare.py workbook` dispatcher and documentation. It reads local run `config.json`, training logs, checkpoint directories, and test metric files; no remote server connection, synchronization, training, or output regeneration was performed.
+- Added the workbook-dispatch unit test. Per the request, stopped before creating the xlsx; a prior incomplete local export was terminated and produced no output file.
+
+## 2026-07-10
+- Checked the active remote Stage 2 sweep. The first four jobs were still in epoch 0 with low GPU utilization, consistent with CPU-side dynamic sequence encoding in contrastive training.
+- Implemented local GPU-cache contrastive sequence support in `src/gpu_cache.py`, updated `scripts/train.py` to consume cached positive/control tensors when present, and added `tests/unit/test_gpu_cache.py`.
+- Local syntax-only compile passed for `src/gpu_cache.py`, `scripts/train.py`, and `tests/unit/test_gpu_cache.py` using in-memory `compile(...)` because Windows pycache writing was denied.
+- Remote sync was interrupted by usage limits after an earlier copy of `scripts/train.py`; before any new remote launch, re-sync the repaired local `scripts/train.py`, `src/gpu_cache.py`, Stage 2 launchers, and `tests/unit/test_gpu_cache.py`, then run remote py_compile and pytest.
+
+## 2026-07-10
+- Compared the reused Stage2 asset plan with `DROSOPHILA_CELL_TYPE_PROMOTER_3UTR_MODEL_GUIDE.md`; it is consistent with the guide's requirement to keep model comparisons on the same gene split, feature panel, and frozen eval-cell panel.
+- Added the reusable promoter sequence-window derivation script and a focused unit test.
+- Updated `scripts/build_utr_stage_assets.py` so matched downstream/intergenic controls try at most 200 random positions by default.
 
 ## 2026-07-08
 - Installed micromamba 2.8.1 at `/PROJ5/liangn_zxy/envs/bin/micromamba` and created the remote project environment at `/PROJ5/liangn_zxy/envs/promodel`; package caches and temporary files remain under the approved `/PROJ5/liangn_zxy/` paths.
@@ -85,7 +107,37 @@
 
 Codex operation log for meaningful repository work.
 
+## 2026-07-10
+
+- Added a default `stage2_cfgcache` run prefix because four earlier `stage2_cw*` directories already exist remotely; the new queue remains under `outputs/stage2/` while retaining those historical partial runs.
+- Extended the Stage 2 launcher with a post-training `model_test.py --run-mutagenesis` step and a separate mutation log; configured the top-1000 gene-capped mutation protocol so motif support can be evaluated at the required `support_genes >= 5` gate.
+- Prepared a four-GPU backfill queue for all twelve legacy Stage 2 checkpoints; it waits for active training and uses GPUs 4-7 so the active training batch on GPUs 0-3 is not interrupted.
+- Reworked `select_top_expressed_pairs()` to group promoter rows by gene and retain each gene's top capped candidates with NumPy partitioning; existing gene-cap regression tests remain the validation target.
+- Identified that the completed 12-run sweep lacked a same-config `cw=0` baseline; prepared a three-seed `stage2_cw000` run using the launcher weight override before attributing gains to contrastive loss.
+- Completed the matched `cw=0` baseline and regenerated remote `runs/expression/stage2/stage2_summary.csv` for 15 runs. Confirmed all standard/mutation outputs exist, maximum `support_genes=1`, and decided not to launch projection fallback solely for prediction because `cw=0.40` improves Pearson/Spearman; motif-specific follow-up remains open.
+- Added and prepared a gene-balanced motif diagnostic to distinguish genuine cross-gene support from single-gene pair multiplicity; it writes `gene_balanced_motif_windows.csv`, `gene_balanced_de_novo_motifs.csv`, and a Stage 2 summary table.
+- Ran the diagnostic remotely: 15 runs processed, maximum gene-balanced `support_genes=2`, zero motifs passed the threshold 5. This confirms the Stage 2 motif limitation is not explained solely by the 100-pair single-gene cap.
+- Prepared the projection-head fallback at `contrastive_weight=0.40`, projection dimension 64, two layers, three seeds, with automatic standard test and mutation outputs.
+
+## 2026-07-10
+
+- Read `/PROJ5/liangn_zxy/work/expression/configs/config.json` through the approved `sulab7g-zxy` SSH alias and compared it with `hpc/stage2_sweep.sh` and the Stage 2 guide defaults.
+- Updated the local Stage 2 sweep launcher to use the remote config's combined-loss, fusion, expression-layer, training-budget, EMA, validation, checkpoint, and test parameters explicitly; retained only Stage 2 contrastive sequence settings as sweep-specific values.
+- The guide's EMA `0.9999` starting prior is intentionally overridden by the active remote configuration's `0.9`, as requested; no training job was launched or stopped by this change.
+- Synced `src/gpu_cache.py`, `scripts/train.py`, and `tests/unit/test_gpu_cache.py` to `/PROJ5/liangn_zxy/work/expression`; remote `py_compile` passed and `tests/unit/test_gpu_cache.py` passed (`1 passed`).
+- Started the four-GPU Stage 2 contrastive sweep in detached tmux session `promoter_stage2` with weights `0.05/0.10/0.20/0.40` and seeds `1/7/42`. The first four runs (`cw005` seeds 1/7/42 and `cw010` seed1) use GPUs 0--3. Earlier incomplete run directories are overwritten with explicit user approval.
+- Added a deterministic unit assertion for random intergenic-negative crop positions so the Stage 2 requirement is covered directly rather than inferred from cached tensor shapes.
+- Audited the deferred projection-head fallback launcher and aligned its loss, expression layers, training budget, EMA, validation, checkpoint, and test parameters with the active Stage 2 configuration before any projection run is considered.
+
 ## 2026-07-06
+
+- 2026-07-11: Added the Stage 1-comparable Stage 2 mutation parameter contract to all launchers and created a seed-7 retest launcher. Ran the reusable Stage 1-style Stage 2 seed-7 contrastive ablation for cw=0.40 vs cw=0: global Pearson increased 0.326239 to 0.333287, per-cell paired Pearson increased 0.006881 (95% CI [0.006352, 0.007408]), while per-gene delta was -0.002591 (95% CI [-0.006683, 0.001327]).
+- 2026-07-11: Added and generated Stage 2 seed-7 per-cell/per-gene Pearson violin plots for cw=0 vs cw=0.40, with 9,510 distribution rows and 200 displayed extreme points.
+- 2026-07-11: Fixed standalone Stage 2 violin output directory creation and ran the focused ablation test module in remote promodel: 3 passed.
+
+- 2026-07-11: Confirmed the new remote Stage 2 projection sweep started on GPUs 0/1/2. Training completed and checkpoints were written, but the automatic post-training test failed because `model_test.py` omitted the projection head when rebuilding the model. Patched the loader and added a focused unit test; the completed checkpoints can now be evaluated without retraining.
+- 2026-07-11: Added the projection checkpoint retest launcher to regenerate standard test, mutation position, and motif outputs without retraining.
+- 2026-07-11: Fixed projection checkpoint loading, reran all three completed projection checkpoints, and regenerated standard/mutation outputs. The projection mean was MSE 5.054070, Pearson 0.317593, Spearman 0.315024; gene-balanced motif support max was 2, so the biological motif gate still failed.
 
 - Compared stage1_shift420_promoter_seed7, stage1_shift420_combined_seed7, and stage1_shift420_combined_fixedlr_seed7 on the same frozen 5,543,936 test pairs.
 - Generated outputs/stage1/summary/stage1_training_ablation_seed7.csv, paired deltas/bootstrap CSVs, PNG/SVG summary, and a Chinese README using 10,000 bootstrap repeats.
@@ -120,3 +172,9 @@ Codex operation log for meaningful repository work.
 - Added project memory and change-record rules to `AGENTS.md`.
 - Created initial `TODO.md`, `CHANGELOG.md`, `LOG.md`, and `project_overview.md`.
 - No tests were run; documentation-only change.
+
+
+- 2026-07-11: Organized script entry points into `build_sequence_assets.py` and `model_compare.py`; added dispatcher unit tests and `scripts/README.md` documenting the public workflows. This does not alter asset construction, split reuse, or comparison calculations.
+- 2026-07-11: Fixed asset dispatcher support for legacy `build_assets(parse_args())` backends and preserved unspecified promoter window length behavior. Remote syntax/help checks passed; focused asset/comparison/ablation suite: 20 passed.
+- 2026-07-11: Added and tested the standalone Stage 1 ablation model-comparison subcommand. Final focused asset/comparison/ablation suite: 21 passed.
+- 2026-07-11: Local-only cleanup: removed obsolete temporary/one-off scripts and normalized `project_test.py` to `data_sanity.py`; updated smoke and sanity test imports and renamed the corresponding sanity test file. No remote synchronization was performed after the user's Git-only instruction.

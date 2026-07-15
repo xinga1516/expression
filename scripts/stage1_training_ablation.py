@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -185,3 +186,227 @@ def write_training_ablation_outputs(
     plot_summary(global_data, summary, output_dir)
     write_ablation_readme(global_data, summary, output_dir)
     return {"ablation_global_rows": len(global_data), "ablation_paired_rows": len(paired)}
+
+
+def load_two_run_paired_deltas(
+    runs_root: Path,
+    baseline_run: str,
+    treatment_run: str,
+    comparison: str,
+) -> pd.DataFrame:
+    """Build per-cell and per-gene Pearson deltas for one matched run pair."""
+    frames: list[pd.DataFrame] = []
+    for level, (id_column, filename) in LEVELS.items():
+        baseline = pd.read_csv(
+            runs_root / baseline_run / "test" / filename,
+            usecols=[id_column, "pearson_r"],
+        )
+        treatment = pd.read_csv(
+            runs_root / treatment_run / "test" / filename,
+            usecols=[id_column, "pearson_r"],
+        )
+        paired = treatment.merge(
+            baseline,
+            on=id_column,
+            validate="one_to_one",
+            suffixes=("_treatment", "_baseline"),
+        ).dropna(subset=["pearson_r_treatment", "pearson_r_baseline"])
+        paired.insert(0, "comparison", comparison)
+        paired.insert(1, "level", level)
+        paired = paired.rename(columns={id_column: "sample_id"})
+        paired["pearson_delta"] = (
+            paired["pearson_r_treatment"] - paired["pearson_r_baseline"]
+        )
+        frames.append(paired)
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_two_run_global_summary(
+    runs_root: Path,
+    baseline_run: str,
+    treatment_run: str,
+    baseline_label: str,
+    treatment_label: str,
+) -> pd.DataFrame:
+    """Load directly comparable global test metrics for a two-run ablation."""
+    rows: list[dict[str, Any]] = []
+    for strategy, run_name, label in (
+        ("baseline", baseline_run, baseline_label),
+        ("treatment", treatment_run, treatment_label),
+    ):
+        metrics = json.loads(
+            (runs_root / run_name / "test" / "test_metrics.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        config = json.loads(
+            (runs_root / run_name / "config.json").read_text(encoding="utf-8")
+        )
+        rows.append(
+            {
+                "strategy": strategy,
+                "label": label,
+                "run_name": run_name,
+                "seed": int(config.get("seed", -1)),
+                "contrastive_weight": float(config.get("contrastive_weight", 0.0)),
+                "contrastive_projection_dim": int(
+                    config.get("contrastive_projection_dim", 0)
+                ),
+                "test_mse": float(metrics["mse"]),
+                "test_rmse": float(metrics["rmse"]),
+                "test_pearson_r": float(metrics["pearson_r"]),
+                "test_spearman_r": float(metrics["spearman_r"]),
+                "test_nonzero_rmse": float(metrics["nonzero_rmse"]),
+                "test_zero_rmse": float(metrics["zero_rmse"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def write_two_run_ablation_outputs(
+    runs_root: Path,
+    output_dir: Path,
+    baseline_run: str,
+    treatment_run: str,
+    baseline_label: str,
+    treatment_label: str,
+    comparison: str,
+    title: str,
+    repeats: int,
+    confidence: float,
+    random_seed: int,
+) -> dict[str, int]:
+    """Write the Stage 1 ablation contract for another matched two-run comparison."""
+    from scripts.summarize_stage1_bootstrap import bootstrap_paired_delta
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    global_data = load_two_run_global_summary(
+        runs_root,
+        baseline_run,
+        treatment_run,
+        baseline_label,
+        treatment_label,
+    )
+    global_data.to_csv(output_dir / "global_metrics.csv", index=False)
+    paired = load_two_run_paired_deltas(
+        runs_root,
+        baseline_run,
+        treatment_run,
+        comparison,
+    )
+    paired.to_csv(output_dir / "paired_deltas.csv", index=False)
+
+    rng = np.random.default_rng(random_seed)
+    summary_rows: list[dict[str, Any]] = []
+    for level, group in paired.groupby("level", sort=False):
+        deltas = group["pearson_delta"].to_numpy(dtype=np.float64)
+        summary_rows.append(
+            {
+                "comparison": comparison,
+                "level": level,
+                "n_pairs": len(deltas),
+                **bootstrap_paired_delta(deltas, repeats, confidence, rng),
+            }
+        )
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(output_dir / "paired_bootstrap.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5))
+    labels = global_data["label"].tolist()
+    x = np.arange(len(labels))
+    width = 0.36
+    axes[0].bar(x - width / 2, global_data["test_pearson_r"], width, label="Pearson", color="#4C78A8")
+    axes[0].bar(x + width / 2, global_data["test_spearman_r"], width, label="Spearman", color="#F58518")
+    axes[0].set_ylabel("Global test correlation")
+    axes[0].set_xticks(x, labels)
+    axes[0].legend(frameon=False)
+    axes[0].grid(axis="y", alpha=0.2)
+
+    y = np.arange(len(summary))
+    axes[1].errorbar(
+        summary["mean_delta"],
+        y,
+        xerr=np.vstack(
+            (
+                summary["mean_delta"] - summary["mean_ci_low"],
+                summary["mean_ci_high"] - summary["mean_delta"],
+            )
+        ),
+        fmt="o",
+        color="#263238",
+        ecolor="#607D8B",
+        capsize=4,
+    )
+    axes[1].axvline(0, color="#B0BEC5", linestyle="--", linewidth=1)
+    axes[1].set_yticks(y, summary["level"].str.replace("_", "-"))
+    axes[1].set_xlabel("Paired Pearson delta: treatment - baseline")
+    axes[1].grid(axis="x", alpha=0.2)
+    for axis in axes:
+        axis.spines[["top", "right"]].set_visible(False)
+    fig.suptitle(title, fontsize=13)
+    plt.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(output_dir / "ablation_summary.png", dpi=240, bbox_inches="tight")
+    fig.savefig(output_dir / "ablation_summary.svg", bbox_inches="tight")
+    plt.close(fig)
+
+    summary_text = summary.to_string(index=False)
+    readme = "\n".join(
+        (
+            f"# {title}",
+            "",
+            f"Baseline: `{baseline_run}` ({baseline_label})",
+            f"Treatment: `{treatment_run}` ({treatment_label})",
+            f"Bootstrap repeats: {repeats:,}; confidence: {confidence:.1%}; random seed: {random_seed}",
+            "",
+            "Positive paired Pearson deltas favor the treatment.",
+            "",
+            "```text",
+            summary_text,
+            "```",
+            "",
+        )
+    )
+    (output_dir / "README.md").write_text(readme, encoding="utf-8")
+    return {
+        "global_rows": len(global_data),
+        "paired_rows": len(paired),
+        "bootstrap_rows": len(summary),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    project_root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(
+        description="Write the standalone Stage 1 seed-7 training-strategy ablation."
+    )
+    parser.add_argument("--stage1-dir", type=Path, default=project_root / "outputs" / "stage1")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--repeats", type=int, default=10_000)
+    parser.add_argument("--confidence", type=float, default=0.95)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def main() -> None:
+    from scripts.summarize_stage1_bootstrap import bootstrap_paired_delta
+
+    args = parse_args()
+    stage1_dir = args.stage1_dir
+    if not stage1_dir.is_absolute():
+        stage1_dir = Path(__file__).resolve().parent.parent / stage1_dir
+    output_dir = args.output_dir or stage1_dir / "summary"
+    if not output_dir.is_absolute():
+        output_dir = Path(__file__).resolve().parent.parent / output_dir
+    result = write_training_ablation_outputs(
+        stage1_dir=stage1_dir,
+        output_dir=output_dir,
+        repeats=int(args.repeats),
+        confidence=float(args.confidence),
+        rng=np.random.default_rng(int(args.seed)),
+        bootstrap_fn=bootstrap_paired_delta,
+    )
+    print(f"[Stage1Ablation] output={output_dir} {result}")
+
+
+if __name__ == "__main__":
+    main()

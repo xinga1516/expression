@@ -1,104 +1,173 @@
-#!/bin/bash
-#SBATCH -J promoter_stage2
-#SBATCH -p gpu_4l
-#SBATCH -N 1
-#SBATCH -A jchamper_g1
-#SBATCH --qos jchamperg4c
-#SBATCH -o outputs/stage2/slurm/%A_%a.out
-#SBATCH -e outputs/stage2/slurm/%A_%a.err
-#SBATCH --gres=gpu:1
-#SBATCH --overcommit
-#SBATCH --mincpus=8
-#SBATCH --no-requeue
-#SBATCH -a 1-12
-
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
-# Run from repository root on sulab7g-zxy, for example:
-#   mkdir -p outputs/stage2/slurm
-#   sbatch hpc/stage2_sweep.sh
+# sulab7g-zxy direct launcher for promoter Stage 2 contrastive sweep.
+# Run from repository root:
+#   nohup bash hpc/stage2_sweep.sh > /PROJ5/liangn_zxy/runs/expression/stage2/launcher_logs/stage2_sweep.nohup.log 2>&1 &
 #
-# This sweep assumes Stage 2 assets have wider sequence caches, e.g.:
-#   python scripts/build_promoter_stage1_assets.py \
-#     --source-data umi_E-MTAB-10519-hqcells \
-#     --output-data promoter_stage2_v1 \
-#     --gtf data/raw/dmel-all-r6.54.gtf \
-#     --genome-fasta data/raw/dmel-all-chromosome-r6.54.fasta \
-#     --promoter-window-length 440 \
-#     --positive-shift-bp 20 \
-#     --seed 42
+# Defaults use GPUs 0-3 only. Override with STAGE2_GPUS, e.g. STAGE2_GPUS=0,1.
 
-if [ -f /home/jchamper_pkuhpc/miniconda3/etc/profile.d/conda.sh ]; then
-    source /home/jchamper_pkuhpc/miniconda3/etc/profile.d/conda.sh
-    conda activate promodel
-elif [ -f /home/xinyue/miniconda3/etc/profile.d/conda.sh ]; then
-    source /home/xinyue/miniconda3/etc/profile.d/conda.sh
-    conda activate promodel_wsl
-elif [ -x /PROJ5/liangn_zxy/envs/promodel/bin/python ]; then
-    export PATH="/PROJ5/liangn_zxy/envs/promodel/bin:${PATH}"
-fi
-
-mkdir -p outputs/stage2/slurm
-export TMPDIR=${TMPDIR:-/tmp}
-export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
-
+REPO_ROOT=${REPO_ROOT:-/PROJ5/liangn_zxy/work/expression}
+PYTHON=${PYTHON:-/PROJ5/liangn_zxy/envs/promodel/bin/python}
+RUN_ROOT=${STAGE2_RUN_ROOT:-/PROJ5/liangn_zxy/runs/expression/stage2}
 DATA=${STAGE2_DATA:-promoter_stage2_v1}
 SCRNA=${STAGE2_SCRNA:-data/umi_E-MTAB-10519-hqcells/integrated_data.h5ad}
 CELL_SPLIT_DIR=${STAGE2_CELL_SPLIT_DIR:-data/${DATA}}
 INPUT_PANEL=${STAGE2_INPUT_PANEL:-data/${DATA}/input_gene_panel_train.txt}
+GPU_CSV=${STAGE2_GPUS:-0,1,2,3}
+# Keep repaired/config-aligned runs separate from earlier incomplete Stage 2 attempts.
+EXP_PREFIX=${STAGE2_EXP_PREFIX:-stage2_cfgcache}
 
-WEIGHTS=(0.05 0.10 0.20 0.40)
-SEEDS=(1 7 42)
-TOTAL=$(( ${#WEIGHTS[@]} * ${#SEEDS[@]} ))
-TASK_ID=${SLURM_ARRAY_TASK_ID:-1}
-if [ "$TASK_ID" -lt 1 ] || [ "$TASK_ID" -gt "$TOTAL" ]; then
-    echo "Task ${TASK_ID} outside 1-${TOTAL}; exiting."
-    exit 0
+cd "${REPO_ROOT}"
+export PATH="$(dirname "${PYTHON}"):${PATH}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export TMPDIR=${TMPDIR:-/PROJ5/liangn_zxy/scratch}
+export HF_HOME=${HF_HOME:-/PROJ5/liangn_zxy/cache/huggingface}
+export TORCH_HOME=${TORCH_HOME:-/PROJ5/liangn_zxy/cache/torch}
+mkdir -p "${RUN_ROOT}" "${RUN_ROOT}/launcher_logs" "${RUN_ROOT}/pids" "${TMPDIR}" "${HF_HOME}" "${TORCH_HOME}" outputs
+
+if [ -e outputs/stage2 ] && [ ! -L outputs/stage2 ]; then
+  echo "ERROR: outputs/stage2 exists and is not a symlink. Move it before launching." >&2
+  exit 1
+fi
+ln -sfn "${RUN_ROOT}" outputs/stage2
+
+if [ ! -x "${PYTHON}" ]; then
+  echo "ERROR: Python not executable: ${PYTHON}" >&2
+  exit 1
+fi
+if [ ! -f "data/${DATA}/promoter_train.csv" ]; then
+  echo "ERROR: data/${DATA}/promoter_train.csv not found. Build promoter_stage2_v1 first." >&2
+  exit 1
 fi
 
-IDX=$((TASK_ID - 1))
-WEIGHT_IDX=$((IDX / ${#SEEDS[@]}))
-SEED_IDX=$((IDX % ${#SEEDS[@]}))
-CW=${WEIGHTS[$WEIGHT_IDX]}
-SEED=${SEEDS[$SEED_IDX]}
-CW_TAG=$(printf "%03d" "$(python - <<PY
-print(int(round(float('${CW}') * 100)))
+IFS=',' read -r -a GPUS <<< "${GPU_CSV}"
+if [ "${#GPUS[@]}" -lt 1 ]; then
+  echo "ERROR: STAGE2_GPUS is empty." >&2
+  exit 1
+fi
+
+WEIGHTS=(0.05 0.10 0.20 0.40)
+if [ -n "${STAGE2_WEIGHTS:-}" ]; then
+  read -r -a WEIGHTS <<< "${STAGE2_WEIGHTS}"
+fi
+SEEDS=(1 7 42)
+
+launch_train() {
+  local gpu=$1
+  local cw=$2
+  local seed=$3
+  local cw_tag
+  cw_tag=$("${PYTHON}" - <<PY
+print(f"{int(round(float('${cw}') * 100)):03d}")
 PY
-)")
-EXP_NAME="stage2/stage2_cw${CW_TAG}_seed${SEED}"
+)
+  local exp_id="${EXP_PREFIX}_cw${cw_tag}_seed${seed}"
+  local log_file="${RUN_ROOT}/launcher_logs/${exp_id}.log"
+  local mutation_log_file="${RUN_ROOT}/launcher_logs/${exp_id}.mutation.log"
+  echo "[$(date '+%F %T')] launch ${exp_id} gpu=${gpu} cw=${cw} seed=${seed} log=${log_file}"
+  (
+    set +e
+    CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" scripts/train.py \
+      --exp_name "stage2/${exp_id}" \
+      --data "${DATA}" \
+      --scrna-file "${SCRNA}" \
+      --model CNNFlattenPromoterModel \
+      --sequence-column sequence \
+      --sequence-length 400 \
+      --promoter-shift-max 20 \
+      --contrastive-negative-shift-max -1 \
+      --contrastive-weight "${cw}" \
+      --contrastive-margin 1.0 \
+      --contrastive-positive-column positive_sequence \
+      --contrastive-negative-column control_sequence \
+      --use-cell-split \
+      --cell-split-dir "${CELL_SPLIT_DIR}" \
+      --input-gene-panel-file "${INPUT_PANEL}" \
+      --loss combined \
+      --pearson-lambda 5.0 \
+      --nonzero-loss-weight 2.0 \
+      --fusion gate \
+      --expression-layer logcpm \
+      --expression-transform none \
+      --target-count-layer counts \
+      --target-value-layer logcpm \
+      --target-transform none \
+      --checkpoint-metric val_rmse \
+      --run-test-after-train \
+      --test-max-samples 0 \
+      --test-spearman-samples 0 \
+      --samples-per-epoch 128000 \
+      --val-samples 128000 \
+      --cell-ratio 1.0 \
+      --val-cell-ratio 1.0 \
+      --max-duplication 1.0 \
+      --gpu-cache-dataset \
+      --gpu-sampler balanced \
+      --batch-size 512 \
+      --hidden-size 128 \
+      --learning-rate 5e-4 \
+      --warmup-epochs 5 \
+      --eval-every-steps 512 \
+      --patience 32 \
+      --min-delta 1e-4 \
+      --ema-alpha 0.9 \
+      --epochs 80 \
+      --num-workers 2 \
+      --prefetch-factor 2 \
+      --seed "${seed}" \
+      > "${log_file}" 2>&1
+    train_status=$?
+    if [ "${train_status}" -ne 0 ]; then
+      echo "[$(date '+%F %T')] training failed for ${exp_id}; mutation test skipped (status=${train_status})" >> "${mutation_log_file}"
+      exit "${train_status}"
+    fi
+    echo "[$(date '+%F %T')] starting mutation position test for ${exp_id}" > "${mutation_log_file}"
+    CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" scripts/model_test.py \
+      --exp_name "stage2/${exp_id}" \
+      --data "${DATA}" \
+      --scrna-file "${SCRNA}" \
+      --sequence-column sequence \
+      --sequence-length 400 \
+      --input-gene-panel-file "${INPUT_PANEL}" \
+      --use-cell-split \
+      --cell-split-dir "${CELL_SPLIT_DIR}" \
+      --skip-standard-test \
+      --run-mutagenesis \
+      --top-n 1000 \
+      --max-pairs-per-gene-ratio 0.02 \
+      --max-pairs-per-gene 20 \
+      --motif-window-size 9 \
+      --motif-top-windows 200 \
+      --motif-top-k 20 \
+      --motif-min-support 3 \
+      --batch-size 512 \
+      --mutation-batch-size 512 \
+      --num-workers 2 \
+      > "${mutation_log_file}" 2>&1
+  ) &
+  echo $! > "${RUN_ROOT}/pids/${exp_id}.pid"
+}
 
-echo "===== Stage 2 contrastive sweep ====="
-echo "host=$(hostname) job=${SLURM_JOB_ID:-manual} task=${TASK_ID} cuda=${CUDA_VISIBLE_DEVICES:-none}"
-echo "data=${DATA} exp=${EXP_NAME} contrastive_weight=${CW} seed=${SEED}"
+batch_pids=()
+gpu_i=0
+for cw in "${WEIGHTS[@]}"; do
+  for seed in "${SEEDS[@]}"; do
+    gpu=${GPUS[$gpu_i]}
+    launch_train "${gpu}" "${cw}" "${seed}"
+    batch_pids+=("$!")
+    gpu_i=$((gpu_i + 1))
+    if [ "${gpu_i}" -ge "${#GPUS[@]}" ]; then
+      echo "[$(date '+%F %T')] waiting for batch: ${batch_pids[*]}"
+      wait "${batch_pids[@]}"
+      batch_pids=()
+      gpu_i=0
+    fi
+  done
+done
+if [ "${#batch_pids[@]}" -gt 0 ]; then
+  echo "[$(date '+%F %T')] waiting for final batch: ${batch_pids[*]}"
+  wait "${batch_pids[@]}"
+fi
 
-python scripts/train.py \
-  --exp_name "${EXP_NAME}" \
-  --data "${DATA}" \
-  --scrna-file "${SCRNA}" \
-  --model CNNFlattenPromoterModel \
-  --sequence-column sequence \
-  --sequence-length 400 \
-  --promoter-shift-max 20 \
-  --contrastive-negative-shift-max -1 \
-  --contrastive-weight "${CW}" \
-  --contrastive-margin 1.0 \
-  --contrastive-positive-column positive_sequence \
-  --contrastive-negative-column control_sequence \
-  --use-cell-split \
-  --cell-split-dir "${CELL_SPLIT_DIR}" \
-  --input-gene-panel-file "${INPUT_PANEL}" \
-  --loss mse \
-  --checkpoint-metric val_rmse \
-  --run-test-after-train \
-  --test-spearman-samples 0 \
-  --batch-size 512 \
-  --hidden-size 128 \
-  --learning-rate 5e-4 \
-  --warmup-epochs 5 \
-  --patience 32 \
-  --ema-alpha 0.9999 \
-  --epochs 30 \
-  --num-workers 2 \
-  --prefetch-factor 2 \
-  --amp \
-  --seed "${SEED}"
+echo "[$(date '+%F %T')] Stage 2 contrastive sweep complete."

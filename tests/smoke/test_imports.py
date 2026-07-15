@@ -16,7 +16,8 @@ def test_main_modules_import() -> None:
         "scripts.train",
         "scripts.model_test",
         "scripts.process_data",
-        "scripts.project_test",
         "scripts.data_sanity",
+        "scripts.build_sequence_assets",
+        "scripts.model_compare",
     ]:
         importlib.import_module(module_name)

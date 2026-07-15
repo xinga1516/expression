@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from scripts.model_test import (
+    build_test_model,
     parse_meme_motifs,
     resolve_max_pairs_per_gene,
     select_top_expressed_pairs,
@@ -16,6 +18,7 @@ from scripts.model_test import (
     write_known_motif_outputs,
 )
 from src.dataset import MyDataset
+from src.model import build_model
 
 
 pytestmark = pytest.mark.unit
@@ -131,3 +134,33 @@ def test_write_known_motif_outputs_with_and_without_file(tiny_data_dir, tiny_mut
 
     assert (tmp_path / "known_motif_hits.csv").exists()
     assert (tmp_path / "known_motif_summary.csv").exists()
+
+
+def test_build_test_model_recreates_projection_head(tmp_path) -> None:
+    cfg = {
+        "model": "CNNFlattenPromoterModel",
+        "sequence_length": 8,
+        "hidden_size": 8,
+        "loss_type": "combined",
+        "fusion": "gate",
+        "use_vae": False,
+        "contrastive_projection_dim": 4,
+        "contrastive_projection_layers": 2,
+    }
+    trained_model = build_model(
+        "CNNFlattenPromoterModel",
+        promoter_len=8,
+        expr_dim=3,
+        hidden_size=8,
+        output_mode="scalar",
+        fusion="gate",
+        contrastive_projection_dim=4,
+        contrastive_projection_layers=2,
+    )
+    checkpoint = tmp_path / "projection.safetensors"
+    save_file(trained_model.state_dict(), str(checkpoint))
+
+    loaded_model = build_test_model(cfg, expr_dim=3, checkpoint=checkpoint, device=torch.device("cpu"))
+
+    assert loaded_model.contrastive_projection_dim == 4
+    assert any(key.startswith("contrastive_projection_head.") for key in loaded_model.state_dict())

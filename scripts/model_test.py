@@ -131,6 +131,8 @@ def build_test_model(cfg: dict[str, Any], expr_dim: int, checkpoint: Path, devic
         vae_fine_tune=cfg.get("vae_fine_tune", False),
         output_mode=output_mode,
         fusion=cfg.get("fusion", "gate"),
+        contrastive_projection_dim=cfg.get("contrastive_projection_dim", 0),
+        contrastive_projection_layers=cfg.get("contrastive_projection_layers", 2),
     )
     model.load_state_dict(load_file(str(checkpoint), device=str(device)))
     model.to(device)
@@ -184,31 +186,64 @@ def select_top_expressed_pairs(
 
     x_csc = dataset.X.tocsc()
     totals = np.asarray(dataset.X.sum(axis=1)).ravel().astype(np.float64)
-    cell_row_to_pos = {int(cell_row): cell_pos for cell_pos, cell_row in enumerate(dataset.cells)}
-    gene_heaps: dict[str, list[tuple[float, int, int, int, int, float, str]]] = defaultdict(list)
+    cell_pos_lookup = np.full(dataset.X.shape[0], -1, dtype=np.int64)
+    cell_pos_lookup[np.asarray(dataset.cells, dtype=np.int64)] = np.arange(dataset.C, dtype=np.int64)
 
+    # Keep only the top cap per gene with vectorized argpartition. The previous
+    # implementation updated a Python heap for every non-zero cell/gene pair,
+    # which made top-1000 mutation tests CPU-bound before any model inference.
+    gene_to_promoters: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for pro_i in range(dataset.P):
-        gene_idx = int(dataset.promoter2expr_idx[pro_i])
         gene_id = str(dataset.promoters["gene_id"].iloc[pro_i])
-        col = x_csc[:, gene_idx]
-        cell_rows = col.indices.astype(np.int64, copy=False)
-        values = col.data.astype(np.float64, copy=False)
-        if len(values) == 0:
+        gene_idx = int(dataset.promoter2expr_idx[pro_i])
+        gene_to_promoters[gene_id].append((pro_i, gene_idx))
+
+    candidates: list[tuple[float, int, int, int, int, float, str]] = []
+    for gene_id, promoter_entries in gene_to_promoters.items():
+        score_parts: list[np.ndarray] = []
+        pro_parts: list[np.ndarray] = []
+        cell_row_parts: list[np.ndarray] = []
+        gene_idx_for_parts: list[np.ndarray] = []
+        raw_parts: list[np.ndarray] = []
+
+        for pro_i, gene_idx in promoter_entries:
+            col = x_csc[:, gene_idx]
+            cell_rows = col.indices.astype(np.int64, copy=False)
+            values = col.data.astype(np.float64, copy=False)
+            if len(values) == 0:
+                continue
+            cell_positions = cell_pos_lookup[cell_rows]
+            keep = cell_positions >= 0
+            if not np.any(keep):
+                continue
+            cell_rows = cell_rows[keep]
+            values = values[keep]
+            scores = compute_target_values(dataset, cell_rows, gene_idx, values, totals)
+            score_parts.append(np.asarray(scores, dtype=np.float64))
+            pro_parts.append(np.full(len(scores), pro_i, dtype=np.int64))
+            cell_row_parts.append(cell_rows)
+            gene_idx_for_parts.append(np.full(len(scores), gene_idx, dtype=np.int64))
+            raw_parts.append(values)
+
+        if not score_parts:
             continue
 
-        scores = compute_target_values(dataset, cell_rows, gene_idx, values, totals)
-        for cell_row, raw_value, score in zip(cell_rows, values, scores):
-            cell_pos = cell_row_to_pos.get(int(cell_row))
-            if cell_pos is None:
-                continue
-            item = (float(score), int(pro_i), int(cell_pos), int(cell_row), gene_idx, float(raw_value), gene_id)
-            gene_heap = gene_heaps[gene_id]
-            if len(gene_heap) < max_pairs_per_gene_resolved:
-                heapq.heappush(gene_heap, item)
-            elif item[0] > gene_heap[0][0]:
-                heapq.heapreplace(gene_heap, item)
+        scores_all = np.concatenate(score_parts)
+        keep_count = min(max_pairs_per_gene_resolved, len(scores_all))
+        if keep_count < len(scores_all):
+            keep_indices = np.argpartition(scores_all, -keep_count)[-keep_count:]
+        else:
+            keep_indices = np.arange(len(scores_all), dtype=np.int64)
+        for score, pro_i, cell_row, gene_idx, raw_value in zip(
+            scores_all[keep_indices],
+            np.concatenate(pro_parts)[keep_indices],
+            np.concatenate(cell_row_parts)[keep_indices],
+            np.concatenate(gene_idx_for_parts)[keep_indices],
+            np.concatenate(raw_parts)[keep_indices],
+        ):
+            cell_pos = int(cell_pos_lookup[int(cell_row)])
+            candidates.append((float(score), int(pro_i), cell_pos, int(cell_row), int(gene_idx), float(raw_value), gene_id))
 
-    candidates = [item for gene_heap in gene_heaps.values() for item in gene_heap]
     selected = sorted(candidates, key=lambda x: x[0], reverse=True)[:top_n]
     if len(selected) < top_n:
         print(

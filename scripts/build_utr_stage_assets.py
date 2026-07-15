@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -398,10 +398,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-gene-panel-method", choices=["hvg", "variance"], default="hvg")
     parser.add_argument("--hvg-flavor", type=str, default="cell_ranger")
     parser.add_argument("--max-eval-cells", type=int, default=2048)
-    parser.add_argument("--control-attempts", type=int, default=2000)
+    parser.add_argument("--control-attempts", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     build_assets(parse_args())
+

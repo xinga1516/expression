@@ -20,7 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
         "scripts/evaluate.py",
         "scripts/model_test.py",
         "scripts/pretrain_scvi.py",
-        "scripts/project_test.py",
+        "scripts/data_sanity.py",
+        "scripts/build_sequence_assets.py",
+        "scripts/model_compare.py",
     ],
 )
 def test_cli_help(script: str) -> None:

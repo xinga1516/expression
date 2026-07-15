@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any, Iterator, Sequence
 
@@ -20,8 +20,10 @@ class GpuCachedPairLoader:
 
     The loader keeps fixed dataset arrays on ``device`` and materializes each batch
     by gathering ``promoter_idx`` and ``cell_idx`` directly on that device. It
-    intentionally returns the same ``(promoters, exprs, ys)`` tuple shape as the
-    standard DataLoader path so the existing training loop can stay unchanged.
+    returns the same leading ``(promoters, exprs, ys)`` tuple shape as the standard
+    DataLoader path; when the dataset requests indices, the pair indices are
+    appended. Optional cached contrastive sequence columns can be appended after
+    the indices for Stage 2 triplet training.
     """
 
     def __init__(
@@ -33,6 +35,9 @@ class GpuCachedPairLoader:
         seed: int = 42,
         sampler_mode: str = "balanced",
         drop_last: bool = True,
+        contrastive_positive_column: str | None = None,
+        contrastive_negative_column: str | None = None,
+        contrastive_negative_shift_max: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -42,6 +47,10 @@ class GpuCachedPairLoader:
         self.sampler_mode = sampler_mode
         self.drop_last = bool(drop_last)
         self.device = torch.device(device)
+        self.return_indices = bool(getattr(dataset, "return_indices", False))
+        self.contrastive_positive_column = contrastive_positive_column
+        self.contrastive_negative_column = contrastive_negative_column
+        self.contrastive_negative_shift_max = contrastive_negative_shift_max
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         if self.samples_per_epoch < 0:
@@ -67,12 +76,24 @@ class GpuCachedPairLoader:
         )
 
         pro_indices = np.arange(self.P, dtype=np.int64)
-        self.promoters_device = self._encode_full_sequence_cache(pro_indices).to(self.device, non_blocking=False)
+        self.promoters_device = self._encode_sequence_column_cache(self.dataset.sequence_column, pro_indices).to(
+            self.device, non_blocking=False
+        )
         self.cached_sequence_length = int(self.promoters_device.shape[1])
         self.model_sequence_length = int(self.dataset.sequence_length)
         self.runtime_sequence_shift = bool(
             hasattr(self.dataset, "uses_runtime_sequence_shift") and self.dataset.uses_runtime_sequence_shift()
         )
+        self.positive_promoters_device: torch.Tensor | None = None
+        self.negative_promoters_device: torch.Tensor | None = None
+        if self.contrastive_positive_column is not None:
+            self.positive_promoters_device = self._encode_sequence_column_cache(
+                self.contrastive_positive_column, pro_indices
+            ).to(self.device, non_blocking=False)
+        if self.contrastive_negative_column is not None:
+            self.negative_promoters_device = self._encode_sequence_column_cache(
+                self.contrastive_negative_column, pro_indices
+            ).to(self.device, non_blocking=False)
 
         expr_indices = self.dataset.input_expr_indices
         if expr_indices is None:
@@ -111,14 +132,19 @@ class GpuCachedPairLoader:
             target_input_positions, dtype=torch.long, device=self.device
         )
 
-        cached_mib = (
+        cached_elements = (
             self.promoters_device.numel()
             + self.expr_panel_device.numel()
             + self.target_matrix_device.numel()
             + self.raw_target_matrix_device.numel()
             + self.cell_totals_device.numel()
             + self.target_input_positions_device.numel()
-        ) * 4 / (1024 ** 2)
+        )
+        if self.positive_promoters_device is not None:
+            cached_elements += self.positive_promoters_device.numel()
+        if self.negative_promoters_device is not None:
+            cached_elements += self.negative_promoters_device.numel()
+        cached_mib = cached_elements * 4 / (1024 ** 2)
         print(f"[GPUCache] cached tensors occupy approximately {cached_mib:.1f} MiB.")
         if self.cached_sequence_length > self.model_sequence_length:
             crop_mode = "random" if self.runtime_sequence_shift else "center"
@@ -126,48 +152,59 @@ class GpuCachedPairLoader:
                 f"[GPUCache] sequence crop enabled: cached={self.cached_sequence_length} "
                 f"model={self.model_sequence_length} mode={crop_mode}"
             )
+        if self.positive_promoters_device is not None and self.negative_promoters_device is not None:
+            print(
+                f"[GPUCache] contrastive sequences cached: "
+                f"positive={self.contrastive_positive_column} negative={self.contrastive_negative_column} "
+                f"negative_shift_max={self.contrastive_negative_shift_max}"
+            )
 
-    def _encode_full_sequence_cache(self, pro_indices: np.ndarray) -> torch.Tensor:
-        sequences = self.dataset.promoters[self.dataset.sequence_column].astype(str)
+    def _encode_sequence_column_cache(self, column: str, pro_indices: np.ndarray) -> torch.Tensor:
+        if column not in self.dataset.promoters.columns:
+            raise ValueError(f"Sequence column {column!r} not found in promoter table.")
+        sequences = self.dataset.promoters[column].astype(str)
         source_length = max(int(sequences.str.len().max()), int(self.dataset.sequence_length))
         encoder = PromoterOneHotEncoder(length=source_length)
         tensors = [encoder(str(sequences.iloc[int(pro_i)])) for pro_i in pro_indices]
         return torch.stack(tensors, dim=0).to(torch.float32)
 
-    def _crop_promoters_for_model(
+    def _crop_sequences_for_model(
         self,
-        promoters: torch.Tensor,
+        sequences: torch.Tensor,
         generator: torch.Generator | None = None,
+        shift_max: int | None = None,
     ) -> torch.Tensor:
-        source_len = int(promoters.shape[1])
+        source_len = int(sequences.shape[1])
         target_len = int(self.model_sequence_length)
         if source_len == target_len:
-            return promoters
+            return sequences
         if source_len < target_len:
-            raise ValueError(f"Cached promoter length {source_len} is shorter than model sequence length {target_len}.")
+            raise ValueError(f"Cached sequence length {source_len} is shorter than model sequence length {target_len}.")
         max_start = source_len - target_len
         center_start = max_start // 2
-        if self.runtime_sequence_shift:
-            shift = min(int(self.dataset.promoter_shift_max), center_start, max_start - center_start)
+        if shift_max is None:
+            active_shift = int(self.dataset.promoter_shift_max) if self.runtime_sequence_shift else 0
+        else:
+            active_shift = max(0, int(shift_max))
+        if getattr(self.dataset, "mode", "train") == "train" and active_shift > 0:
+            shift = min(active_shift, center_start, max_start - center_start)
             if shift > 0:
-                low = center_start - shift
-                high = center_start + shift + 1
                 starts = torch.randint(
-                    low,
-                    high,
-                    (promoters.shape[0],),
+                    center_start - shift,
+                    center_start + shift + 1,
+                    (sequences.shape[0],),
                     generator=generator,
                     device=self.device,
                     dtype=torch.long,
                 )
             else:
-                starts = torch.full((promoters.shape[0],), center_start, device=self.device, dtype=torch.long)
+                starts = torch.full((sequences.shape[0],), center_start, device=self.device, dtype=torch.long)
         else:
-            starts = torch.full((promoters.shape[0],), center_start, device=self.device, dtype=torch.long)
+            starts = torch.full((sequences.shape[0],), center_start, device=self.device, dtype=torch.long)
         offsets = torch.arange(target_len, device=self.device, dtype=torch.long)
         positions = starts[:, None] + offsets[None, :]
-        gather_index = positions[:, :, None].expand(-1, -1, promoters.shape[2])
-        return promoters.gather(dim=1, index=gather_index)
+        gather_index = positions[:, :, None].expand(-1, -1, sequences.shape[2])
+        return sequences.gather(dim=1, index=gather_index)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -181,7 +218,7 @@ class GpuCachedPairLoader:
     def sampler(self) -> "GpuCachedPairLoader":
         return self
 
-    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, ...]]:
         n_samples = self.samples_per_epoch
         if self.drop_last:
             n_samples = (n_samples // self.batch_size) * self.batch_size
@@ -224,7 +261,7 @@ class GpuCachedPairLoader:
         cell_idx = torch.randint(0, self.C, (n_samples,), generator=generator, device=self.device)
         return promoter_idx, cell_idx
 
-    def _make_batch(self, flat_indices: Sequence[int] | np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _make_batch(self, flat_indices: Sequence[int] | np.ndarray) -> tuple[torch.Tensor, ...]:
         flat = torch.as_tensor(flat_indices, dtype=torch.long, device=self.device)
         promoter_idx = torch.div(flat, self.C, rounding_mode="floor")
         cell_idx = flat.remainder(self.C)
@@ -235,8 +272,8 @@ class GpuCachedPairLoader:
         promoter_idx: torch.Tensor,
         cell_idx: torch.Tensor,
         generator: torch.Generator | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        promoters = self._crop_promoters_for_model(
+    ) -> tuple[torch.Tensor, ...]:
+        promoters = self._crop_sequences_for_model(
             self.promoters_device.index_select(0, promoter_idx),
             generator=generator,
         )
@@ -254,4 +291,18 @@ class GpuCachedPairLoader:
             lib_size = torch.clamp(self.cell_totals_device.index_select(0, cell_idx) - raw_ys, min=1.0)
             ys = torch.log1p(raw_ys / lib_size * 1e6)
 
-        return promoters, exprs, ys.float()
+        batch: tuple[torch.Tensor, ...] = (promoters, exprs, ys.float())
+        if self.return_indices:
+            batch = batch + (promoter_idx, cell_idx)
+            if self.positive_promoters_device is not None and self.negative_promoters_device is not None:
+                positive_promoters = self._crop_sequences_for_model(
+                    self.positive_promoters_device.index_select(0, promoter_idx),
+                    generator=generator,
+                )
+                negative_promoters = self._crop_sequences_for_model(
+                    self.negative_promoters_device.index_select(0, promoter_idx),
+                    generator=generator,
+                    shift_max=self.contrastive_negative_shift_max,
+                )
+                batch = batch + (positive_promoters, negative_promoters)
+        return batch
